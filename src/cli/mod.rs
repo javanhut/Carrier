@@ -87,17 +87,5 @@ impl RegistryImage {
         }
     }
 
-    /// Get the full image reference without the tag if it's "latest"
-    pub fn to_string_compact(&self) -> String {
-        let base = match &self.registry {
-            Some(reg) => format!("{}/{}", reg, self.image),
-            None => self.image.clone(),
-        };
 
-        if self.tag == "latest" {
-            base
-        } else {
-            format!("{}:{}", base, self.tag)
-        }
-    }
 }
