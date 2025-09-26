@@ -150,6 +150,32 @@ CgroupConfig {
 
 ## Usage
 
+### Container Execution Modes
+
+#### Interactive Mode (Default)
+When you run `carrier run <image>`:
+- Container runs in foreground
+- Inherits terminal stdin/stdout/stderr
+- Suitable for shells and interactive programs
+- Process waits for container to exit
+- Automatically detected for bash/sh commands
+
+#### Detached Mode
+When you run `carrier run -d <image>`:
+- Container runs in background
+- I/O redirected to null (future: logs)
+- Returns immediately with container ID
+- Container continues after terminal closes
+- Use `carrier sh` to interact later
+
+#### Command Execution in Running Containers
+When you run `carrier sh <container-id> [command]`:
+- Uses `nsenter` to join container namespaces
+- Executes command in container context
+- Supports interactive and non-interactive modes
+- Default command is `/bin/sh` if not specified
+- Requires container to be in "running" state
+
 ### Running a Container
 
 When you run `carrier run <image>`, the runtime:
@@ -160,7 +186,7 @@ When you run `carrier run <image>`, the runtime:
 
 2. **Spawns Process**
    - Forks child process for container
-   - Parent stays outside for monitoring
+   - Parent stays outside for monitoring (or detaches if `-d`)
 
 3. **Configures Isolation**
    - Child enters new namespaces
@@ -181,6 +207,38 @@ When you run `carrier run <image>`, the runtime:
    - Changes to working directory
    - Sets environment variables
    - Executes container entrypoint
+   - Saves PID for management
+
+### Container Lifecycle Management
+
+```bash
+# Start container (interactive)
+carrier run alpine
+
+# Start container (detached)
+carrier run -d nginx
+
+# List running containers
+carrier ls -c
+
+# Execute command in running container
+carrier sh abc123 echo "Hello"
+
+# Open shell in running container  
+carrier sh abc123
+
+# Stop container gracefully
+carrier stop abc123
+
+# Force stop container
+carrier stop --force abc123
+
+# Remove stopped container
+carrier rm abc123
+
+# Remove all stopped containers
+carrier rm -c
+```
 
 ## Advantages Over Traditional Runtimes
 

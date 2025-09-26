@@ -1,0 +1,15 @@
+[build]
+# Uncomment to suppress all warnings during development
+# rustflags = ["-A", "warnings"]
+
+# Or suppress specific warnings only
+rustflags = [
+    "-A", "dead_code",
+    "-A", "unused_imports",
+    "-A", "unused_variables",
+]
+
+[alias]
+# Create a quiet build alias
+quiet = "run --quiet --bin carrier --"
+q = "run --quiet --bin carrier --"

@@ -25,6 +25,15 @@ pub enum Commands {
     /// Run a container from an image
     Run {
         image: String,
+
+        /// Run container in detached mode (background)
+        #[arg(short = 'd', long = "detach")]
+        detach: bool,
+
+        /// Custom name for the container
+        #[arg(long = "name")]
+        name: Option<String>,
+
         /// Optional command to override the image default
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -45,7 +54,7 @@ pub enum Commands {
         /// Force removal even if container is running
         #[arg(short, long)]
         force: bool,
-        
+
         /// Remove all stopped containers
         #[arg(short = 'c', long = "all-containers")]
         all_containers: bool,
@@ -79,6 +88,24 @@ pub enum Commands {
         /// Timeout in seconds before forcing stop
         #[arg(short = 't', long, default_value = "10")]
         timeout: u64,
+    },
+
+    /// Execute a command in a running container
+    #[command(alias = "sh", aliases = ["exec","execute", "term", "terminal"])]
+    Shell {
+        /// Container ID or name
+        container: String,
+
+        /// Command to execute in the container
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    
+    /// Show detailed information about a container
+    #[command(alias = "inspect")]
+    Info {
+        /// Container ID or name
+        container: String,
     },
 }
 

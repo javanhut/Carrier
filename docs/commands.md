@@ -1,7 +1,26 @@
 # Carrier Commands
 
 ## Overview
-Carrier provides several commands for managing container images and running containers. All commands support pulling images from various container registries including Docker Hub, Quay.io, GitHub Container Registry, and more.
+Carrier provides comprehensive container management with commands for pulling images, running containers (interactive or detached), executing commands in running containers, and managing container lifecycle. All commands support pulling images from various container registries including Docker Hub, Quay.io, GitHub Container Registry, and more.
+
+## Quick Start
+```bash
+# Run a container interactively
+carrier run alpine
+
+# Run in background (detached)
+carrier run -d nginx
+
+# Run with custom name
+carrier run --name my-app alpine
+
+# Execute commands in running container
+carrier sh <container-id>
+
+# Stop and remove containers
+carrier stop <container-id>
+carrier rm -c  # Remove all stopped containers
+```
 
 ## Commands
 
@@ -34,30 +53,62 @@ carrier pull quay.io/prometheus/prometheus:latest
 - Rootless storage in user home directory
 
 ### run
-Pull an image and run it as a container.
+Run a container from a local or remote image.
 
 **Usage:**
 ```bash
-carrier run <image>
+carrier run [OPTIONS] <image|image-id> [COMMAND...]
 ```
+
+**Options:**
+- `-d, --detach`: Run container in detached mode (background)
+- `--name <NAME>`: Assign a custom name to the container
 
 **Examples:**
 ```bash
-# Run latest alpine image
+# Run latest alpine image interactively
 carrier run alpine
+
+# Run by image ID (local image)
+carrier run 621a1d661664
 
 # Run specific version
 carrier run nginx:1.24
 
 # Run from specific registry
 carrier run ghcr.io/my-org/my-app:latest
+
+# Run in detached mode (background)
+carrier run -d nginx
+carrier run --detach redis:latest
+
+# Run with custom name
+carrier run --name my-web-server nginx
+carrier run --name dev-db -d postgres:latest
+
+# Run with custom command (future feature)
+carrier run alpine echo "Hello World"
 ```
 
 **Features:**
+- Checks for local images first (by name or ID)
 - Automatically pulls the image if not already downloaded
+- Supports running by image ID for local images
 - Creates overlay filesystem with copy-on-write
-- Sets up container environment with unique ID
+- Sets up container environment with unique ID or custom name
+- Custom container naming with `--name` option
 - Supports both native overlay and fuse-overlayfs for rootless operation
+- Detached mode for background execution
+- Interactive mode for shells (bash, sh)
+
+**Detached Mode:**
+When running with `-d` or `--detach`:
+- Container runs in the background
+- Returns immediately with container ID
+- Output is redirected to null (future: logs)
+- Container continues running after terminal closes
+- Use `carrier stop` to stop the container
+- Use `carrier sh` to execute commands in the container
 
 ### list
 List downloaded images and containers with a clean, box-style output format with dynamic width adjustment.
@@ -135,6 +186,69 @@ When no items are found, appropriate messages are displayed:
 - "No images found" when no images exist
 - "No containers found" when using -a and no containers exist  
 - "No running containers (use -a to show all)" when no running containers
+
+### info / inspect
+Display detailed information about a container.
+
+**Usage:**
+```bash
+carrier info <container>
+carrier inspect <container>  # Alias
+```
+
+**Examples:**
+```bash
+# Get detailed container information
+carrier info abc123def456
+
+# Using partial ID
+carrier info abc1
+```
+
+**Features:**
+- Complete container metadata display
+- Runtime status with visual indicators
+- Process and resource information
+- Environment variables preview
+- Context-sensitive command suggestions
+- Uptime and timing information
+
+### shell / sh / exec
+Execute commands in running containers.
+
+**Usage:**
+```bash
+carrier shell <container> [COMMAND...]
+carrier sh <container> [COMMAND...]     # Alias
+carrier exec <container> [COMMAND...]   # Alias
+```
+
+**Examples:**
+```bash
+# Open interactive shell in container
+carrier sh abc123def456
+carrier sh abc1  # Partial ID
+
+# Execute specific command
+carrier sh abc123 echo "Hello"
+carrier sh abc123 ls -la /
+carrier sh abc123 ps aux
+
+# Run bash if available
+carrier sh abc123 /bin/bash
+```
+
+**Features:**
+- Enters all container namespaces using nsenter
+- Supports interactive and non-interactive commands
+- Default command is /bin/sh if none specified
+- Requires container to be running
+- Supports partial container ID matching
+
+**Requirements:**
+- Container must be in "running" state
+- nsenter command must be installed
+- May require elevated privileges
 
 ### stop
 Stop running containers by sending termination signals.

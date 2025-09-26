@@ -1,7 +1,7 @@
 [package]
 name = "carrier"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 chrono = "0.4"
@@ -22,3 +22,14 @@ tokio = { version = "1", features = ["full"] }
 caps = "0.5"
 libc = "0.2"
 procfs = "0.16"
+
+[profile.dev]
+# Suppress warnings in dev builds
+# Uncomment the next line to disable warnings
+# rustflags = ["-A", "warnings"]
+
+[profile.release]
+# Release builds are already optimized
+lto = true
+codegen-units = 1
+opt-level = 3

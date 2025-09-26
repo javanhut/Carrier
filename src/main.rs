@@ -6,24 +6,27 @@ mod runtime;
 mod storage;
 
 use cli::{Cli, Commands};
-use commands::{list_items, pull_image, remove_item, remove_all_stopped_containers, run_image, stop_container};
+use commands::{exec_in_container, list_items, pull_image, remove_item, remove_all_stopped_containers, run_image, run_image_with_command, show_container_info, show_container_logs, stop_container};
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { image, command } => {
+        Commands::Run { image, detach, name, command } => {
             if command.is_empty() {
-                run_image(image).await;
+                run_image(image, detach, name).await;
             } else {
                 // For now, just use run_image since we'll handle command override internally
                 // In the future, we can pass the command through
-                run_image(image).await;
+                run_image_with_command(image, detach, name, command).await;
             }
         }
         Commands::Logs { image } => {
-            println!("Printing logs from {image}");
+            if let Err(e) = show_container_logs(image).await {
+                eprintln!("Failed to show logs: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Pull { image } => {
             pull_image(image).await;
@@ -58,6 +61,18 @@ async fn main() {
         } => {
             if let Err(e) = stop_container(container, force, timeout).await {
                 eprintln!("Failed to stop container: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Shell { container, command } => {
+            if let Err(e) = exec_in_container(container, command).await {
+                eprintln!("Failed to execute command: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Info { container } => {
+            if let Err(e) = show_container_info(container).await {
+                eprintln!("Failed to get container info: {}", e);
                 std::process::exit(1);
             }
         }
