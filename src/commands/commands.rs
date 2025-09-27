@@ -178,6 +178,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
             &storage,
             detach,
             name.clone(),
+            None,
         )
         .await
         {
@@ -241,6 +242,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
                 &storage,
                 detach,
                 name.clone(),
+                None,
             )
             .await
             {
@@ -317,6 +319,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
         &storage,
         detach,
         name,
+        None,
     )
     .await
     {
@@ -330,9 +333,201 @@ pub async fn run_image_with_command(
     name: Option<String>,
     command: Vec<String>,
 ) {
-    // For now, just call run_image since command override isn't fully implemented
-    // TODO: Pass the command to override the image's default command
-    run_image(image_name, detach, name).await;
+    // Initialize storage layout
+    let storage = match StorageLayout::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to initialize storage: {}", e);
+            return;
+        }
+    };
+
+    // First check if this is an image ID for a local image
+    if let Ok(Some((image, tag, manifest_content))) = find_image_by_id(&storage, &image_name) {
+        println!("Found local image: {}:{}", image, tag);
+
+        let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to parse local manifest: {}", e);
+                return;
+            }
+        };
+
+        // Build layer paths from the manifest
+        let mut layer_paths = Vec::new();
+        for layer in &manifest.layers {
+            let layer_path = storage.image_layer_path(&layer.digest);
+            if !layer_path.exists() {
+                eprintln!(
+                    "Layer {} not found locally. Please re-pull the image.",
+                    &layer.digest[..12]
+                );
+                return;
+            }
+            layer_paths.push(layer_path);
+        }
+
+        // Create a parsed image struct for compatibility
+        let parsed_image = RegistryImage {
+            registry: None,
+            image: image.clone(),
+            tag: tag.clone(),
+        };
+
+        println!("Running container from local image {}:{} with override...", image, tag);
+
+        if let Err(e) = run_container_with_storage(
+            &parsed_image,
+            &manifest,
+            layer_paths,
+            &storage,
+            detach,
+            name.clone(),
+            Some(command.clone()),
+        )
+        .await
+        {
+            eprintln!("Failed to run container: {}", e);
+        }
+        return;
+    }
+
+    // Not a local image ID, proceed with parsing as image reference
+    let parsed_image = match RegistryImage::parse(&image_name) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("Failed to parse image: {}", e);
+            return;
+        }
+    };
+
+    // Check if we have this image locally already
+    let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
+    if metadata_path.exists() {
+        println!(
+            "Image {}:{} found locally",
+            parsed_image.image, parsed_image.tag
+        );
+
+        // Load the manifest from local storage
+        let manifest_content = match std::fs::read_to_string(&metadata_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read local manifest: {}", e);
+                return;
+            }
+        };
+
+        let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to parse local manifest: {}", e);
+                return;
+            }
+        };
+
+        // Build layer paths
+        let mut layer_paths = Vec::new();
+        for layer in &manifest.layers {
+            let layer_path = storage.image_layer_path(&layer.digest);
+            if !layer_path.exists() {
+                println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                break; // Will fall through to pull
+            }
+            layer_paths.push(layer_path);
+        }
+
+        // If all layers exist, run directly
+        if layer_paths.len() == manifest.layers.len() {
+            println!("Running container from local image with override...");
+            if let Err(e) = run_container_with_storage(
+                &parsed_image,
+                &manifest,
+                layer_paths,
+                &storage,
+                detach,
+                name.clone(),
+                Some(command.clone()),
+            )
+            .await
+            {
+                eprintln!("Failed to run container: {}", e);
+            }
+            return;
+        }
+    }
+
+    // Image not found locally or incomplete, pull it
+    let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
+    println!("Registry: {}", registry);
+    println!("Image: {}", parsed_image.image);
+    println!("Tag: {}", parsed_image.tag);
+
+    // Get auth token
+    let token = match get_repo_auth_token(image_name.clone()).await {
+        Ok(t) => {
+            println!("Successfully obtained auth token");
+            t
+        }
+        Err(e) => {
+            eprintln!("Failed to get auth token: {}", e);
+            return;
+        }
+    };
+
+    // Get manifest
+    let manifest_json = match get_manifest_content(&parsed_image, &token).await {
+        Ok(m) => {
+            println!("Successfully downloaded manifest");
+            m
+        }
+        Err(e) => {
+            eprintln!("Failed to get manifest: {}", e);
+            return;
+        }
+    };
+
+    // Parse manifest - handle both manifest list and single manifest
+    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to parse manifest: {}", e);
+            return;
+        }
+    };
+
+    // Save the actual manifest as metadata
+    let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
+    let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
+    let _ = std::fs::write(&metadata_path, &manifest_to_save);
+
+    // Download layers with progress using storage
+    let layer_paths = match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("Failed to download layers: {}", e);
+            return;
+        }
+    };
+
+    println!("\nImage {} pulled successfully!", image_name);
+    println!("Ready to run container with override...");
+
+    // Run the container with proper storage and command override
+    if let Err(e) = run_container_with_storage(
+        &parsed_image,
+        &manifest,
+        layer_paths,
+        &storage,
+        detach,
+        name,
+        Some(command),
+    )
+    .await
+    {
+        eprintln!("Failed to run container: {}", e);
+    }
 }
 
 pub async fn exec_in_container(
@@ -1303,6 +1498,7 @@ async fn run_container_with_storage(
     storage: &StorageLayout,
     detach: bool,
     name: Option<String>,
+    command_override: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::runtime::container::{Container, ContainerConfig};
     use crate::runtime::network::{NetworkConfig, NetworkMode};
@@ -1369,6 +1565,13 @@ async fn run_container_with_storage(
                     }
                 }
             }
+        }
+    }
+
+    // Apply command override if provided
+    if let Some(override_cmd) = command_override.clone() {
+        if !override_cmd.is_empty() {
+            command = override_cmd;
         }
     }
 
@@ -2020,8 +2223,15 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                 };
 
                                 // Get command if available
-                                let command =
-                                    metadata["command"].as_str().unwrap_or("").to_string();
+                                let command = if let Some(cmd_array) = metadata["command"].as_array() {
+                                    cmd_array
+                                        .iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                } else {
+                                    metadata["command"].as_str().unwrap_or("").to_string()
+                                };
 
                                 // Get ports if available
                                 let ports = metadata["ports"].as_str().unwrap_or("").to_string();
