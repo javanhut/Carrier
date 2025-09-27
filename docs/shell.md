@@ -82,8 +82,28 @@ The command will fail if:
 - 0: Command executed successfully
 - Non-zero: Command failed or exited with error
 
+## PTY vs Non-PTY Execution
+
+### Automatic PTY Detection
+The `shell` command automatically detects when to use a pseudo-terminal (PTY):
+- PTY is enabled for interactive shells (`sh`, `bash`)
+- PTY is disabled for specific commands for better output handling
+
+### For Full TTY Support
+If you need guaranteed TTY support (arrow keys, raw mode, proper terminal handling), use the `terminal` command instead:
+
+```bash
+# Use shell for most commands
+carrier sh abc123 ls -la
+
+# Use terminal for interactive programs that need full TTY
+carrier terminal abc123 bash
+carrier terminal abc123 python3 -i
+```
+
 ## Related Commands
 
+- `carrier terminal` - Always uses PTY with full TTY support and arrow key navigation
 - `carrier run --detach` - Run container in background
 - `carrier stop` - Stop a running container
 - `carrier ls -c` - List containers to see running ones

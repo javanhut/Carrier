@@ -422,9 +422,20 @@ carrier terminal abc123 python3 -i
 carrier t abc123 bash
 ```
 
+**Features:**
+- **Full TTY Support**: Always allocates a pseudo-terminal (PTY) with proper raw mode
+- **Arrow Key Navigation**: Supports arrow keys for command history and line editing
+- **Window Resizing**: Automatically handles terminal window resize events
+- **Proper Exit Handling**: Clean exit with `exit` command or Ctrl+D without hanging
+- **Raw Mode**: Terminal is set to raw mode for immediate character processing
+- **Signal Handling**: Proper handling of terminal signals and cleanup
+
 **Behavior:**
-- Always allocates a pseudo-terminal (PTY) with proper raw mode and window resize handling.
-- Suitable for interactive programs that expect a terminal (editors, REPLs, shells).
+- Automatically enables raw mode for proper input handling including arrow keys
+- Gracefully restores terminal settings on exit
+- Handles Ctrl+C, Ctrl+D, and exit commands properly
+- Suitable for interactive programs that expect a terminal (editors, REPLs, shells)
+- Non-blocking I/O prevents hanging when processes exit
 
 ### build
 Build a container image (not yet implemented).

@@ -1984,6 +1984,35 @@ fn short12(s: &str) -> String {
 fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+    // Save the original terminal attributes
+    let mut original_attrs: libc::termios = unsafe { std::mem::zeroed() };
+    let stdin_fd = libc::STDIN_FILENO;
+    
+    // Get original terminal settings
+    if unsafe { libc::tcgetattr(stdin_fd, &mut original_attrs) } != 0 {
+        return Err("Failed to get terminal attributes".into());
+    }
+
+    // Set terminal to raw mode for proper input handling
+    let mut raw_attrs = original_attrs;
+    raw_attrs.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+    raw_attrs.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+    raw_attrs.c_cflag &= !(libc::CSIZE | libc::PARENB);
+    raw_attrs.c_cflag |= libc::CS8;
+    raw_attrs.c_oflag &= !(libc::OPOST);
+    raw_attrs.c_cc[libc::VMIN] = 1;
+    raw_attrs.c_cc[libc::VTIME] = 0;
+
+    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_attrs) } != 0 {
+        return Err("Failed to set raw mode".into());
+    }
+
+    // Ensure we restore terminal on any exit
+    let _restore_guard = scopeguard::guard((), |_| {
+        let _ = unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &original_attrs) };
+    });
 
     // Open a PTY with a reasonable default size
     let pty_system = native_pty_system();
@@ -1999,22 +2028,59 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
     drop(pair.slave); // not needed in parent
 
     // Prepare master for I/O and resizing
-    use std::sync::{Arc, Mutex};
     let master = pair.master;
     let mut reader = master.try_clone_reader()?;
     let mut writer = master.take_writer()?;
     let master_arc = Arc::new(Mutex::new(master));
 
+    // Shared flag to signal when child process has exited
+    let child_running = Arc::new(AtomicBool::new(true));
+    let child_running_tx = child_running.clone();
+    let child_running_rx = child_running.clone();
+
     // stdin -> PTY writer
     let tx = std::thread::spawn(move || {
+        use std::os::unix::io::AsRawFd;
         let mut buf = [0u8; 4096];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => { if writer.write_all(&buf[..n]).is_err() { break; } }
-                Err(_) => break,
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        
+        while child_running_tx.load(Ordering::Relaxed) {
+            // Use select to check if stdin has data available with timeout
+            let mut read_fds = unsafe { std::mem::zeroed::<libc::fd_set>() };
+            unsafe { libc::FD_ZERO(&mut read_fds) };
+            unsafe { libc::FD_SET(stdin_fd, &mut read_fds) };
+            
+            let mut timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100_000, // 100ms timeout
+            };
+            
+            let result = unsafe {
+                libc::select(
+                    stdin_fd + 1,
+                    &mut read_fds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut timeout,
+                )
+            };
+            
+            if result > 0 && unsafe { libc::FD_ISSET(stdin_fd, &read_fds) } {
+                // Data is available, read it
+                let bytes_read = unsafe {
+                    libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                
+                if bytes_read > 0 {
+                    let n = bytes_read as usize;
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                } else if bytes_read == 0 {
+                    break; // EOF
+                }
             }
+            // If result <= 0, either timeout or error, continue loop to check child_running
         }
     });
 
@@ -2022,7 +2088,7 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
     let rx = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut stdout = std::io::stdout();
-        loop {
+        while child_running_rx.load(Ordering::Relaxed) {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -2036,9 +2102,10 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
 
     // Resize thread: poll terminal size and update PTY size
     let master_for_resize = master_arc.clone();
+    let child_running_resize = child_running.clone();
     let _resize_handle = std::thread::spawn(move || {
         let mut last = (24u16, 80u16);
-        loop {
+        while child_running_resize.load(Ordering::Relaxed) {
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
             let ok = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0;
             if ok {
@@ -2054,9 +2121,14 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
         }
     });
 
+    // Wait for child to complete and signal threads to stop
     let status = child.wait()?;
+    child_running.store(false, Ordering::Relaxed);
+    
+    // Wait for threads to finish
     let _ = tx.join();
     let _ = rx.join();
+    
     Ok(status.exit_code() as i32)
 }
 

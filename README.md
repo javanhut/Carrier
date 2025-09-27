@@ -73,7 +73,7 @@ carrier sh <container-id> redis-cli ping
 # Interactive shell
 carrier sh <container-id>
 
-# Force a PTY terminal (full TTY support)
+# Force a PTY terminal (full TTY support with arrow keys)
 carrier terminal <container-id>
 # or with alias
 carrier t <container-id> bash
