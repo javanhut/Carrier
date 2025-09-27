@@ -64,11 +64,19 @@ carrier run ubuntu
 # Run with detached mode
 carrier run -d redis
 
+# Run with specific platform (useful on multi-arch hosts)
+carrier run --platform linux/arm64 alpine uname -m
+
 # Execute commands in running container
 carrier sh <container-id> redis-cli ping
 
 # Interactive shell
 carrier sh <container-id>
+
+# Force a PTY terminal (full TTY support)
+carrier terminal <container-id>
+# or with alias
+carrier t <container-id> bash
 
 # Stop container
 carrier stop <container-id>
@@ -82,6 +90,9 @@ carrier rm <container-id>
 # Pull images
 carrier pull nginx:latest
 carrier pull quay.io/prometheus/prometheus
+
+# Pull for a specific platform
+carrier pull --platform linux/arm64 alpine
 
 # List images
 carrier ls -i

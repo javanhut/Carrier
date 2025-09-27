@@ -13,23 +13,23 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { image, detach, name, command } => {
+        Commands::Run { image, detach, name, command, platform } => {
             if command.is_empty() {
-                run_image(image, detach, name).await;
+                run_image(image, detach, name, platform, cli.storage_driver.clone()).await;
             } else {
                 // For now, just use run_image since we'll handle command override internally
                 // In the future, we can pass the command through
-                run_image_with_command(image, detach, name, command).await;
+                run_image_with_command(image, detach, name, command, platform, cli.storage_driver.clone()).await;
             }
         }
-        Commands::Logs { image } => {
-            if let Err(e) = show_container_logs(image).await {
+        Commands::Logs { image, follow, tail, timestamps, since, search, fuzzy, regex } => {
+            if let Err(e) = show_container_logs(image, follow, tail, timestamps, since, search, fuzzy, regex).await {
                 eprintln!("Failed to show logs: {}", e);
                 std::process::exit(1);
             }
         }
-        Commands::Pull { image } => {
-            pull_image(image).await;
+        Commands::Pull { image, platform } => {
+            pull_image(image, platform).await;
         }
         Commands::Auth { username, registry } => {
             println!("Login into {registry} using {username}");
@@ -65,8 +65,14 @@ async fn main() {
             }
         }
         Commands::Shell { container, command } => {
-            if let Err(e) = exec_in_container(container, command).await {
+            if let Err(e) = exec_in_container(container, command, false).await {
                 eprintln!("Failed to execute command: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Terminal { container, command } => {
+            if let Err(e) = exec_in_container(container, command, true).await {
+                eprintln!("Failed to open terminal: {}", e);
                 std::process::exit(1);
             }
         }

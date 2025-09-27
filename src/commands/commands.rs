@@ -9,6 +9,7 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 lazy_static! {
     static ref REGISTRYMAP: HashMap<&'static str, &'static str> = {
@@ -106,7 +107,13 @@ struct Platform {
     variant: Option<String>,
 }
 
-pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
+pub async fn run_image(
+    image_name: String,
+    detach: bool,
+    name: Option<String>,
+    platform: Option<String>,
+    storage_driver: Option<String>,
+) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
         Ok(s) => s,
@@ -179,6 +186,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
             detach,
             name.clone(),
             None,
+            storage_driver.as_deref(),
         )
         .await
         {
@@ -243,6 +251,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
                 detach,
                 name.clone(),
                 None,
+                storage_driver.as_deref(),
             )
             .await
             {
@@ -283,7 +292,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token).await {
+    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse manifest: {}", e);
@@ -320,6 +329,7 @@ pub async fn run_image(image_name: String, detach: bool, name: Option<String>) {
         detach,
         name,
         None,
+        storage_driver.as_deref(),
     )
     .await
     {
@@ -332,6 +342,8 @@ pub async fn run_image_with_command(
     detach: bool,
     name: Option<String>,
     command: Vec<String>,
+    platform: Option<String>,
+    storage_driver: Option<String>,
 ) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -385,6 +397,7 @@ pub async fn run_image_with_command(
             detach,
             name.clone(),
             Some(command.clone()),
+            storage_driver.as_deref(),
         )
         .await
         {
@@ -449,6 +462,7 @@ pub async fn run_image_with_command(
                 detach,
                 name.clone(),
                 Some(command.clone()),
+                storage_driver.as_deref(),
             )
             .await
             {
@@ -489,7 +503,7 @@ pub async fn run_image_with_command(
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token).await {
+    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse manifest: {}", e);
@@ -523,6 +537,7 @@ pub async fn run_image_with_command(
         detach,
         name,
         Some(command),
+        storage_driver.as_deref(),
     )
     .await
     {
@@ -533,6 +548,7 @@ pub async fn run_image_with_command(
 pub async fn exec_in_container(
     container_id: String,
     command: Vec<String>,
+    force_pty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize storage layout
     let storage = StorageLayout::new()?;
@@ -562,7 +578,7 @@ pub async fn exec_in_container(
     if !is_running {
         return Err(format!(
             "Container {} is not running (status: {})",
-            &full_container_id[..12],
+            short12(&full_container_id),
             status
         )
         .into());
@@ -585,7 +601,7 @@ pub async fn exec_in_container(
         // they might be from a different run or the PID wasn't saved properly
         return Err(format!(
             "Container {} appears to be running but PID file not found. Try stopping and restarting the container.",
-            &full_container_id[..12]
+            short12(&full_container_id)
         ).into());
     }
 
@@ -606,7 +622,7 @@ pub async fn exec_in_container(
 
         return Err(format!(
             "Container {} process (PID {}) is not running. Status updated.",
-            &full_container_id[..12],
+            short12(&full_container_id),
             container_pid
         )
         .into());
@@ -621,75 +637,81 @@ pub async fn exec_in_container(
 
     println!(
         "Executing command in container {}: {:?}",
-        &full_container_id[..12],
+        short12(&full_container_id),
         cmd_to_run
     );
 
-    // Use nsenter to enter the container's namespaces
-    use std::process::{Command, Stdio};
+    // Build unshare+chroot command to enter container environment
+    // This approach works better with user namespaces than nsenter
+    let mut unshare_args: Vec<String> = vec![
+        "--user".into(),
+        "--map-root-user".into(),
+        "chroot".into(),
+        rootfs.to_string_lossy().to_string(),
+    ];
+    unshare_args.extend(cmd_to_run.clone());
 
-    let mut exec_cmd = Command::new("nsenter");
-
-    // Enter all namespaces of the target process
-    exec_cmd
-        .arg("-t")
-        .arg(container_pid.to_string())
-        .arg("-m") // Mount namespace
-        .arg("-u") // UTS namespace
-        .arg("-i") // IPC namespace
-        .arg("-n") // Network namespace
-        .arg("-p"); // PID namespace
-
-    // Add the command to execute
-    exec_cmd.args(&cmd_to_run);
-
-    // Check if this is an interactive command
-    let is_interactive = cmd_to_run.len() == 1
-        && (cmd_to_run[0] == "/bin/sh"
-            || cmd_to_run[0] == "/bin/bash"
-            || cmd_to_run[0] == "sh"
-            || cmd_to_run[0] == "bash");
+    // Check if this is an interactive command or PTY is forced
+    let is_interactive = force_pty || (
+        cmd_to_run.len() == 1
+            && (cmd_to_run[0] == "/bin/sh"
+                || cmd_to_run[0] == "/bin/bash"
+                || cmd_to_run[0] == "sh"
+                || cmd_to_run[0] == "bash")
+    );
 
     if is_interactive {
         println!("Starting interactive shell session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
 
-        exec_cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+        let exit_code = spawn_with_pty("unshare", &unshare_args).map_err(|e| format!("Failed to start PTY session: {}", e))?;
+        if exit_code != 0 {
+            return Err(format!("Command exited with code {}", exit_code).into());
+        }
+        return Ok(());
     } else {
         // For non-interactive commands, just inherit stdout/stderr
+        use std::process::{Command, Stdio};
+        let mut exec_cmd = Command::new("unshare");
+        exec_cmd.args(&unshare_args);
         exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    }
 
-    // Execute the command
-    let mut child = exec_cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "nsenter command not found. Please install util-linux package.".to_string()
-        } else if e.to_string().contains("Operation not permitted") {
-            format!(
-                "Permission denied. You may need to run this command with elevated privileges: {}",
-                e
-            )
-        } else {
-            format!("Failed to execute command: {}", e)
+        let mut child = exec_cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "unshare command not found. Please install util-linux package.".to_string()
+            } else if e.to_string().contains("Operation not permitted") {
+                format!(
+                    "Permission denied. You may need to run this command with elevated privileges: {}",
+                    e
+                )
+            } else {
+                format!("Failed to execute command: {}", e)
+            }
+        })?;
+
+        // Wait for the command to complete
+        let status = child.wait()?;
+
+        if !status.success() {
+            if let Some(code) = status.code() {
+                return Err(format!("Command exited with code {}", code).into());
+            }
         }
-    })?;
 
-    // Wait for the command to complete
-    let status = child.wait()?;
-
-    if !status.success() {
-        if let Some(code) = status.code() {
-            return Err(format!("Command exited with code {}", code).into());
-        }
+        Ok(())
     }
-
-    Ok(())
 }
 
-pub async fn show_container_logs(container_id: String) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn show_container_logs(
+    container_id: String,
+    follow: bool,
+    tail: Option<usize>,
+    timestamps: bool,
+    since: Option<String>,
+    search: Option<String>,
+    fuzzy: bool,
+    regex: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize storage layout
     let storage = StorageLayout::new()?;
     
@@ -704,31 +726,73 @@ pub async fn show_container_logs(container_id: String) -> Result<(), Box<dyn std
     // Check if container log file exists
     let log_file = container_dir.join("container.log");
     if !log_file.exists() {
-        println!("No logs available for container {}", &full_container_id[..12]);
+        println!("No logs available for container {}", short12(&full_container_id));
         println!("Container may not have been run in detached mode or may not have produced any output yet.");
         return Ok(());
     }
     
-    // Read and display the logs
-    let logs = std::fs::read_to_string(&log_file)?;
-    if logs.trim().is_empty() {
-        println!("Log file exists but is empty for container {}", &full_container_id[..12]);
-        return Ok(());
-    }
-    
-    // Display logs with timestamps if available
-    println!("Logs for container {}:", &full_container_id[..12]);
-    println!("{}", "─".repeat(60));
-    
-    for line in logs.lines() {
-        if !line.trim().is_empty() {
-            println!("{}", line);
+    // Display logs
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    // Build filters
+    let since_time = since
+        .as_deref()
+        .and_then(|s| parse_since(s).ok());
+    let search = search.map(|s| s.to_lowercase());
+    // Pre-compile regex (case-insensitive) if provided
+    let regex = if let Some(pat) = regex {
+        // (?i) for case-insensitive matching
+        Some(regex::Regex::new(&format!("(?i){}", pat)).map_err(|e| format!("Invalid regex: {}", e))?)
+    } else { None };
+
+    // File mtime for best-effort since filtering of non-timestamped lines
+    let file_meta = std::fs::metadata(&log_file)?;
+    let file_mtime_utc: Option<chrono::DateTime<chrono::Utc>> = file_meta.modified().ok().map(|t| chrono::DateTime::<chrono::Utc>::from(t));
+
+    if follow {
+        // Tail-follow implementation: optionally seek to last N lines, then stream appends
+        let mut file = File::open(&log_file)?;
+
+        if let Some(n) = tail {
+            if n > 0 {
+                let pos = seek_to_last_n_lines(&mut file, n)?;
+                let _ = file.seek(SeekFrom::Start(pos))?;
+            }
+        }
+
+        println!("Following logs for container {} (press Ctrl+C to stop)...", short12(&full_container_id));
+        let mut reader = BufReader::new(file);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // No new data; sleep briefly and retry
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Ok(_) => {
+                    if let Some(out) = filter_and_format_log_line(&line, since_time, file_mtime_utc, timestamps, search.as_deref(), fuzzy, regex.as_ref()) {
+                        print!("{}", out);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error reading log: {}", e);
+                    break;
+                }
+            }
+        }
+    } else {
+        // Non-follow mode: read file, optionally tail
+        let logs = std::fs::read_to_string(&log_file)?;
+        let lines: Vec<&str> = logs.lines().collect();
+        let start = tail.map(|n| lines.len().saturating_sub(n)).unwrap_or(0);
+        for line in &lines[start..] {
+            if let Some(out) = filter_and_format_log_line(line, since_time, file_mtime_utc, timestamps, search.as_deref(), fuzzy, regex.as_ref()) {
+                print!("{}", out);
+            }
         }
     }
-    
-    println!("{}", "─".repeat(60));
-    println!("End of logs for container {}", &full_container_id[..12]);
-    
+
     Ok(())
 }
 
@@ -778,7 +842,7 @@ fn show_container_details(
     println!("║ ID:        {:<54} ║", full_container_id);
 
     // Short ID
-    println!("║ Short ID:  {:<54} ║", &full_container_id[..12]);
+    println!("║ Short ID:  {:<54} ║", short12(&full_container_id));
 
     // Name
     let default_name = format!("car_{}", &full_container_id[..6]);
@@ -799,6 +863,10 @@ fn show_container_details(
         format!("⚫ {}", status)
     };
     println!("║ Status:    {:<54} ║", status_display);
+    // Storage driver indicator
+    if let Some(driver) = metadata["storage_driver"].as_str() {
+        println!("║ Storage:   {:<54} ║", driver);
+    }
 
     // Created
     let created = metadata["created"].as_str().unwrap_or("unknown");
@@ -992,20 +1060,20 @@ fn show_container_details(
     if status == "running" || status.starts_with("Up") {
         println!(
             "║ • carrier sh {}                                          ║",
-            &full_container_id[..12]
+            short12(&full_container_id)
         );
         println!(
             "║ • carrier stop {}                                        ║",
-            &full_container_id[..12]
+            short12(&full_container_id)
         );
         println!(
             "║ • carrier logs {} (if implemented)                      ║",
-            &full_container_id[..12]
+            short12(&full_container_id)
         );
     } else {
         println!(
             "║ • carrier rm {}                                          ║",
-            &full_container_id[..12]
+            short12(&full_container_id)
         );
         println!(
             "║ • carrier run {} (to start a new instance)              ║",
@@ -1178,7 +1246,7 @@ fn count_running_instances(
     Ok(count)
 }
 
-pub async fn pull_image(image_name: String) {
+pub async fn pull_image(image_name: String, platform: Option<String>) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
         Ok(s) => s,
@@ -1231,7 +1299,7 @@ pub async fn pull_image(image_name: String) {
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token).await {
+    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse manifest: {}", e);
@@ -1291,16 +1359,23 @@ async fn parse_and_get_manifest(
     manifest_json: &str,
     parsed_image: &RegistryImage,
     token: &str,
+    platform: Option<&str>,
 ) -> Result<ManifestV2, Box<dyn std::error::Error>> {
     // First try to parse as manifest list
     if let Ok(manifest_list) = serde_json::from_str::<ManifestList>(manifest_json) {
         println!("Detected manifest list, selecting appropriate platform...");
 
-        // Find the linux/amd64 manifest (or first available)
+        // Determine desired platform
+        let (want_os, want_arch) = platform
+            .and_then(|p| p.split_once('/'))
+            .map(|(os, arch)| (os.to_string(), arch.to_string()))
+            .unwrap_or_else(|| ("linux".to_string(), "amd64".to_string()));
+
+        // Find the desired platform (or first available)
         let selected_manifest = manifest_list
             .manifests
             .iter()
-            .find(|m| m.platform.os == "linux" && m.platform.architecture == "amd64")
+            .find(|m| m.platform.os == want_os && m.platform.architecture == want_arch)
             .or_else(|| manifest_list.manifests.first())
             .ok_or("No suitable manifest found in manifest list")?;
 
@@ -1448,47 +1523,73 @@ async fn download_blob_with_progress(
     multi_progress: &MultiProgress,
     label: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Create progress bar
-    let pb = multi_progress.add(ProgressBar::new(expected_size));
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-            .progress_chars("#>-"),
-    );
-    pb.set_message(format!("{} {}", label, &digest[..12]));
+    let mut attempt = 0;
+    let max_attempts = 3;
+    loop {
+        // Create progress bar for this attempt
+        let pb = multi_progress.add(ProgressBar::new(expected_size));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
+                .progress_chars("#>-")
+        );
+        pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
 
-    // Make request
-    let response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await?;
+        // Make request
+        let response = client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?;
 
-    if !response.status().is_success() {
-        return Err(format!("Failed to download blob: {}", response.status()).into());
+        if !response.status().is_success() {
+            pb.finish_with_message(format!("✗ {} {}", label, &digest[..12]));
+            attempt += 1;
+            if attempt >= max_attempts {
+                return Err(format!("Failed to download blob: {}", response.status()).into());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            continue;
+        }
+
+        // Get content length if available
+        let content_length = response.content_length().unwrap_or(expected_size);
+        if content_length != expected_size && content_length > 0 {
+            pb.set_length(content_length);
+        }
+
+        // Download with progress
+        let mut downloaded = Vec::new();
+        let mut stream = response.bytes_stream();
+
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            downloaded.extend_from_slice(&chunk);
+            pb.inc(chunk.len() as u64);
+        }
+
+        // Verify digest if provided as sha256
+        if let Some(hex_expected) = digest.strip_prefix("sha256:") {
+            let mut hasher = sha2::Sha256::new();
+            use sha2::Digest;
+            hasher.update(&downloaded);
+            let actual = hasher.finalize();
+            let actual_hex = hex::encode(actual);
+            if actual_hex != hex_expected {
+                pb.finish_with_message(format!("✗ digest mismatch for {}", &digest[..12]));
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err("Downloaded blob digest verification failed".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                continue;
+            }
+        }
+
+        pb.finish_with_message(format!("✓ {} {}", label, &digest[..12]));
+        return Ok(downloaded);
     }
-
-    // Get content length if available
-    let content_length = response.content_length().unwrap_or(expected_size);
-
-    if content_length != expected_size && content_length > 0 {
-        pb.set_length(content_length);
-    }
-
-    // Download with progress
-    let mut downloaded = Vec::new();
-    let mut stream = response.bytes_stream();
-
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        downloaded.extend_from_slice(&chunk);
-        pb.inc(chunk.len() as u64);
-    }
-
-    pb.finish_with_message(format!("✓ {} {}", label, &digest[..12]));
-
-    Ok(downloaded)
 }
 
 async fn run_container_with_storage(
@@ -1499,6 +1600,7 @@ async fn run_container_with_storage(
     detach: bool,
     name: Option<String>,
     command_override: Option<Vec<String>>,
+    storage_driver: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::runtime::container::{Container, ContainerConfig};
     use crate::runtime::network::{NetworkConfig, NetworkMode};
@@ -1518,8 +1620,16 @@ async fn run_container_with_storage(
     // Create container with overlay filesystem
     println!("Setting up container filesystem with overlay...");
 
-    let container_storage = ContainerStorage::new()?;
+    // Preflight checks for rootless operation
+    crate::storage::preflight_rootless_checks();
+    // Allow forcing storage driver via CLI
+    let mut container_storage = if let Some(drv) = storage_driver { ContainerStorage::new_with_driver(Some(drv))? } else { ContainerStorage::new()? };
     let rootfs = container_storage.create_container_filesystem(&container_id, layer_paths)?;
+    let storage_driver_str = match container_storage.last_driver() {
+        crate::storage::StorageDriver::OverlayFuse => "overlay(fuse)",
+        crate::storage::StorageDriver::OverlayNative => "overlay(native)",
+        crate::storage::StorageDriver::Vfs => "vfs",
+    };
 
     println!("Container filesystem ready at: {}", rootfs.display());
 
@@ -1624,7 +1734,8 @@ async fn run_container_with_storage(
         "created": chrono::Utc::now().to_rfc3339(),
         "rootfs": rootfs.to_string_lossy(),
         "command": container_config.command,
-        "status": "running"
+        "status": "running",
+        "storage_driver": storage_driver_str
     });
 
     if let Some(parent) = container_meta_path.parent() {
@@ -1636,15 +1747,14 @@ async fn run_container_with_storage(
     if detach {
         println!(
             "\nRunning container {} in detached mode...",
-            &container_id[..12]
+            short12(&container_id)
         );
     } else {
         println!("\nRunning container {}...", container_id);
     }
     println!("Command: {:?}", &command_to_run);
 
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     if command_to_run.is_empty() || command_to_run[0].is_empty() {
         println!("No command specified in image");
@@ -1691,48 +1801,76 @@ async fn run_container_with_storage(
     cmd.args(&command_to_run);
 
     if detach {
-        // For detached containers, redirect stdout/stderr to log file
-        let log_file = storage.container_path(&container_id).join("container.log");
-        let log_file_stdout = std::fs::File::create(&log_file)?;
-        let log_file_stderr = log_file_stdout.try_clone()?;
-        
-        let child = cmd
+        // For detached containers, pipe stdout/stderr and write timestamped lines to log file
+        let log_path = storage.container_path(&container_id).join("container.log");
+
+        let mut child = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file_stdout))
-            .stderr(Stdio::from(log_file_stderr))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         // Save the PID to a file
         let pid_file = storage.container_path(&container_id).join("pid");
         std::fs::write(&pid_file, child.id().to_string())?;
 
-        println!("Container {} started in background", &container_id[..12]);
-        println!("Logs are being written to: {}", log_file.display());
-        println!("To view logs: carrier logs {}", &container_id[..12]);
-        println!("To stop: carrier stop {}", &container_id[..12]);
+        // Spawn logging threads
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log_writer = std::sync::Arc::new(std::sync::Mutex::new(log_file));
 
-        // Don't wait for the process - let it run in background
+        // stdout thread
+        if let Some(stdout) = child.stdout.take() {
+            let writer = log_writer.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let stamp = chrono::Utc::now().to_rfc3339();
+                    let mut w = writer.lock().unwrap();
+                    let _ = writeln!(w, "{} {}", stamp, line);
+                }
+            });
+        }
+        // stderr thread
+        if let Some(stderr) = child.stderr.take() {
+            let writer = log_writer.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let stamp = chrono::Utc::now().to_rfc3339();
+                    let mut w = writer.lock().unwrap();
+                    let _ = writeln!(w, "{} {}", stamp, line);
+                }
+            });
+        }
+
+        println!("Container {} started in background", short12(&container_id));
+        println!("Logs are being written to: {}", log_path.display());
+        println!("To view logs: carrier logs {}", short12(&container_id));
+        println!("To stop: carrier stop {}", short12(&container_id));
+
+        // Do not wait for the child; threads handle logging
         return Ok(());
     } else if is_interactive {
         println!("\nStarting interactive container session...");
         println!("Type 'exit' or press Ctrl+D to exit the container.\n");
 
-        // For interactive containers, use spawn and inherit stdio
-        let mut child = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
-        // Save the PID to a file
-        let pid_file = storage.container_path(&container_id).join("pid");
-        std::fs::write(&pid_file, child.id().to_string())?;
-
-        // Wait for the process to complete
-        let status = child.wait()?;
-        let exit_code = status.code().unwrap_or(0);
+        // Build argv for unshare + chroot + command
+        let mut args: Vec<String> = vec![
+            "--user".into(),
+            "--map-root-user".into(),
+            "--mount".into(),
+            "--pid".into(),
+            "--fork".into(),
+            "chroot".into(),
+            rootfs.display().to_string(),
+        ];
+        args.extend(command_to_run.clone());
+        let exit_code = spawn_with_pty("unshare", &args)?;
 
         // Remove PID file after process exits
+        let pid_file = storage.container_path(&container_id).join("pid");
         let _ = std::fs::remove_file(&pid_file);
 
         // Update container status
@@ -1748,14 +1886,14 @@ async fn run_container_with_storage(
         if exit_code == 0 {
             println!("\nContainer {} exited successfully", container_id);
         } else {
-            println!(
-                "\nContainer {} exited with code {}",
-                container_id, exit_code
-            );
+            println!("\nContainer {} exited with code {}", container_id, exit_code);
         }
     } else {
         // For non-interactive containers, capture output
-        match cmd.output() {
+        use std::process::Command;
+        match Command::new("unshare").args([
+            "--user","--map-root-user","--mount","--pid","--fork","chroot", &rootfs.to_string_lossy()
+        ]).args(&command_to_run).output() {
             Ok(output) => {
                 // Print output
                 if !output.stdout.is_empty() {
@@ -1838,6 +1976,258 @@ fn normalize_image_path(image_name: &str) -> String {
     }
 }
 
+fn short12(s: &str) -> String {
+    s.chars().take(12).collect::<String>()
+}
+
+// Spawn a Command under a pseudo-terminal with TTY semantics, window resizing, and raw mode
+fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+
+    // Open a PTY with a reasonable default size
+    let pty_system = native_pty_system();
+    let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    let pair = pty_system.openpty(size)?;
+
+    // Build command
+    let mut builder = CommandBuilder::new(program);
+    builder.args(args.iter().map(|s| s.as_str()));
+
+    // Spawn the child connected to the slave end of the PTY
+    let mut child = pair.slave.spawn_command(builder)?;
+    drop(pair.slave); // not needed in parent
+
+    // Prepare master for I/O and resizing
+    use std::sync::{Arc, Mutex};
+    let master = pair.master;
+    let mut reader = master.try_clone_reader()?;
+    let mut writer = master.take_writer()?;
+    let master_arc = Arc::new(Mutex::new(master));
+
+    // stdin -> PTY writer
+    let tx = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => { if writer.write_all(&buf[..n]).is_err() { break; } }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // PTY reader -> stdout
+    let rx = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut stdout = std::io::stdout();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout.write_all(&buf[..n]).is_err() { break; }
+                    let _ = stdout.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Resize thread: poll terminal size and update PTY size
+    let master_for_resize = master_arc.clone();
+    let _resize_handle = std::thread::spawn(move || {
+        let mut last = (24u16, 80u16);
+        loop {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            let ok = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0;
+            if ok {
+                let current = (ws.ws_row, ws.ws_col);
+                if current != last && ws.ws_row > 0 && ws.ws_col > 0 {
+                    if let Ok(guard) = master_for_resize.lock() {
+                        let _ = guard.resize(PtySize { rows: ws.ws_row, cols: ws.ws_col, pixel_width: 0, pixel_height: 0 });
+                    }
+                    last = current;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+
+    let status = child.wait()?;
+    let _ = tx.join();
+    let _ = rx.join();
+    Ok(status.exit_code() as i32)
+}
+
+fn parse_since(input: &str) -> Result<chrono::DateTime<chrono::Utc>, Box<dyn std::error::Error>> {
+    // Try RFC3339 first
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(input) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    // Try duration suffixes: s,m,h,d
+    let (num_part, unit) = input.trim().split_at(input.trim().len().saturating_sub(1));
+    let n: i64 = num_part.parse()?;
+    let dur = match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        _ => return Err("Invalid since format".into()),
+    };
+    Ok(chrono::Utc::now() - dur)
+}
+
+fn filter_and_format_log_line(
+    raw_line: &str,
+    since_time: Option<chrono::DateTime<chrono::Utc>>,
+    file_mtime_utc: Option<chrono::DateTime<chrono::Utc>>,
+    show_timestamps: bool,
+    search: Option<&str>,
+    fuzzy: bool,
+    regex: Option<&regex::Regex>,
+) -> Option<String> {
+    let line = raw_line.trim_end_matches('\n');
+    if line.is_empty() { return None; }
+
+    // Parse optional timestamp prefix: RFC3339 followed by space
+    let (ts, content) = if let Some((ts_str, rest)) = line.split_once(' ') {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+            (Some(dt.with_timezone(&chrono::Utc)), rest)
+        } else {
+            (None, line)
+        }
+    } else {
+        (None, line)
+    };
+
+    // Apply since filter only if we have a parsable timestamp
+    match (since_time, ts) {
+        (Some(since_dt), Some(entry_dt)) => {
+            if entry_dt < since_dt { return None; }
+        }
+        (Some(since_dt), None) => {
+            // Best-effort: include only if file mtime is newer than since
+            if let Some(mtime) = file_mtime_utc {
+                if mtime < since_dt { return None; }
+            }
+        }
+        _ => {}
+    }
+
+    // Apply search filter
+    if let Some(re) = regex {
+        if !re.is_match(content) { return None; }
+    } else if let Some(q) = search {
+        let lc = content.to_lowercase();
+        let matched = if fuzzy { fuzzy_match(&lc, q) } else { lc.contains(q) };
+        if !matched { return None; }
+    }
+
+    // Format output
+    let out = if show_timestamps {
+        let stamp = ts.unwrap_or_else(|| chrono::Utc::now()).to_rfc3339();
+        format!("{} {}\n", stamp, content)
+    } else {
+        format!("{}\n", content)
+    };
+    Some(out)
+}
+
+fn fuzzy_match(text: &str, pattern: &str) -> bool {
+    if pattern.is_empty() { return true; }
+    let mut it = text.chars();
+    for pc in pattern.chars() {
+        let mut found = false;
+        while let Some(tc) = it.next() {
+            if tc == pc { found = true; break; }
+        }
+        if !found { return false; }
+    }
+    true
+}
+
+#[cfg(test)]
+fn choose_manifest_digest(manifest_list_json: &str, platform: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest_list: ManifestList = serde_json::from_str(manifest_list_json)?;
+    let (want_os, want_arch) = platform
+        .and_then(|p| p.split_once('/'))
+        .map(|(os, arch)| (os, arch))
+        .unwrap_or(("linux", "amd64"));
+    let selected = manifest_list
+        .manifests
+        .iter()
+        .find(|m| m.platform.os == want_os && m.platform.architecture == want_arch)
+        .or_else(|| manifest_list.manifests.first())
+        .ok_or("no manifest")?;
+    Ok(selected.digest.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Write, Read, Seek, SeekFrom};
+
+    #[test]
+    fn test_normalize_image_path() {
+        assert_eq!(normalize_image_path("alpine"), "library/alpine");
+        assert_eq!(normalize_image_path("library/nginx"), "library/nginx");
+        assert_eq!(normalize_image_path("myorg/myimg"), "myorg/myimg");
+    }
+
+    #[test]
+    fn test_choose_manifest_digest() {
+        let json = r#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [
+                {"mediaType":"application/vnd.docker.distribution.manifest.v2+json","size":123,"digest":"sha256:amd64digest","platform":{"architecture":"amd64","os":"linux"}},
+                {"mediaType":"application/vnd.docker.distribution.manifest.v2+json","size":124,"digest":"sha256:arm64digest","platform":{"architecture":"arm64","os":"linux"}}
+            ]
+        }"#;
+        assert_eq!(choose_manifest_digest(json, Some("linux/arm64")).unwrap(), "sha256:arm64digest");
+        assert_eq!(choose_manifest_digest(json, Some("linux/amd64")).unwrap(), "sha256:amd64digest");
+        // default picks first if platform not provided
+        let d = choose_manifest_digest(json, None).unwrap();
+        assert!(d.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_seek_to_last_n_lines() {
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        tf.write_all(content.as_bytes()).unwrap();
+        let mut file = std::fs::File::open(tf.path()).unwrap();
+        let pos = seek_to_last_n_lines(&mut file, 2).unwrap();
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        let mut out = String::new();
+        file.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "line4\nline5\n");
+    }
+
+    #[test]
+    fn test_parse_since_duration() {
+        let now = chrono::Utc::now();
+        let dt = parse_since("10m").unwrap();
+        assert!(now - dt >= chrono::Duration::minutes(9));
+        assert!(now - dt <= chrono::Duration::minutes(11));
+    }
+
+    #[test]
+    fn test_parse_since_rfc3339() {
+        let s = "2020-01-01T00:00:00Z";
+        let dt = parse_since(s).unwrap();
+        assert_eq!(dt.to_rfc3339(), s);
+    }
+
+    #[test]
+    fn test_fuzzy_match() {
+        assert!(fuzzy_match("hello world", "hwd"));
+        assert!(fuzzy_match("ContainerLogs", "clg"));
+        assert!(!fuzzy_match("abc", "acdb"));
+    }
+}
+
 pub async fn get_repo_auth_token(url: String) -> Result<String, Box<dyn std::error::Error>> {
     let parsed_image = RegistryImage::parse(&url)?;
     let client = Client::new();
@@ -1898,11 +2288,36 @@ pub async fn make_authenticated_request(
         .header("Authorization", format!("Bearer {}", token))
         .header(
             "Accept",
-            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json",
         )
         .send()
         .await?;
     Ok(response)
+}
+
+// Helper: seek to last N lines in a file
+fn seek_to_last_n_lines(file: &mut std::fs::File, n: usize) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::{Seek, SeekFrom, Read};
+    if n == 0 { return Ok(0); }
+    let pos_len = file.metadata()?.len() as i64;
+    let mut pos = pos_len;
+    let mut count = 0usize;
+    let mut buf = [0u8; 1024];
+    while pos > 0 && count <= n {
+        let read_size = std::cmp::min(buf.len() as i64, pos) as usize;
+        pos -= read_size as i64;
+        file.seek(SeekFrom::Start(pos as u64))?;
+        file.read_exact(&mut buf[..read_size])?;
+        for &b in buf[..read_size].iter().rev() {
+            if b == b'\n' {
+                count += 1;
+                if count > n { break; }
+            }
+        }
+    }
+    // If file shorter than requested lines, start at 0
+    let start = if count > n { pos as u64 } else { 0 };
+    Ok(start)
 }
 
 // List command implementation
@@ -2212,7 +2627,7 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                 };
 
                                 // Format status display
-                                let status_display = match actual_status {
+                                let mut status_display = match actual_status {
                                     "created" => format!("Created"),
                                     "running" => format!("Up {}", created_display.clone()),
                                     "exited" => format!("Exited (0) {}", created_display.clone()),
@@ -2221,6 +2636,13 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     }
                                     _ => actual_status.to_string(),
                                 };
+
+                                // Append storage driver indicator if present
+                                if let Some(driver) = metadata["storage_driver"].as_str() {
+                                    if !driver.is_empty() {
+                                        status_display = format!("{} ({})", status_display, driver);
+                                    }
+                                }
 
                                 // Get command if available
                                 let command = if let Some(cmd_array) = metadata["command"].as_array() {
@@ -2662,7 +3084,7 @@ pub async fn stop_container(
         return Ok(());
     }
 
-    println!("Stopping container {}...", &full_container_id[..12]);
+    println!("Stopping container {}...", short12(&full_container_id));
 
     // Get the PID file if it exists
     let pid_file = container_dir.join("pid");
@@ -2737,7 +3159,7 @@ pub async fn stop_container(
 
     std::fs::write(&metadata_path, metadata.to_string())?;
 
-    println!("Container {} stopped", &full_container_id[..12]);
+    println!("Container {} stopped", short12(&full_container_id));
     Ok(())
 }
 

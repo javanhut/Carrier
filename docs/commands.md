@@ -338,12 +338,21 @@ carrier auth <username> <registry>
 ```
 
 ### logs
-Show logs from a container. Only works for containers that were run in detached mode (`-d` flag) or containers that have produced output.
+Show logs from a container. Works for containers run in detached mode (`-d`) or any container that has produced output written to `container.log`.
 
 **Usage:**
 ```bash
-carrier logs <container-id>
+carrier logs [OPTIONS] <container-id>
 ```
+
+**Options:**
+- `-f, --follow`: Stream logs and wait for new lines.
+- `--tail <N>`: Show only the last N lines before streaming or exiting.
+- `--timestamps`: Display RFC3339 timestamps for each line. If the line lacks a timestamp, a current-time stamp is added for display.
+- `--since <TIME|DURATION>`: Only show logs since the given time. Accepts RFC3339 (e.g., `2024-09-26T12:30:00Z`) or durations like `10m`, `2h`, `1d`. For lines without timestamps, a best-effort filter is applied using the log file's modification time.
+- `--search <TERM>`: Case-insensitive substring filtering.
+- `--fuzzy`: Use subsequence fuzzy matching with `--search` (e.g., `hwd` matches `hello world`).
+- `--regex <PATTERN>`: Case-insensitive regex filtering; overrides `--search/--fuzzy` when provided.
 
 **Examples:**
 ```bash
@@ -352,21 +361,70 @@ carrier logs abc123def456
 
 # Using partial container ID
 carrier logs abc1
+
+# Follow and show last 100 lines with timestamps
+carrier logs -f --tail 100 --timestamps abc1
+
+# Show logs since 15 minutes ago, filter by 'error'
+carrier logs --since 15m --search error abc1
+
+# Fuzzy search 'hwd' (matches 'hello world')
+carrier logs --search hwd --fuzzy abc1
+
+# Regex matching (case-insensitive)
+carrier logs --regex "^\s*ERROR" abc1
 ```
 
 **Features:**
-- Displays all output from detached containers
-- Captures both stdout and stderr
-- Supports partial container ID matching
-- Shows clear messages when no logs are available
-- Logs are persistently stored until container is removed
+- Captures both stdout and stderr for detached containers.
+- Partial ID matching is supported.
+- Clear messages when no logs are available.
+- Logs persist until the container is removed.
 
 **Behavior:**
-- For detached containers: Shows all captured output since container start
-- For interactive containers: No logs are captured as output goes directly to terminal
-- Log files are stored in the container directory as `container.log`
-- If no log file exists or container is not found, appropriate error messages are displayed
-- Logs persist until the container is removed with `carrier rm`
+- Detached containers write timestamped lines to `container.log`.
+- Interactive containers write directly to the terminal, so `container.log` may be empty or missing.
+- If no log file exists or the container is not found, an appropriate message is displayed.
+
+### shell
+Execute a command inside a running container. Defaults to `/bin/sh` when no command is given.
+
+**Usage:**
+```bash
+carrier shell <container-id> [COMMAND...]
+```
+
+**Aliases:** `sh`, `exec`, `execute`
+
+**Notes:**
+- Shell attempts to allocate a PTY automatically when running common shells (sh/bash) for a better interactive experience.
+- Forcing a PTY for any command is supported via the `terminal` command below.
+
+### terminal
+Open a PTY terminal inside a running container. Always forces a TTY regardless of the command.
+
+**Usage:**
+```bash
+carrier terminal <container-id> [COMMAND...]
+```
+
+**Aliases:** `term`, `t`
+
+**Examples:**
+```bash
+# Open an interactive shell with full TTY support
+carrier terminal abc123
+
+# Run a TTY session for an arbitrary program
+carrier terminal abc123 python3 -i
+
+# Use a short alias
+carrier t abc123 bash
+```
+
+**Behavior:**
+- Always allocates a pseudo-terminal (PTY) with proper raw mode and window resize handling.
+- Suitable for interactive programs that expect a terminal (editors, REPLs, shells).
 
 ### build
 Build a container image (not yet implemented).

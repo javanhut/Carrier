@@ -9,6 +9,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "carrier_config.toml")]
     config: String,
 
+    /// Force storage driver: auto, overlay-fuse, overlay-native, or vfs
+    #[arg(long = "storage-driver")]
+    pub storage_driver: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -16,11 +20,33 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Show container logs
-    Logs { image: String },
+    Logs {
+        /// Container ID or name
+        image: String,
+        /// Follow log output
+        #[arg(short = 'f', long = "follow")]
+        follow: bool,
+        /// Number of lines to show from the end of the logs
+        #[arg(long = "tail")]
+        tail: Option<usize>,
+        /// Show timestamps with each log line
+        #[arg(long = "timestamps")]
+        timestamps: bool,
+        /// Only show logs since the given time (RFC3339) or duration like 10m, 2h, 1d
+        #[arg(long = "since")]
+        since: Option<String>,
+        /// Case-insensitive search term; combined with --fuzzy for fuzzy matching
+        #[arg(long = "search")]
+        search: Option<String>,
+        /// Enable fuzzy matching for --search (subsequence match)
+        #[arg(long = "fuzzy")]
+        fuzzy: bool,
+        /// Use a regex pattern to filter lines (case-insensitive). Overrides --search/--fuzzy if set.
+        #[arg(long = "regex")]
+        regex: Option<String>,
+    },
 
-    /// Pull an image from registry
-    #[command(alias="p", aliases=["download", "get"])]
-    Pull { image: String },
+    // Pull command moved below with platform option
 
     /// Run a container from an image
     Run {
@@ -37,6 +63,10 @@ pub enum Commands {
         /// Optional command to override the image default
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+
+        /// Target platform (e.g., linux/amd64, linux/arm64)
+        #[arg(long = "platform")]
+        platform: Option<String>,
     },
 
     /// Build a container image
@@ -91,7 +121,7 @@ pub enum Commands {
     },
 
     /// Execute a command in a running container
-    #[command(alias = "sh", aliases = ["exec","execute", "term", "terminal"])]
+    #[command(alias = "sh", aliases = ["exec","execute"])]
     Shell {
         /// Container ID or name
         container: String,
@@ -101,11 +131,31 @@ pub enum Commands {
         command: Vec<String>,
     },
     
+    /// Open a PTY terminal inside a running container (forces TTY)
+    #[command(aliases = ["term", "t"])]
+    Terminal {
+        /// Container ID or name
+        container: String,
+        
+        /// Command to execute (defaults to /bin/sh)
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    
     /// Show detailed information about a container
     #[command(alias = "inspect")]
     Info {
         /// Container ID or name
         container: String,
+    },
+
+    /// Pull an image with optional platform selection
+    #[command(alias="p", aliases=["download", "get"])]
+    Pull {
+        image: String,
+        /// Target platform (e.g., linux/amd64)
+        #[arg(long = "platform")]
+        platform: Option<String>,
     },
 }
 
@@ -168,5 +218,41 @@ impl RegistryImage {
             Some(reg) => format!("{}/{}:{}", reg, self.image, self.tag),
             None => format!("{}:{}", self.image, self.tag),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegistryImage;
+
+    #[test]
+    fn parse_simple_image() {
+        let img = RegistryImage::parse("alpine").unwrap();
+        assert_eq!(img.registry, None);
+        assert_eq!(img.image, "alpine");
+        assert_eq!(img.tag, "latest");
+    }
+
+    #[test]
+    fn parse_with_tag() {
+        let img = RegistryImage::parse("nginx:1.25").unwrap();
+        assert_eq!(img.image, "nginx");
+        assert_eq!(img.tag, "1.25");
+    }
+
+    #[test]
+    fn parse_with_registry() {
+        let img = RegistryImage::parse("docker.io/library/ubuntu:22.04").unwrap();
+        assert_eq!(img.registry.as_deref(), Some("docker.io"));
+        assert_eq!(img.image, "library/ubuntu");
+        assert_eq!(img.tag, "22.04");
+    }
+
+    #[test]
+    fn parse_localhost_registry() {
+        let img = RegistryImage::parse("localhost:5000/my/app:dev").unwrap();
+        assert_eq!(img.registry.as_deref(), Some("localhost:5000"));
+        assert_eq!(img.image, "my/app");
+        assert_eq!(img.tag, "dev");
     }
 }
