@@ -495,7 +495,45 @@ pub async fn exec_in_container(
 }
 
 pub async fn show_container_logs(container_id: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Printing logs from {}", container_id);
+    // Initialize storage layout
+    let storage = StorageLayout::new()?;
+    
+    // Find the container
+    let container_dir = find_container_by_id(&storage, &container_id)?;
+    let full_container_id = container_dir
+        .file_name()
+        .ok_or("Invalid container directory")?
+        .to_string_lossy()
+        .to_string();
+    
+    // Check if container log file exists
+    let log_file = container_dir.join("container.log");
+    if !log_file.exists() {
+        println!("No logs available for container {}", &full_container_id[..12]);
+        println!("Container may not have been run in detached mode or may not have produced any output yet.");
+        return Ok(());
+    }
+    
+    // Read and display the logs
+    let logs = std::fs::read_to_string(&log_file)?;
+    if logs.trim().is_empty() {
+        println!("Log file exists but is empty for container {}", &full_container_id[..12]);
+        return Ok(());
+    }
+    
+    // Display logs with timestamps if available
+    println!("Logs for container {}:", &full_container_id[..12]);
+    println!("{}", "─".repeat(60));
+    
+    for line in logs.lines() {
+        if !line.trim().is_empty() {
+            println!("{}", line);
+        }
+    }
+    
+    println!("{}", "─".repeat(60));
+    println!("End of logs for container {}", &full_container_id[..12]);
+    
     Ok(())
 }
 
@@ -1450,11 +1488,15 @@ async fn run_container_with_storage(
     cmd.args(&command_to_run);
 
     if detach {
-        // For detached containers, redirect stdio to null
+        // For detached containers, redirect stdout/stderr to log file
+        let log_file = storage.container_path(&container_id).join("container.log");
+        let log_file_stdout = std::fs::File::create(&log_file)?;
+        let log_file_stderr = log_file_stdout.try_clone()?;
+        
         let child = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file_stdout))
+            .stderr(Stdio::from(log_file_stderr))
             .spawn()?;
 
         // Save the PID to a file
@@ -1462,6 +1504,7 @@ async fn run_container_with_storage(
         std::fs::write(&pid_file, child.id().to_string())?;
 
         println!("Container {} started in background", &container_id[..12]);
+        println!("Logs are being written to: {}", log_file.display());
         println!("To view logs: carrier logs {}", &container_id[..12]);
         println!("To stop: carrier stop {}", &container_id[..12]);
 

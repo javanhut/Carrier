@@ -4,12 +4,12 @@ A lightweight, secure, rootless container runtime and management tool written in
 ## Features
 
 ### Core Capabilities
-- 🚀 **Rootless by Design** - Run containers without root privileges
-- 📦 **Multi-Registry Support** - Pull from Docker Hub, Quay.io, GHCR, GCR, ECR, and more
-- 🔄 **Container Lifecycle Management** - Run, stop, remove, and execute commands
-- 🏃 **Multiple Execution Modes** - Interactive, detached, and exec into running containers
-- 🧹 **Bulk Operations** - Clean up all stopped containers with one command
-- 📊 **Clean Output** - Formatted tables for listing images and containers
+- **Rootless by Design** - Run containers without root privileges
+- **Multi-Registry Support** - Pull from Docker Hub, Quay.io, GHCR, GCR, ECR, and more
+- **Container Lifecycle Management** - Run, stop, remove, and execute commands
+- **Multiple Execution Modes** - Interactive, detached, and exec into running containers
+- **Bulk Operations** - Clean up all stopped containers with one command
+- **Clean Output** - Formatted tables for listing images and containers
 
 ### Technical Features
 - **Custom Runtime** - Built-in container runtime, no dependency on runc/crun
@@ -158,16 +158,16 @@ carrier/
 ## Comparison
 
 ### vs Docker
-- ✅ No daemon required
-- ✅ Rootless by default
-- ✅ Lighter resource usage
-- ✅ Direct execution model
+-  No daemon required
+-  Rootless by default
+-  Lighter resource usage
+-  Direct execution model
 
 ### vs Podman
-- ✅ No external runtime dependency (runc/crun)
-- ✅ Simpler architecture
-- ✅ Faster container startup
-- ✅ Integrated runtime
+- x No external runtime dependency (runc/crun)
+-  Simpler architecture
+-  Faster container startup
+-  Integrated runtime
 
 ## Contributing
 

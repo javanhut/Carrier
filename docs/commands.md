@@ -105,8 +105,9 @@ carrier run alpine echo "Hello World"
 When running with `-d` or `--detach`:
 - Container runs in the background
 - Returns immediately with container ID
-- Output is redirected to null (future: logs)
+- Output is captured to log files for later viewing
 - Container continues running after terminal closes
+- Use `carrier logs` to view captured output
 - Use `carrier stop` to stop the container
 - Use `carrier sh` to execute commands in the container
 
@@ -337,12 +338,35 @@ carrier auth <username> <registry>
 ```
 
 ### logs
-Show container logs (not yet implemented).
+Show logs from a container. Only works for containers that were run in detached mode (`-d` flag) or containers that have produced output.
 
 **Usage:**
 ```bash
 carrier logs <container-id>
 ```
+
+**Examples:**
+```bash
+# Show logs from a detached container
+carrier logs abc123def456
+
+# Using partial container ID
+carrier logs abc1
+```
+
+**Features:**
+- Displays all output from detached containers
+- Captures both stdout and stderr
+- Supports partial container ID matching
+- Shows clear messages when no logs are available
+- Logs are persistently stored until container is removed
+
+**Behavior:**
+- For detached containers: Shows all captured output since container start
+- For interactive containers: No logs are captured as output goes directly to terminal
+- Log files are stored in the container directory as `container.log`
+- If no log file exists or container is not found, appropriate error messages are displayed
+- Logs persist until the container is removed with `carrier rm`
 
 ### build
 Build a container image (not yet implemented).
