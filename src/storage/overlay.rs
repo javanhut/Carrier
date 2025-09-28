@@ -1,7 +1,43 @@
-use nix::mount::{MsFlags, mount, umount};
+use nix::mount::{mount, umount, MsFlags};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::env;
+
+/// Get runtime directory with auto-detection and fallback
+fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // First check if XDG_RUNTIME_DIR is already set
+    if let Some(dir) = dirs::runtime_dir() {
+        return Ok(dir);
+    }
+
+    // If not set, try to detect and set it
+    let uid = nix::unistd::getuid().as_raw();
+    let runtime_dir = PathBuf::from(format!("/run/user/{}", uid));
+
+    // Check if the expected runtime dir exists
+    if runtime_dir.exists() {
+        // Set the environment variable for this process and children
+        env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        println!("Auto-detected XDG_RUNTIME_DIR: {}", runtime_dir.display());
+        Ok(runtime_dir)
+    } else {
+        // Fallback to /tmp if /run/user/{uid} doesn't exist
+        let fallback = PathBuf::from(format!("/tmp/runtime-{}", uid));
+        fs::create_dir_all(&fallback)?;
+
+        // Set permissions to 0700
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(&fallback)?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&fallback, perms)?;
+
+        env::set_var("XDG_RUNTIME_DIR", &fallback);
+        println!("Using fallback XDG_RUNTIME_DIR: {}", fallback.display());
+        Ok(fallback)
+    }
+}
 
 pub struct ContainerStorage {
     // Persistent data (upper/work) rooted under user data dir
@@ -29,16 +65,21 @@ impl ContainerStorage {
             .join("storage");
         fs::create_dir_all(&persistent_dir)?;
 
-        // Runtime base (XDG_RUNTIME_DIR)
-        let runtime_dir = dirs::runtime_dir()
-            .ok_or("Cannot determine runtime directory (XDG_RUNTIME_DIR) for rootless mounts")?
+        // Runtime base (XDG_RUNTIME_DIR) with auto-detection
+        let runtime_dir = get_runtime_dir()?
             .join("carrier");
         fs::create_dir_all(&runtime_dir)?;
 
         // Check if we can use native overlayfs or need fuse-overlayfs
         let use_fuse_overlayfs = !can_use_native_overlay();
 
-        Ok(Self { persistent_dir, runtime_dir, use_fuse_overlayfs, forced_driver: None, last_driver: None })
+        Ok(Self {
+            persistent_dir,
+            runtime_dir,
+            use_fuse_overlayfs,
+            forced_driver: None,
+            last_driver: None,
+        })
     }
 
     pub fn new_with_driver(forced: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
@@ -81,19 +122,29 @@ impl ContainerStorage {
             Some(StorageDriver::OverlayFuse) => StorageDriver::OverlayFuse,
             Some(StorageDriver::OverlayNative) => StorageDriver::OverlayNative,
             Some(StorageDriver::Vfs) => StorageDriver::Vfs,
-            None => if self.use_fuse_overlayfs { StorageDriver::OverlayFuse } else { StorageDriver::OverlayNative },
+            None => {
+                if self.use_fuse_overlayfs {
+                    StorageDriver::OverlayFuse
+                } else {
+                    StorageDriver::OverlayNative
+                }
+            }
         };
 
         // Execute
         let mut mounted = false;
         if matches!(chosen, StorageDriver::OverlayNative) {
-            if let Err(e) = self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+            if let Err(e) =
+                self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir)
+            {
                 eprintln!("native overlay mount failed: {}", e);
             } else {
                 mounted = true;
             }
         } else if matches!(chosen, StorageDriver::OverlayFuse) {
-            if let Err(e) = self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+            if let Err(e) =
+                self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir)
+            {
                 eprintln!("fuse-overlayfs mount failed: {}", e);
             } else {
                 mounted = true;
@@ -185,7 +236,13 @@ impl ContainerStorage {
     }
 
     pub fn last_driver(&self) -> StorageDriver {
-        self.last_driver.clone().unwrap_or(if self.use_fuse_overlayfs { StorageDriver::OverlayFuse } else { StorageDriver::OverlayNative })
+        self.last_driver
+            .clone()
+            .unwrap_or(if self.use_fuse_overlayfs {
+                StorageDriver::OverlayFuse
+            } else {
+                StorageDriver::OverlayNative
+            })
     }
 }
 
@@ -305,13 +362,15 @@ impl ContainerStorage {
 
 // Preflight rootless environment checks with actionable hints
 pub fn preflight_rootless_checks() {
-    // XDG_RUNTIME_DIR
-    match dirs::runtime_dir() {
-        Some(p) => {
-            if !p.exists() { let _ = fs::create_dir_all(&p); }
+    // XDG_RUNTIME_DIR with auto-detection
+    match get_runtime_dir() {
+        Ok(p) => {
+            if !p.exists() {
+                let _ = fs::create_dir_all(&p);
+            }
             println!("Using runtime dir: {}", p.display());
         }
-        None => eprintln!("Warning: XDG_RUNTIME_DIR not set. Rootless mounts may fail."),
+        Err(e) => eprintln!("Warning: Could not determine runtime directory: {}", e),
     }
 
     // fusermount3 SUID

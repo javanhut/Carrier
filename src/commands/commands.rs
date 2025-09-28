@@ -3,12 +3,14 @@ use crate::storage::{
     extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout,
 };
 
+use base64::prelude::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 lazy_static! {
@@ -111,6 +113,7 @@ pub async fn run_image(
     image_name: String,
     detach: bool,
     name: Option<String>,
+    elevated: bool,
     platform: Option<String>,
     storage_driver: Option<String>,
 ) {
@@ -185,6 +188,7 @@ pub async fn run_image(
             &storage,
             detach,
             name.clone(),
+            elevated,
             None,
             storage_driver.as_deref(),
         )
@@ -250,6 +254,7 @@ pub async fn run_image(
                 &storage,
                 detach,
                 name.clone(),
+                elevated,
                 None,
                 storage_driver.as_deref(),
             )
@@ -267,8 +272,9 @@ pub async fn run_image(
     println!("Image: {}", parsed_image.image);
     println!("Tag: {}", parsed_image.tag);
 
-    // Get auth token
-    let token = match get_repo_auth_token(image_name.clone()).await {
+    // Get auth token (try authenticated first, fall back to anonymous)
+    let image_path = normalize_image_path(&parsed_image.image);
+    let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             println!("Successfully obtained auth token");
             t
@@ -292,13 +298,16 @@ pub async fn run_image(
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to parse manifest: {}", e);
-            return;
-        }
-    };
+    let manifest =
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to parse manifest: {}", e);
+                return;
+            }
+        };
 
     // Save the actual manifest (not the manifest list) as metadata
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
@@ -328,6 +337,7 @@ pub async fn run_image(
         &storage,
         detach,
         name,
+        elevated,
         None,
         storage_driver.as_deref(),
     )
@@ -341,6 +351,7 @@ pub async fn run_image_with_command(
     image_name: String,
     detach: bool,
     name: Option<String>,
+    elevated: bool,
     command: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
@@ -387,7 +398,10 @@ pub async fn run_image_with_command(
             tag: tag.clone(),
         };
 
-        println!("Running container from local image {}:{} with override...", image, tag);
+        println!(
+            "Running container from local image {}:{} with override...",
+            image, tag
+        );
 
         if let Err(e) = run_container_with_storage(
             &parsed_image,
@@ -396,6 +410,7 @@ pub async fn run_image_with_command(
             &storage,
             detach,
             name.clone(),
+            elevated,
             Some(command.clone()),
             storage_driver.as_deref(),
         )
@@ -461,6 +476,7 @@ pub async fn run_image_with_command(
                 &storage,
                 detach,
                 name.clone(),
+                elevated,
                 Some(command.clone()),
                 storage_driver.as_deref(),
             )
@@ -478,8 +494,9 @@ pub async fn run_image_with_command(
     println!("Image: {}", parsed_image.image);
     println!("Tag: {}", parsed_image.tag);
 
-    // Get auth token
-    let token = match get_repo_auth_token(image_name.clone()).await {
+    // Get auth token (try authenticated first, fall back to anonymous)
+    let image_path = normalize_image_path(&parsed_image.image);
+    let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             println!("Successfully obtained auth token");
             t
@@ -503,13 +520,16 @@ pub async fn run_image_with_command(
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to parse manifest: {}", e);
-            return;
-        }
-    };
+    let manifest =
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to parse manifest: {}", e);
+                return;
+            }
+        };
 
     // Save the actual manifest as metadata
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
@@ -517,13 +537,14 @@ pub async fn run_image_with_command(
     let _ = std::fs::write(&metadata_path, &manifest_to_save);
 
     // Download layers with progress using storage
-    let layer_paths = match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
-        Ok(paths) => paths,
-        Err(e) => {
-            eprintln!("Failed to download layers: {}", e);
-            return;
-        }
-    };
+    let layer_paths =
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("Failed to download layers: {}", e);
+                return;
+            }
+        };
 
     println!("\nImage {} pulled successfully!", image_name);
     println!("Ready to run container with override...");
@@ -536,6 +557,7 @@ pub async fn run_image_with_command(
         &storage,
         detach,
         name,
+        elevated,
         Some(command),
         storage_driver.as_deref(),
     )
@@ -543,6 +565,299 @@ pub async fn run_image_with_command(
     {
         eprintln!("Failed to run container: {}", e);
     }
+}
+
+/// Execute a command in an elevated container without user namespace mapping
+async fn exec_elevated_container(
+    container_dir: &Path,
+    rootfs: &Path,
+    container_pid: i32,
+    command: Vec<String>,
+    is_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::{Command, Stdio};
+
+    println!("Executing in elevated container (PID {}) with sudo", container_pid);
+
+    // For elevated containers, use sudo unshare without user namespace
+    let mut exec_cmd = Command::new("sudo");
+
+    // Use the same namespace setup as container creation but no user namespace
+    exec_cmd.arg("unshare")
+        .arg("--mount")
+        .arg("--pid")
+        .arg("chroot")
+        .arg(rootfs);
+
+    // Ensure we use full paths for commands
+    let cmd_with_path = if !command.is_empty() && !command[0].starts_with('/') {
+        // Try to find the command in common locations
+        let cmd_name = &command[0];
+        let possible_paths = vec![
+            format!("/bin/{}", cmd_name),
+            format!("/usr/bin/{}", cmd_name),
+            format!("/sbin/{}", cmd_name),
+            format!("/usr/sbin/{}", cmd_name),
+        ];
+
+        // Check which path exists in the rootfs
+        let mut found_path = format!("/bin/{}", cmd_name); // default
+        for path in &possible_paths {
+            let full_path = rootfs.join(&path[1..]); // Remove leading /
+            if full_path.exists() {
+                found_path = path.clone();
+                break;
+            }
+        }
+
+        let mut full_path_cmd = vec![found_path];
+        if command.len() > 1 {
+            full_path_cmd.extend(command[1..].iter().cloned());
+        }
+        full_path_cmd
+    } else {
+        command.clone()
+    };
+
+    exec_cmd.args(&cmd_with_path);
+
+    // Set up environment
+    exec_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    exec_cmd.env("HOME", "/root");
+    exec_cmd.env("TERM", "xterm");
+
+    if is_interactive {
+        println!("Starting interactive session with elevated privileges...");
+        println!("Type 'exit' or press Ctrl+D to exit.\n");
+
+        // Check if we're in a TTY
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+
+        if is_tty {
+            // Try using PTY for interactive session with sudo
+            let mut sudo_args = vec![
+                "unshare".to_string(),
+                "--mount".to_string(),
+                "--pid".to_string(),
+                "chroot".to_string(),
+                rootfs.to_string_lossy().to_string(),
+            ];
+            sudo_args.extend(cmd_with_path.clone());
+
+            let exit_code = spawn_with_pty("sudo", &sudo_args)
+                .unwrap_or_else(|_| {
+                    // Fallback to regular execution
+                    let mut child = exec_cmd
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .expect("Failed to spawn unshare");
+
+                    let status = child.wait().expect("Failed to wait for child");
+                    status.code().unwrap_or(1)
+                });
+
+            if exit_code != 0 {
+                return Err(format!("Command exited with code {}", exit_code).into());
+            }
+        } else {
+            println!("Not running in a TTY, using regular command execution...");
+            exec_cmd.stdin(Stdio::inherit());
+            exec_cmd.stdout(Stdio::inherit());
+            exec_cmd.stderr(Stdio::inherit());
+
+            let mut child = exec_cmd.spawn()?;
+            let status = child.wait()?;
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    return Err(format!("Command exited with code {}", code).into());
+                }
+            }
+        }
+    } else {
+        // Non-interactive execution
+        exec_cmd.stdout(Stdio::inherit());
+        exec_cmd.stderr(Stdio::inherit());
+
+        let mut child = exec_cmd.spawn()?;
+        let status = child.wait()?;
+
+        if !status.success() {
+            if let Some(code) = status.code() {
+                return Err(format!("Command exited with code {}", code).into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute a command in a rootless container by directly entering its rootfs
+async fn exec_rootless_container(
+    container_dir: &Path,
+    rootfs: &Path,
+    container_pid: i32,
+    command: Vec<String>,
+    is_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::{Command, Stdio};
+
+    println!("Executing in rootless container (PID {})", container_pid);
+
+    // For entering an already running container, we should use nsenter to join its namespaces
+    // Check if we're running as root (e.g., with sudo)
+    let is_root = nix::unistd::Uid::effective().is_root();
+
+    let mut exec_cmd = if is_root {
+        // If running as root, use nsenter directly
+        let mut cmd = Command::new("nsenter");
+        cmd.arg("--target").arg(container_pid.to_string())
+           .arg("--mount")
+           .arg("--uts")
+           .arg("--net")
+           .arg("--pid")
+           .arg("--root").arg(rootfs)  // Set the root filesystem
+           .arg("--wd=/");  // Set working directory to /
+        cmd
+    } else {
+        // If not root, we need to use unshare approach since nsenter requires root
+        let mut cmd = Command::new("unshare");
+        cmd.arg("--user")
+           .arg("--map-root-user")  // Map current user to root
+           .arg("--mount")
+           .arg("--pid")
+           .arg("chroot")
+           .arg(rootfs);
+        cmd
+    };
+
+    // For nsenter with --root, we don't need full paths as nsenter handles the root change
+    // For unshare with chroot, we do need full paths
+    let cmd_with_path = if is_root {
+        // With nsenter, use commands as-is since --root handles the filesystem
+        command.clone()
+    } else if !command.is_empty() && !command[0].starts_with('/') {
+        // Try to find the command in common locations
+        let cmd_name = &command[0];
+        let possible_paths = vec![
+            format!("/bin/{}", cmd_name),
+            format!("/usr/bin/{}", cmd_name),
+            format!("/sbin/{}", cmd_name),
+            format!("/usr/sbin/{}", cmd_name),
+        ];
+
+        // Check which path exists in the rootfs
+        let mut found_path = format!("/bin/{}", cmd_name); // default
+        for path in &possible_paths {
+            let full_path = rootfs.join(&path[1..]); // Remove leading /
+            if full_path.exists() {
+                found_path = path.clone();
+                break;
+            }
+        }
+
+        let mut full_path_cmd = vec![found_path];
+        if command.len() > 1 {
+            full_path_cmd.extend(command[1..].iter().cloned());
+        }
+        full_path_cmd
+    } else {
+        command.clone()
+    };
+
+    exec_cmd.args(&cmd_with_path);
+
+    // Set up environment
+    exec_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    exec_cmd.env("HOME", "/root");
+    exec_cmd.env("TERM", "xterm");
+
+    if is_interactive {
+        println!("Starting interactive session...");
+        println!("Type 'exit' or press Ctrl+D to exit.\n");
+
+        // Check if we're in a TTY
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+
+        if is_tty {
+            // Try using PTY for interactive session
+            let (cmd_name, args) = if is_root {
+                // Use nsenter for root
+                let mut nsenter_args = vec![
+                    "--target".to_string(),
+                    container_pid.to_string(),
+                    "--mount".to_string(),
+                    "--uts".to_string(),
+                    "--net".to_string(),
+                    "--pid".to_string(),
+                    "--root".to_string(),
+                    rootfs.to_string_lossy().to_string(),
+                    "--wd=/".to_string(),
+                ];
+                nsenter_args.extend(cmd_with_path.clone());
+                ("nsenter", nsenter_args)
+            } else {
+                // Use unshare for non-root
+                let mut unshare_args = vec![
+                    "--user".to_string(),
+                    "--map-root-user".to_string(),
+                    "--mount".to_string(),
+                    "--pid".to_string(),
+                    "chroot".to_string(),
+                    rootfs.to_string_lossy().to_string(),
+                ];
+                unshare_args.extend(cmd_with_path.clone());
+                ("unshare", unshare_args)
+            };
+
+            let exit_code = spawn_with_pty(cmd_name, &args)
+                .unwrap_or_else(|_| {
+                    // Fallback to regular execution
+                    let mut child = exec_cmd
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .expect("Failed to spawn unshare");
+
+                    let status = child.wait().expect("Failed to wait for child");
+                    status.code().unwrap_or(1)
+                });
+
+            if exit_code != 0 {
+                return Err(format!("Command exited with code {}", exit_code).into());
+            }
+        } else {
+            println!("Not running in a TTY, using regular command execution...");
+            exec_cmd.stdin(Stdio::inherit());
+            exec_cmd.stdout(Stdio::inherit());
+            exec_cmd.stderr(Stdio::inherit());
+
+            let mut child = exec_cmd.spawn()?;
+            let status = child.wait()?;
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    return Err(format!("Command exited with code {}", code).into());
+                }
+            }
+        }
+    } else {
+        // Non-interactive execution
+        exec_cmd.stdout(Stdio::inherit());
+        exec_cmd.stderr(Stdio::inherit());
+
+        let mut child = exec_cmd.spawn()?;
+        let status = child.wait()?;
+
+        if !status.success() {
+            if let Some(code) = status.code() {
+                return Err(format!("Command exited with code {}", code).into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn exec_in_container(
@@ -641,64 +956,195 @@ pub async fn exec_in_container(
         cmd_to_run
     );
 
-    // Build unshare+chroot command to enter container environment
-    // This approach works better with user namespaces than nsenter
-    let mut unshare_args: Vec<String> = vec![
-        "--user".into(),
-        "--map-root-user".into(),
-        "chroot".into(),
-        rootfs.to_string_lossy().to_string(),
-    ];
-    unshare_args.extend(cmd_to_run.clone());
-
     // Check if this is an interactive command or PTY is forced
-    let is_interactive = force_pty || (
-        cmd_to_run.len() == 1
+    let is_interactive = force_pty
+        || (cmd_to_run.len() == 1
             && (cmd_to_run[0] == "/bin/sh"
                 || cmd_to_run[0] == "/bin/bash"
                 || cmd_to_run[0] == "sh"
-                || cmd_to_run[0] == "bash")
-    );
+                || cmd_to_run[0] == "bash"));
+
+    // Check if the container was started with elevated privileges
+    let elevated = metadata["elevated"].as_bool().unwrap_or(false);
+
+    // Check if we're running as root or regular user
+    let is_root = nix::unistd::Uid::effective().is_root();
+
+    // Handle based on how the container was created
+    if !elevated {
+        // Container was created as rootless, use rootless exec regardless of current privileges
+        return exec_rootless_container(&container_dir, &rootfs, container_pid, cmd_to_run, is_interactive).await;
+    }
+
+    // For elevated/root containers, check if we need special handling
+    if !is_root && elevated {
+        // Running as non-root but container needs elevated privileges
+        return exec_elevated_container(&container_dir, &rootfs, container_pid, cmd_to_run, is_interactive).await;
+    }
+
+    // For root containers running with root privileges, use nsenter
+    let mut nsenter_args: Vec<String> = vec![
+        "--target".into(),
+        container_pid.to_string(),
+        "--mount".into(),
+        "--uts".into(),
+        "--ipc".into(),
+        "--net".into(),
+        "--pid".into(),
+        format!("--root={}", rootfs.to_string_lossy()),
+        "--".into(),
+    ];
+    
+    // Wrap the command to ensure we're in a valid directory
+    let wrapped_cmd = if cmd_to_run.is_empty() {
+        vec!["sh".to_string(), "-c".to_string(), "cd / 2>/dev/null || true; exec /bin/sh".to_string()]
+    } else {
+        let cmd_str = cmd_to_run.join(" ");
+        vec!["sh".to_string(), "-c".to_string(), format!("cd / 2>/dev/null || true; exec {}", cmd_str)]
+    };
+    
+    nsenter_args.extend(wrapped_cmd);
 
     if is_interactive {
         println!("Starting interactive shell session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
 
-        let exit_code = spawn_with_pty("unshare", &unshare_args).map_err(|e| format!("Failed to start PTY session: {}", e))?;
-        if exit_code != 0 {
-            return Err(format!("Command exited with code {}", exit_code).into());
+        // Check if we're running in a TTY
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+
+        if is_tty {
+            // Try nsenter first, then fallback to sudo if permission denied
+            match spawn_with_pty("nsenter", &nsenter_args) {
+                Ok(exit_code) => {
+                    if exit_code != 0 {
+                        return Err(format!("Command exited with code {}", exit_code).into());
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.to_string().contains("Operation not permitted") => {
+                    println!("Permission denied with nsenter, trying with sudo...");
+                    let mut sudo_args = vec!["nsenter".to_string()];
+                    sudo_args.extend(nsenter_args);
+
+                    let exit_code = spawn_with_pty("sudo", &sudo_args)
+                        .map_err(|e| format!("Failed to start PTY session with sudo: {}", e))?;
+                    if exit_code != 0 {
+                        return Err(format!("Command exited with code {}", exit_code).into());
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("Failed to start PTY session: {}", e).into()),
+            }
+        } else {
+            // Not in a TTY, fall back to regular command execution
+            println!("Not running in a TTY, using regular command execution...");
+            use std::process::{Command, Stdio};
+
+            // Try nsenter first
+            let mut exec_cmd = Command::new("nsenter");
+            exec_cmd.args(&nsenter_args);
+            exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit()).stdin(Stdio::inherit());
+
+            match exec_cmd.spawn() {
+                Ok(mut child) => {
+                    let status = child.wait()?;
+                    if !status.success() {
+                        if let Some(code) = status.code() {
+                            return Err(format!("Command exited with code {}", code).into());
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.to_string().contains("Operation not permitted") => {
+                    println!("Permission denied with nsenter, trying with sudo...");
+
+                    let mut sudo_args = vec!["nsenter".to_string()];
+                    sudo_args.extend(nsenter_args);
+
+                    let mut sudo_cmd = Command::new("sudo");
+                    sudo_cmd.args(&sudo_args);
+                    sudo_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit()).stdin(Stdio::inherit());
+
+                    let mut child = sudo_cmd.spawn().map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            "sudo command not found. Please run as root or install sudo.".to_string()
+                        } else {
+                            format!("Failed to execute command with sudo: {}", e)
+                        }
+                    })?;
+
+                    let status = child.wait()?;
+                    if !status.success() {
+                        if let Some(code) = status.code() {
+                            return Err(format!("Command exited with code {}", code).into());
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        return Err("nsenter command not found. Please install util-linux package.".into());
+                    } else {
+                        return Err(format!("Failed to execute command: {}", e).into());
+                    }
+                }
+            }
         }
-        return Ok(());
     } else {
         // For non-interactive commands, just inherit stdout/stderr
         use std::process::{Command, Stdio};
-        let mut exec_cmd = Command::new("unshare");
-        exec_cmd.args(&unshare_args);
+
+        // Try nsenter first
+        let mut exec_cmd = Command::new("nsenter");
+        exec_cmd.args(&nsenter_args);
         exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
-        let mut child = exec_cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "unshare command not found. Please install util-linux package.".to_string()
-            } else if e.to_string().contains("Operation not permitted") {
-                format!(
-                    "Permission denied. You may need to run this command with elevated privileges: {}",
-                    e
-                )
-            } else {
-                format!("Failed to execute command: {}", e)
+        match exec_cmd.spawn() {
+            Ok(mut child) => {
+                // Wait for the command to complete
+                let status = child.wait()?;
+                if !status.success() {
+                    if let Some(code) = status.code() {
+                        return Err(format!("Command exited with code {}", code).into());
+                    }
+                }
+                return Ok(());
             }
-        })?;
+            Err(e) if e.to_string().contains("Operation not permitted") => {
+                println!("Permission denied with nsenter, trying with sudo...");
 
-        // Wait for the command to complete
-        let status = child.wait()?;
+                // Try with sudo
+                let mut sudo_args = vec!["nsenter".to_string()];
+                sudo_args.extend(nsenter_args);
 
-        if !status.success() {
-            if let Some(code) = status.code() {
-                return Err(format!("Command exited with code {}", code).into());
+                let mut sudo_cmd = Command::new("sudo");
+                sudo_cmd.args(&sudo_args);
+                sudo_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+                let mut child = sudo_cmd.spawn().map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "sudo command not found. Please run as root or install sudo.".to_string()
+                    } else {
+                        format!("Failed to execute command with sudo: {}", e)
+                    }
+                })?;
+
+                let status = child.wait()?;
+                if !status.success() {
+                    if let Some(code) = status.code() {
+                        return Err(format!("Command exited with code {}", code).into());
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err("nsenter command not found. Please install util-linux package.".into());
+                } else {
+                    return Err(format!("Failed to execute command: {}", e).into());
+                }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -714,7 +1160,7 @@ pub async fn show_container_logs(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize storage layout
     let storage = StorageLayout::new()?;
-    
+
     // Find the container
     let container_dir = find_container_by_id(&storage, &container_id)?;
     let full_container_id = container_dir
@@ -722,33 +1168,42 @@ pub async fn show_container_logs(
         .ok_or("Invalid container directory")?
         .to_string_lossy()
         .to_string();
-    
+
     // Check if container log file exists
     let log_file = container_dir.join("container.log");
     if !log_file.exists() {
-        println!("No logs available for container {}", short12(&full_container_id));
+        println!(
+            "No logs available for container {}",
+            short12(&full_container_id)
+        );
         println!("Container may not have been run in detached mode or may not have produced any output yet.");
         return Ok(());
     }
-    
+
     // Display logs
     use std::fs::File;
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
     // Build filters
-    let since_time = since
-        .as_deref()
-        .and_then(|s| parse_since(s).ok());
+    let since_time = since.as_deref().and_then(|s| parse_since(s).ok());
     let search = search.map(|s| s.to_lowercase());
     // Pre-compile regex (case-insensitive) if provided
     let regex = if let Some(pat) = regex {
         // (?i) for case-insensitive matching
-        Some(regex::Regex::new(&format!("(?i){}", pat)).map_err(|e| format!("Invalid regex: {}", e))?)
-    } else { None };
+        Some(
+            regex::Regex::new(&format!("(?i){}", pat))
+                .map_err(|e| format!("Invalid regex: {}", e))?,
+        )
+    } else {
+        None
+    };
 
     // File mtime for best-effort since filtering of non-timestamped lines
     let file_meta = std::fs::metadata(&log_file)?;
-    let file_mtime_utc: Option<chrono::DateTime<chrono::Utc>> = file_meta.modified().ok().map(|t| chrono::DateTime::<chrono::Utc>::from(t));
+    let file_mtime_utc: Option<chrono::DateTime<chrono::Utc>> = file_meta
+        .modified()
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t));
 
     if follow {
         // Tail-follow implementation: optionally seek to last N lines, then stream appends
@@ -761,7 +1216,10 @@ pub async fn show_container_logs(
             }
         }
 
-        println!("Following logs for container {} (press Ctrl+C to stop)...", short12(&full_container_id));
+        println!(
+            "Following logs for container {} (press Ctrl+C to stop)...",
+            short12(&full_container_id)
+        );
         let mut reader = BufReader::new(file);
         loop {
             let mut line = String::new();
@@ -771,7 +1229,15 @@ pub async fn show_container_logs(
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
                 Ok(_) => {
-                    if let Some(out) = filter_and_format_log_line(&line, since_time, file_mtime_utc, timestamps, search.as_deref(), fuzzy, regex.as_ref()) {
+                    if let Some(out) = filter_and_format_log_line(
+                        &line,
+                        since_time,
+                        file_mtime_utc,
+                        timestamps,
+                        search.as_deref(),
+                        fuzzy,
+                        regex.as_ref(),
+                    ) {
                         print!("{}", out);
                     }
                 }
@@ -787,7 +1253,15 @@ pub async fn show_container_logs(
         let lines: Vec<&str> = logs.lines().collect();
         let start = tail.map(|n| lines.len().saturating_sub(n)).unwrap_or(0);
         for line in &lines[start..] {
-            if let Some(out) = filter_and_format_log_line(line, since_time, file_mtime_utc, timestamps, search.as_deref(), fuzzy, regex.as_ref()) {
+            if let Some(out) = filter_and_format_log_line(
+                line,
+                since_time,
+                file_mtime_utc,
+                timestamps,
+                search.as_deref(),
+                fuzzy,
+                regex.as_ref(),
+            ) {
                 print!("{}", out);
             }
         }
@@ -1274,8 +1748,9 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     println!("Image: {}", parsed_image.image);
     println!("Tag: {}", parsed_image.tag);
 
-    // Get auth token
-    let token = match get_repo_auth_token(image_name.clone()).await {
+    // Get auth token (try authenticated first, fall back to anonymous)
+    let image_path = normalize_image_path(&parsed_image.image);
+    let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             println!("Successfully obtained auth token");
             t
@@ -1299,13 +1774,16 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest = match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref()).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to parse manifest: {}", e);
-            return;
-        }
-    };
+    let manifest =
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to parse manifest: {}", e);
+                return;
+            }
+        };
 
     // Save the actual manifest (not the manifest list) as metadata
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
@@ -1530,8 +2008,10 @@ async fn download_blob_with_progress(
         let pb = multi_progress.add(ProgressBar::new(expected_size));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-                .progress_chars("#>-")
+                .template(
+                    "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                )?
+                .progress_chars("#>-"),
         );
         pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
 
@@ -1592,6 +2072,42 @@ async fn download_blob_with_progress(
     }
 }
 
+/// Set up essential network configuration files in the container
+fn setup_container_network_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let etc_dir = rootfs.join("etc");
+    
+    println!("Setting up network files in: {}", etc_dir.display());
+    
+    // Ensure /etc exists
+    std::fs::create_dir_all(&etc_dir)?;
+    
+    // Copy host's resolv.conf for DNS resolution
+    let host_resolv = Path::new("/etc/resolv.conf");
+    let container_resolv = etc_dir.join("resolv.conf");
+    
+    // Always overwrite resolv.conf to ensure DNS works
+    if host_resolv.exists() {
+        println!("Copying host resolv.conf to container");
+        std::fs::copy(host_resolv, &container_resolv)?;
+    } else {
+        println!("Creating default resolv.conf with Google DNS");
+        // Create a basic resolv.conf with common DNS servers
+        std::fs::write(
+            &container_resolv,
+            "# Generated by carrier\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n"
+        )?;
+    }
+    
+    // Set up hosts file (always overwrite for consistency)
+    let container_hosts = etc_dir.join("hosts");
+    std::fs::write(
+        &container_hosts,
+        "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
+    )?;
+    
+    Ok(())
+}
+
 async fn run_container_with_storage(
     parsed_image: &RegistryImage,
     manifest: &ManifestV2,
@@ -1599,6 +2115,7 @@ async fn run_container_with_storage(
     storage: &StorageLayout,
     detach: bool,
     name: Option<String>,
+    elevated: bool,
     command_override: Option<Vec<String>>,
     storage_driver: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1623,7 +2140,11 @@ async fn run_container_with_storage(
     // Preflight checks for rootless operation
     crate::storage::preflight_rootless_checks();
     // Allow forcing storage driver via CLI
-    let mut container_storage = if let Some(drv) = storage_driver { ContainerStorage::new_with_driver(Some(drv))? } else { ContainerStorage::new()? };
+    let mut container_storage = if let Some(drv) = storage_driver {
+        ContainerStorage::new_with_driver(Some(drv))?
+    } else {
+        ContainerStorage::new()?
+    };
     let rootfs = container_storage.create_container_filesystem(&container_id, layer_paths)?;
     let storage_driver_str = match container_storage.last_driver() {
         crate::storage::StorageDriver::OverlayFuse => "overlay(fuse)",
@@ -1632,6 +2153,9 @@ async fn run_container_with_storage(
     };
 
     println!("Container filesystem ready at: {}", rootfs.display());
+    
+    // Set up essential files for networking
+    setup_container_network_files(&rootfs)?;
 
     // Read image config to get command and env
     let config_blob_path = storage.blob_cache_path(&manifest.config.digest);
@@ -1685,6 +2209,16 @@ async fn run_container_with_storage(
         }
     }
 
+    // For detached containers with no explicit command or only a shell, use sleep infinity
+    if detach && (command.is_empty()
+        || (command.len() == 1 && (command[0] == "/bin/sh"
+            || command[0] == "/bin/bash"
+            || command[0] == "sh"
+            || command[0] == "bash"))) {
+        println!("No persistent command specified for detached container, using 'sleep infinity'");
+        command = vec!["sleep".to_string(), "infinity".to_string()];
+    }
+
     // Add default environment if not present
     if !env.iter().any(|(k, _)| k == "PATH") {
         env.push((
@@ -1735,7 +2269,8 @@ async fn run_container_with_storage(
         "rootfs": rootfs.to_string_lossy(),
         "command": container_config.command,
         "status": "running",
-        "storage_driver": storage_driver_str
+        "storage_driver": storage_driver_str,
+        "elevated": elevated
     });
 
     if let Some(parent) = container_meta_path.parent() {
@@ -1775,18 +2310,32 @@ async fn run_container_with_storage(
         println!("Starting container with command: {}", cmd_in_container);
     }
 
-    // Use unshare with user namespaces for better isolation
-    let mut cmd = Command::new("unshare");
-
-    // Add namespace flags
-    cmd.arg("--user")
-        .arg("--map-root-user") // Map current user to root in container
-        .arg("--mount")
-        .arg("--pid")
-        .arg("--fork");
-
-    // Add chroot to the container filesystem
-    cmd.arg("chroot").arg(&rootfs);
+    // Use different approach based on elevated flag
+    let mut cmd = if elevated {
+        println!("Running container with elevated privileges (using sudo)...");
+        // For elevated mode, use sudo to run unshare without user namespace
+        // Use host networking for elevated containers to ensure network connectivity
+        let mut c = Command::new("sudo");
+        c.arg("unshare")
+            .arg("--mount")
+            .arg("--pid")
+            .arg("--fork")  // Fork to properly handle PID namespace
+            .arg("chroot")
+            .arg(&rootfs);
+        c
+    } else {
+        // For rootless mode, use user namespaces for better isolation
+        let mut c = Command::new("unshare");
+        c.arg("--user")
+            .arg("--map-root-user") // Map current user to root in container
+            .arg("--mount")
+            .arg("--pid")
+            .arg("--fork")  // Fork to properly handle PID namespace
+            .arg("--net")   // Create network namespace for rootless
+            .arg("chroot")
+            .arg(&rootfs);
+        c
+    };
 
     // Set up environment
     cmd.env(
@@ -1815,7 +2364,10 @@ async fn run_container_with_storage(
         std::fs::write(&pid_file, child.id().to_string())?;
 
         // Spawn logging threads
-        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         let log_writer = std::sync::Arc::new(std::sync::Mutex::new(log_file));
 
         // stdout thread
@@ -1862,8 +2414,7 @@ async fn run_container_with_storage(
             "--map-root-user".into(),
             "--mount".into(),
             "--pid".into(),
-            "--fork".into(),
-            "chroot".into(),
+                "chroot".into(),
             rootfs.display().to_string(),
         ];
         args.extend(command_to_run.clone());
@@ -1886,14 +2437,26 @@ async fn run_container_with_storage(
         if exit_code == 0 {
             println!("\nContainer {} exited successfully", container_id);
         } else {
-            println!("\nContainer {} exited with code {}", container_id, exit_code);
+            println!(
+                "\nContainer {} exited with code {}",
+                container_id, exit_code
+            );
         }
     } else {
         // For non-interactive containers, capture output
         use std::process::Command;
-        match Command::new("unshare").args([
-            "--user","--map-root-user","--mount","--pid","--fork","chroot", &rootfs.to_string_lossy()
-        ]).args(&command_to_run).output() {
+        match Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "chroot",
+                &rootfs.to_string_lossy(),
+            ])
+            .args(&command_to_run)
+            .output()
+        {
             Ok(output) => {
                 // Print output
                 if !output.stdout.is_empty() {
@@ -1981,47 +2544,101 @@ fn short12(s: &str) -> String {
 }
 
 // Spawn a Command under a pseudo-terminal with TTY semantics, window resizing, and raw mode
+/// Detect a compatible terminal type for maximum portability
+fn detect_compatible_term() -> &'static str {
+    if let Ok(term) = std::env::var("TERM") {
+        // Map common terminal types to widely supported ones
+        if term.starts_with("xterm") || term.contains("256color") {
+            "xterm-256color"
+        } else if term.contains("color") {
+            "xterm-color"
+        } else if term == "screen" || term.starts_with("screen") {
+            "screen"
+        } else if term == "tmux" || term.starts_with("tmux") {
+            "screen"
+        } else if term == "linux" || term == "vt100" || term == "vt102" {
+            term.leak()  // These are basic and widely supported
+        } else {
+            // Default to most basic terminal that should work everywhere
+            "xterm"
+        }
+    } else {
+        // No TERM set, use most compatible option
+        "xterm"
+    }
+}
+
 fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
-    // Save the original terminal attributes
-    let mut original_attrs: libc::termios = unsafe { std::mem::zeroed() };
+    // Check if we're actually in a TTY
     let stdin_fd = libc::STDIN_FILENO;
-    
-    // Get original terminal settings
-    if unsafe { libc::tcgetattr(stdin_fd, &mut original_attrs) } != 0 {
-        return Err("Failed to get terminal attributes".into());
+    let is_tty = unsafe { libc::isatty(stdin_fd) } == 1;
+
+    // Save the original terminal attributes only if we're in a TTY
+    let mut original_attrs: Option<libc::termios> = None;
+
+    if is_tty {
+        let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+
+        // Get original terminal settings
+        if unsafe { libc::tcgetattr(stdin_fd, &mut attrs) } != 0 {
+            return Err("Failed to get terminal attributes".into());
+        }
+
+        original_attrs = Some(attrs);
+
+        // Set terminal to raw mode for proper input handling
+        let mut raw_attrs = attrs;
+        raw_attrs.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        raw_attrs.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw_attrs.c_cflag &= !(libc::CSIZE | libc::PARENB);
+        raw_attrs.c_cflag |= libc::CS8;
+        raw_attrs.c_oflag &= !(libc::OPOST);
+        raw_attrs.c_cc[libc::VMIN] = 1;
+        raw_attrs.c_cc[libc::VTIME] = 0;
+
+        if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_attrs) } != 0 {
+            return Err("Failed to set raw mode".into());
+        }
     }
 
-    // Set terminal to raw mode for proper input handling
-    let mut raw_attrs = original_attrs;
-    raw_attrs.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-    raw_attrs.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
-    raw_attrs.c_cflag &= !(libc::CSIZE | libc::PARENB);
-    raw_attrs.c_cflag |= libc::CS8;
-    raw_attrs.c_oflag &= !(libc::OPOST);
-    raw_attrs.c_cc[libc::VMIN] = 1;
-    raw_attrs.c_cc[libc::VTIME] = 0;
-
-    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &raw_attrs) } != 0 {
-        return Err("Failed to set raw mode".into());
-    }
-
-    // Ensure we restore terminal on any exit
-    let _restore_guard = scopeguard::guard((), |_| {
-        let _ = unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &original_attrs) };
+    // Ensure we restore terminal on any exit (only if we modified it)
+    let _restore_guard = scopeguard::guard(original_attrs, |attrs| {
+        if let Some(attrs) = attrs {
+            let _ = unsafe { libc::tcsetattr(stdin_fd, libc::TCSAFLUSH, &attrs) };
+        }
     });
 
     // Open a PTY with a reasonable default size
     let pty_system = native_pty_system();
-    let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
     let pair = pty_system.openpty(size)?;
 
     // Build command
     let mut builder = CommandBuilder::new(program);
     builder.args(args.iter().map(|s| s.as_str()));
+    
+    // Set up compatible environment variables for maximum portability
+    builder.env("TERM", detect_compatible_term());
+    builder.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    builder.env("HOME", "/root");
+    builder.env("USER", "root");
+    builder.env("LOGNAME", "root");
+    builder.env("SHELL", "/bin/sh");  // Most compatible shell
+    builder.env("LANG", "C.UTF-8");   // UTF-8 support with C locale fallback
+    builder.env("LC_ALL", "C");        // Override all locale settings for compatibility
+    builder.env("PWD", "/");           // Set initial working directory
 
     // Spawn the child connected to the slave end of the PTY
     let mut child = pair.slave.spawn_command(builder)?;
@@ -2043,18 +2660,18 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
         use std::os::unix::io::AsRawFd;
         let mut buf = [0u8; 4096];
         let stdin_fd = std::io::stdin().as_raw_fd();
-        
+
         while child_running_tx.load(Ordering::Relaxed) {
             // Use select to check if stdin has data available with timeout
             let mut read_fds = unsafe { std::mem::zeroed::<libc::fd_set>() };
             unsafe { libc::FD_ZERO(&mut read_fds) };
             unsafe { libc::FD_SET(stdin_fd, &mut read_fds) };
-            
+
             let mut timeout = libc::timeval {
                 tv_sec: 0,
                 tv_usec: 100_000, // 100ms timeout
             };
-            
+
             let result = unsafe {
                 libc::select(
                     stdin_fd + 1,
@@ -2064,13 +2681,13 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
                     &mut timeout,
                 )
             };
-            
+
             if result > 0 && unsafe { libc::FD_ISSET(stdin_fd, &read_fds) } {
                 // Data is available, read it
                 let bytes_read = unsafe {
                     libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                 };
-                
+
                 if bytes_read > 0 {
                     let n = bytes_read as usize;
                     if writer.write_all(&buf[..n]).is_err() {
@@ -2092,7 +2709,9 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() { break; }
+                    if stdout.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
                     let _ = stdout.flush();
                 }
                 Err(_) => break,
@@ -2112,7 +2731,12 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
                 let current = (ws.ws_row, ws.ws_col);
                 if current != last && ws.ws_row > 0 && ws.ws_col > 0 {
                     if let Ok(guard) = master_for_resize.lock() {
-                        let _ = guard.resize(PtySize { rows: ws.ws_row, cols: ws.ws_col, pixel_width: 0, pixel_height: 0 });
+                        let _ = guard.resize(PtySize {
+                            rows: ws.ws_row,
+                            cols: ws.ws_col,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
                     }
                     last = current;
                 }
@@ -2124,11 +2748,11 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
     // Wait for child to complete and signal threads to stop
     let status = child.wait()?;
     child_running.store(false, Ordering::Relaxed);
-    
+
     // Wait for threads to finish
     let _ = tx.join();
     let _ = rx.join();
-    
+
     Ok(status.exit_code() as i32)
 }
 
@@ -2160,7 +2784,9 @@ fn filter_and_format_log_line(
     regex: Option<&regex::Regex>,
 ) -> Option<String> {
     let line = raw_line.trim_end_matches('\n');
-    if line.is_empty() { return None; }
+    if line.is_empty() {
+        return None;
+    }
 
     // Parse optional timestamp prefix: RFC3339 followed by space
     let (ts, content) = if let Some((ts_str, rest)) = line.split_once(' ') {
@@ -2176,12 +2802,16 @@ fn filter_and_format_log_line(
     // Apply since filter only if we have a parsable timestamp
     match (since_time, ts) {
         (Some(since_dt), Some(entry_dt)) => {
-            if entry_dt < since_dt { return None; }
+            if entry_dt < since_dt {
+                return None;
+            }
         }
         (Some(since_dt), None) => {
             // Best-effort: include only if file mtime is newer than since
             if let Some(mtime) = file_mtime_utc {
-                if mtime < since_dt { return None; }
+                if mtime < since_dt {
+                    return None;
+                }
             }
         }
         _ => {}
@@ -2189,11 +2819,19 @@ fn filter_and_format_log_line(
 
     // Apply search filter
     if let Some(re) = regex {
-        if !re.is_match(content) { return None; }
+        if !re.is_match(content) {
+            return None;
+        }
     } else if let Some(q) = search {
         let lc = content.to_lowercase();
-        let matched = if fuzzy { fuzzy_match(&lc, q) } else { lc.contains(q) };
-        if !matched { return None; }
+        let matched = if fuzzy {
+            fuzzy_match(&lc, q)
+        } else {
+            lc.contains(q)
+        };
+        if !matched {
+            return None;
+        }
     }
 
     // Format output
@@ -2207,20 +2845,30 @@ fn filter_and_format_log_line(
 }
 
 fn fuzzy_match(text: &str, pattern: &str) -> bool {
-    if pattern.is_empty() { return true; }
+    if pattern.is_empty() {
+        return true;
+    }
     let mut it = text.chars();
     for pc in pattern.chars() {
         let mut found = false;
         while let Some(tc) = it.next() {
-            if tc == pc { found = true; break; }
+            if tc == pc {
+                found = true;
+                break;
+            }
         }
-        if !found { return false; }
+        if !found {
+            return false;
+        }
     }
     true
 }
 
 #[cfg(test)]
-fn choose_manifest_digest(manifest_list_json: &str, platform: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+fn choose_manifest_digest(
+    manifest_list_json: &str,
+    platform: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let manifest_list: ManifestList = serde_json::from_str(manifest_list_json)?;
     let (want_os, want_arch) = platform
         .and_then(|p| p.split_once('/'))
@@ -2238,7 +2886,7 @@ fn choose_manifest_digest(manifest_list_json: &str, platform: Option<&str>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Write, Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     #[test]
     fn test_normalize_image_path() {
@@ -2257,8 +2905,14 @@ mod tests {
                 {"mediaType":"application/vnd.docker.distribution.manifest.v2+json","size":124,"digest":"sha256:arm64digest","platform":{"architecture":"arm64","os":"linux"}}
             ]
         }"#;
-        assert_eq!(choose_manifest_digest(json, Some("linux/arm64")).unwrap(), "sha256:arm64digest");
-        assert_eq!(choose_manifest_digest(json, Some("linux/amd64")).unwrap(), "sha256:amd64digest");
+        assert_eq!(
+            choose_manifest_digest(json, Some("linux/arm64")).unwrap(),
+            "sha256:arm64digest"
+        );
+        assert_eq!(
+            choose_manifest_digest(json, Some("linux/amd64")).unwrap(),
+            "sha256:amd64digest"
+        );
         // default picks first if platform not provided
         let d = choose_manifest_digest(json, None).unwrap();
         assert!(d.starts_with("sha256:"));
@@ -2368,9 +3022,14 @@ pub async fn make_authenticated_request(
 }
 
 // Helper: seek to last N lines in a file
-fn seek_to_last_n_lines(file: &mut std::fs::File, n: usize) -> Result<u64, Box<dyn std::error::Error>> {
-    use std::io::{Seek, SeekFrom, Read};
-    if n == 0 { return Ok(0); }
+fn seek_to_last_n_lines(
+    file: &mut std::fs::File,
+    n: usize,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if n == 0 {
+        return Ok(0);
+    }
     let pos_len = file.metadata()?.len() as i64;
     let mut pos = pos_len;
     let mut count = 0usize;
@@ -2383,7 +3042,9 @@ fn seek_to_last_n_lines(file: &mut std::fs::File, n: usize) -> Result<u64, Box<d
         for &b in buf[..read_size].iter().rev() {
             if b == b'\n' {
                 count += 1;
-                if count > n { break; }
+                if count > n {
+                    break;
+                }
             }
         }
     }
@@ -2717,15 +3378,16 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                 }
 
                                 // Get command if available
-                                let command = if let Some(cmd_array) = metadata["command"].as_array() {
-                                    cmd_array
-                                        .iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                } else {
-                                    metadata["command"].as_str().unwrap_or("").to_string()
-                                };
+                                let command =
+                                    if let Some(cmd_array) = metadata["command"].as_array() {
+                                        cmd_array
+                                            .iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
+                                    } else {
+                                        metadata["command"].as_str().unwrap_or("").to_string()
+                                    };
 
                                 // Get ports if available
                                 let ports = metadata["ports"].as_str().unwrap_or("").to_string();
@@ -3617,4 +4279,257 @@ fn remove_image(
     }
 
     println!("Image {}:{} removed successfully", image, tag);
+}
+
+// Authentication and credential management
+
+use std::fs;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RegistryCredentials {
+    pub username: String,
+    pub password: String,
+    pub registry: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct AuthConfig {
+    pub auths: HashMap<String, RegistryCredentials>,
+}
+
+impl AuthConfig {
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let auth_path = get_auth_config_path()?;
+        if !auth_path.exists() {
+            return Ok(AuthConfig::default());
+        }
+
+        let content = fs::read_to_string(auth_path)?;
+        let config: AuthConfig = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let auth_path = get_auth_config_path()?;
+        if let Some(parent) = auth_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(auth_path, content)?;
+        Ok(())
+    }
+
+    pub fn add_credentials(&mut self, registry: String, username: String, password: String) {
+        let creds = RegistryCredentials {
+            username,
+            password,
+            registry: registry.clone(),
+        };
+        self.auths.insert(registry, creds);
+    }
+
+    pub fn get_credentials(&self, registry: &str) -> Option<&RegistryCredentials> {
+        self.auths.get(registry)
+    }
+}
+
+fn get_auth_config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home
+        .join(".local")
+        .join("share")
+        .join("carrier")
+        .join("auth.json"))
+}
+
+pub async fn authenticate_registry(
+    username: String,
+    registry: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Authenticating with registry: {}", registry);
+    print!("Password: ");
+    std::io::stdout().flush()?;
+
+    let password = rpassword::read_password()?;
+
+    // Test the credentials by attempting to get a token
+    let test_result = test_registry_credentials(&registry, &username, &password).await;
+
+    match test_result {
+        Ok(_) => {
+            // Save credentials if authentication succeeds
+            let mut auth_config = AuthConfig::load()?;
+            auth_config.add_credentials(registry.clone(), username.clone(), password);
+            auth_config.save()?;
+
+            println!(
+                "✓ Successfully authenticated with {} as {}",
+                registry, username
+            );
+        }
+        Err(e) => {
+            eprintln!("✗ Authentication failed: {}", e);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn test_registry_credentials(
+    registry: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new();
+
+    // Create basic auth header
+    let auth_string = format!("{}:{}", username, password);
+    let auth_header = format!(
+        "Basic {}",
+        base64::prelude::BASE64_STANDARD.encode(auth_string)
+    );
+
+    // Test with a simple API endpoint for each registry
+    let test_url = match registry {
+        "docker.io" => "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/hello-world:pull",
+        "quay.io" => "https://quay.io/v2/auth?service=quay.io&scope=repository:quay/busybox:pull",
+        "ghcr.io" => "https://ghcr.io/token?service=ghcr.io&scope=repository:library/hello-world:pull",
+        "gcr.io" => "https://gcr.io/v2/token?service=gcr.io&scope=repository:library/hello-world:pull",
+        "public.ecr.aws" => "https://public.ecr.aws/token?service=public.ecr.aws&scope=repository:library/hello-world:pull",
+        _ => return Err(format!("Unsupported registry: {}", registry).into()),
+    };
+
+    let response = client
+        .get(test_url)
+        .header("Authorization", &auth_header)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let is_success = status.is_success();
+    let status_code = status.as_u16();
+
+    if is_success || status_code == 401 {
+        // 401 might mean the scope/repo doesn't exist but auth worked
+        // We'll accept both success and certain auth errors as "credentials work"
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+
+        // Check if we got a token (success) or an auth error with proper format
+        if body.get("token").is_some() || body.get("access_token").is_some() {
+            Ok(())
+        } else if status_code == 401 {
+            // For 401, check if it's a proper auth response format
+            if body.get("errors").is_some() {
+                Ok(()) // Proper registry response, credentials format is correct
+            } else {
+                Err("Invalid credentials".into())
+            }
+        } else {
+            Err("Authentication test failed".into())
+        }
+    } else {
+        Err(format!("Authentication failed with status: {}", status).into())
+    }
+}
+
+pub async fn get_authenticated_token(
+    registry: &str,
+    image_path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Try to load stored credentials first
+    let auth_config = AuthConfig::load()?;
+
+    if let Some(creds) = auth_config.get_credentials(registry) {
+        // Use stored credentials to get token
+        get_token_with_credentials(registry, &creds.username, &creds.password, image_path).await
+    } else {
+        // Fall back to anonymous token request
+        let dummy_url = format!("{}:latest", image_path);
+        get_repo_auth_token(dummy_url).await
+    }
+}
+
+async fn get_token_with_credentials(
+    registry: &str,
+    username: &str,
+    password: &str,
+    image_path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = Client::new();
+
+    // Create basic auth header
+    let auth_string = format!("{}:{}", username, password);
+    let auth_header = format!(
+        "Basic {}",
+        base64::prelude::BASE64_STANDARD.encode(auth_string)
+    );
+
+    // Get the auth endpoint for this registry
+    let auth_endpoint = AUTHTOKENMAP
+        .get(registry)
+        .ok_or_else(|| format!("No auth endpoint configured for registry: {}", registry))?;
+
+    // Build scope for the specific image
+    let scope = format!("repository:{}:pull,push", image_path);
+
+    let auth_url = match registry {
+        "docker.io" => format!(
+            "{}?service=registry.docker.io&scope={}",
+            auth_endpoint, scope
+        ),
+        "quay.io" => format!("{}?service=quay.io&scope={}", auth_endpoint, scope),
+        "ghcr.io" => format!("{}?service=ghcr.io&scope={}", auth_endpoint, scope),
+        "gcr.io" => format!("{}?service=gcr.io&scope={}", auth_endpoint, scope),
+        "public.ecr.aws" => format!("{}?service=public.ecr.aws&scope={}", auth_endpoint, scope),
+        _ => format!("{}?scope={}", auth_endpoint, scope),
+    };
+
+    let response = client
+        .get(&auth_url)
+        .header("Authorization", &auth_header)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Auth request failed: {}", response.status()).into());
+    }
+
+    // Parse the token from response
+    let auth_response: serde_json::Value = response.json().await?;
+
+    if let Some(token) = auth_response.get("token").and_then(|t| t.as_str()) {
+        Ok(token.to_string())
+    } else if let Some(access_token) = auth_response.get("access_token").and_then(|t| t.as_str()) {
+        Ok(access_token.to_string())
+    } else {
+        Err("No token found in auth response".into())
+    }
+}
+
+pub async fn verify_authentication() -> Result<(), Box<dyn std::error::Error>> {
+    let auth_config = AuthConfig::load()?;
+
+    if auth_config.auths.is_empty() {
+        println!("No registry credentials stored.");
+        return Ok(());
+    }
+
+    println!("Verifying stored credentials:");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    for (registry, creds) in &auth_config.auths {
+        print!("  {}: ", registry);
+        std::io::stdout().flush()?;
+
+        match test_registry_credentials(registry, &creds.username, &creds.password).await {
+            Ok(_) => println!("✓ Valid (user: {})", creds.username),
+            Err(e) => println!("✗ Failed - {}", e),
+        }
+    }
+
+    Ok(())
 }

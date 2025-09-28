@@ -1,11 +1,11 @@
-use nix::sched::{CloneFlags, unshare};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{Pid, Uid, Gid, setuid, setgid, sethostname};
 use nix::mount::{mount, MsFlags};
+use nix::sched::{unshare, CloneFlags};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{setgid, sethostname, setuid, Gid, Pid, Uid};
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::os::unix::process::CommandExt;
 
 /// Namespace configuration for container isolation
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ impl Default for NamespaceConfig {
     fn default() -> Self {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-        
+
         Self {
             use_pid_ns: true,
             use_net_ns: true,
@@ -62,7 +62,7 @@ impl Default for NamespaceConfig {
                     container_id: 1,
                     host_id: 100000,
                     range: 65536,
-                }
+                },
             ],
             gid_mappings: vec![
                 GidMapping {
@@ -75,7 +75,7 @@ impl Default for NamespaceConfig {
                     container_id: 1,
                     host_id: 100000,
                     range: 65536,
-                }
+                },
             ],
         }
     }
@@ -93,7 +93,7 @@ impl NamespaceManager {
     /// Enter new namespaces based on configuration
     pub fn enter_namespaces(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut flags = CloneFlags::empty();
-        
+
         if self.config.use_pid_ns {
             flags.insert(CloneFlags::CLONE_NEWPID);
         }
@@ -118,17 +118,17 @@ impl NamespaceManager {
 
         // Unshare into new namespaces
         unshare(flags)?;
-        
+
         // Set hostname if in UTS namespace
         if self.config.use_uts_ns {
             if let Some(ref hostname) = self.config.hostname {
                 sethostname(hostname)?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Setup user namespace mappings
     pub fn setup_user_mappings(&self, pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
         // Write uid_map
@@ -137,34 +137,30 @@ impl NamespaceManager {
         for mapping in &self.config.uid_mappings {
             uid_map_content.push_str(&format!(
                 "{} {} {}\n",
-                mapping.container_id,
-                mapping.host_id,
-                mapping.range
+                mapping.container_id, mapping.host_id, mapping.range
             ));
         }
-        
+
         // Disable setgroups before writing gid_map (required for unprivileged user namespaces)
         let setgroups_path = format!("/proc/{}/setgroups", pid);
         fs::write(&setgroups_path, "deny")?;
-        
+
         // Write gid_map
         let gid_map_path = format!("/proc/{}/gid_map", pid);
         let mut gid_map_content = String::new();
         for mapping in &self.config.gid_mappings {
             gid_map_content.push_str(&format!(
                 "{} {} {}\n",
-                mapping.container_id,
-                mapping.host_id,
-                mapping.range
+                mapping.container_id, mapping.host_id, mapping.range
             ));
         }
-        
+
         fs::write(uid_map_path, uid_map_content)?;
         fs::write(gid_map_path, gid_map_content)?;
-        
+
         Ok(())
     }
-    
+
     /// Setup rootless user namespace with newuidmap/newgidmap
     pub fn setup_rootless_userns(&self, pid: i32) -> Result<(), Box<dyn std::error::Error>> {
         // Use newuidmap for setting up uid mappings
@@ -172,7 +168,7 @@ impl NamespaceManager {
         let mut newuidmap_cmd = Command::new("newuidmap");
         newuidmap_cmd.arg(pid.to_string());
         newuidmap_cmd.arg("0").arg(uid.to_string()).arg("1");
-        
+
         // Add subuid ranges if available
         if let Ok(subuid_content) = fs::read_to_string("/etc/subuid") {
             for line in subuid_content.lines() {
@@ -190,15 +186,15 @@ impl NamespaceManager {
                 }
             }
         }
-        
+
         newuidmap_cmd.output()?;
-        
+
         // Use newgidmap for setting up gid mappings
         let gid = nix::unistd::getgid().as_raw();
         let mut newgidmap_cmd = Command::new("newgidmap");
         newgidmap_cmd.arg(pid.to_string());
         newgidmap_cmd.arg("0").arg(gid.to_string()).arg("1");
-        
+
         // Add subgid ranges if available
         if let Ok(subgid_content) = fs::read_to_string("/etc/subgid") {
             for line in subgid_content.lines() {
@@ -216,12 +212,12 @@ impl NamespaceManager {
                 }
             }
         }
-        
+
         newgidmap_cmd.output()?;
-        
+
         Ok(())
     }
-    
+
     /// Setup basic container mounts
     pub fn setup_container_mounts(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Mount proc
@@ -236,7 +232,7 @@ impl NamespaceManager {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
             None::<&str>,
         )?;
-        
+
         // Mount sys
         let sys_target = rootfs.join("sys");
         if !sys_target.exists() {
@@ -249,7 +245,7 @@ impl NamespaceManager {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV | MsFlags::MS_RDONLY,
             None::<&str>,
         )?;
-        
+
         // Mount /dev
         let dev_target = rootfs.join("dev");
         if !dev_target.exists() {
@@ -262,10 +258,10 @@ impl NamespaceManager {
             MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
             Some("mode=755,size=65536k"),
         )?;
-        
+
         // Create essential devices
         self.create_devices(&dev_target)?;
-        
+
         // Mount /dev/pts
         let pts_target = dev_target.join("pts");
         if !pts_target.exists() {
@@ -278,7 +274,7 @@ impl NamespaceManager {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
             Some("newinstance,ptmxmode=0666,mode=0620"),
         )?;
-        
+
         // Mount /dev/shm
         let shm_target = dev_target.join("shm");
         if !shm_target.exists() {
@@ -291,15 +287,15 @@ impl NamespaceManager {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
             Some("mode=1777,size=65536k"),
         )?;
-        
+
         Ok(())
     }
-    
+
     /// Create essential device nodes
     fn create_devices(&self, dev_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        use std::os::unix::fs::symlink;
         use nix::sys::stat::{mknod, Mode, SFlag};
-        
+        use std::os::unix::fs::symlink;
+
         // Create /dev/null
         let null_path = dev_path.join("null");
         if !null_path.exists() {
@@ -310,7 +306,7 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(1, 3),
             )?;
         }
-        
+
         // Create /dev/zero
         let zero_path = dev_path.join("zero");
         if !zero_path.exists() {
@@ -321,7 +317,7 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(1, 5),
             )?;
         }
-        
+
         // Create /dev/random
         let random_path = dev_path.join("random");
         if !random_path.exists() {
@@ -332,7 +328,7 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(1, 8),
             )?;
         }
-        
+
         // Create /dev/urandom
         let urandom_path = dev_path.join("urandom");
         if !urandom_path.exists() {
@@ -343,7 +339,7 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(1, 9),
             )?;
         }
-        
+
         // Create /dev/tty
         let tty_path = dev_path.join("tty");
         if !tty_path.exists() {
@@ -354,7 +350,7 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(5, 0),
             )?;
         }
-        
+
         // Create /dev/console
         let console_path = dev_path.join("console");
         if !console_path.exists() {
@@ -365,19 +361,19 @@ impl NamespaceManager {
                 nix::sys::stat::makedev(5, 1),
             )?;
         }
-        
+
         // Symlink /dev/ptmx to /dev/pts/ptmx
         let ptmx_path = dev_path.join("ptmx");
         if !ptmx_path.exists() {
             symlink("pts/ptmx", &ptmx_path)?;
         }
-        
+
         // Symlink standard streams
         symlink("/proc/self/fd", &dev_path.join("fd"))?;
         symlink("/proc/self/fd/0", &dev_path.join("stdin"))?;
         symlink("/proc/self/fd/1", &dev_path.join("stdout"))?;
         symlink("/proc/self/fd/2", &dev_path.join("stderr"))?;
-        
+
         Ok(())
     }
 }

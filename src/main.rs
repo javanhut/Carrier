@@ -6,24 +6,56 @@ mod runtime;
 mod storage;
 
 use cli::{Cli, Commands};
-use commands::{exec_in_container, list_items, pull_image, remove_item, remove_all_stopped_containers, run_image, run_image_with_command, show_container_info, show_container_logs, stop_container};
+use commands::{
+    authenticate_registry, exec_in_container, list_items, pull_image,
+    remove_all_stopped_containers, remove_item, run_image, run_image_with_command,
+    show_container_info, show_container_logs, stop_container, verify_authentication,
+};
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { image, detach, name, command, platform } => {
+        Commands::Run {
+            image,
+            detach,
+            name,
+            elevated,
+            command,
+            platform,
+        } => {
             if command.is_empty() {
-                run_image(image, detach, name, platform, cli.storage_driver.clone()).await;
+                run_image(image, detach, name, elevated, platform, cli.storage_driver.clone()).await;
             } else {
                 // For now, just use run_image since we'll handle command override internally
                 // In the future, we can pass the command through
-                run_image_with_command(image, detach, name, command, platform, cli.storage_driver.clone()).await;
+                run_image_with_command(
+                    image,
+                    detach,
+                    name,
+                    elevated,
+                    command,
+                    platform,
+                    cli.storage_driver.clone(),
+                )
+                .await;
             }
         }
-        Commands::Logs { image, follow, tail, timestamps, since, search, fuzzy, regex } => {
-            if let Err(e) = show_container_logs(image, follow, tail, timestamps, since, search, fuzzy, regex).await {
+        Commands::Logs {
+            image,
+            follow,
+            tail,
+            timestamps,
+            since,
+            search,
+            fuzzy,
+            regex,
+        } => {
+            if let Err(e) =
+                show_container_logs(image, follow, tail, timestamps, since, search, fuzzy, regex)
+                    .await
+            {
                 eprintln!("Failed to show logs: {}", e);
                 std::process::exit(1);
             }
@@ -32,9 +64,22 @@ async fn main() {
             pull_image(image, platform).await;
         }
         Commands::Auth { username, registry } => {
-            println!("Login into {registry} using {username}");
+            if let Err(e) = authenticate_registry(username, registry).await {
+                eprintln!("Failed to authenticate: {}", e);
+                std::process::exit(1);
+            }
         }
-        Commands::Remove { image, force, all_containers } => {
+        Commands::AuthVerify => {
+            if let Err(e) = verify_authentication().await {
+                eprintln!("Failed to verify authentication: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Remove {
+            image,
+            force,
+            all_containers,
+        } => {
             if all_containers {
                 remove_all_stopped_containers(force).await;
             } else if let Some(img) = image {

@@ -63,6 +63,7 @@ carrier run [OPTIONS] <image|image-id> [COMMAND...]
 **Options:**
 - `-d, --detach`: Run container in detached mode (background)
 - `--name <NAME>`: Assign a custom name to the container
+- `--elevated`: Run with elevated privileges (no user namespace, may require sudo)
 
 **Examples:**
 ```bash
@@ -84,6 +85,10 @@ carrier run --detach redis:latest
 
 # Run with custom name
 carrier run --name my-web-server nginx
+
+# Run with elevated privileges (requires sudo)
+sudo carrier run --elevated ubuntu
+sudo carrier run -d --elevated --name ubuntu-dev ubuntu sleep infinity
 carrier run --name dev-db -d postgres:latest
 
 # Run with custom command (future feature)
@@ -330,12 +335,58 @@ carrier remove --force abc123def456
 - Provides summary of containers removed, skipped, and failed
 
 ### auth
-Authenticate with a container registry (not yet implemented).
+Authenticate with a container registry to enable higher API rate limits and access to private repositories.
 
 **Usage:**
 ```bash
 carrier auth <username> <registry>
 ```
+
+**Arguments:**
+- `<username>` - Your username for the registry
+- `<registry>` - Registry hostname (e.g., docker.io, quay.io, ghcr.io)
+
+**Examples:**
+```bash
+# Authenticate with Docker Hub
+carrier auth myusername docker.io
+
+# Authenticate with GitHub Container Registry
+carrier auth myusername ghcr.io
+
+# Authenticate with Quay.io
+carrier auth myusername quay.io
+
+# Authenticate with Google Container Registry  
+carrier auth myusername gcr.io
+```
+
+**Supported Registries:**
+- `docker.io` - Docker Hub
+- `quay.io` - Red Hat Quay
+- `ghcr.io` - GitHub Container Registry
+- `gcr.io` - Google Container Registry
+- `public.ecr.aws` - Amazon ECR Public
+
+**Features:**
+- **Secure Password Entry**: Password is entered securely without echo
+- **Credential Validation**: Tests credentials before storing
+- **Automatic Token Management**: Uses stored credentials for enhanced API limits
+- **Fallback Support**: Falls back to anonymous access if credentials fail
+
+**Behavior:**
+- Prompts for password securely (no echo to terminal)
+- Tests credentials by attempting to authenticate with the registry
+- Stores credentials locally in `~/.local/share/carrier/auth.json`
+- Automatically uses stored credentials for all registry operations
+- Provides higher API rate limits for authenticated requests
+- Enables access to private repositories (when supported)
+
+**Security:**
+- Credentials are stored in JSON format in user's home directory
+- Only readable by the user (standard file permissions)
+- Passwords are stored in plaintext locally (similar to Docker CLI)
+- Uses HTTPS for all authentication requests
 
 ### logs
 Show logs from a container. Works for containers run in detached mode (`-d`) or any container that has produced output written to `container.log`.
@@ -436,6 +487,17 @@ carrier t abc123 bash
 - Handles Ctrl+C, Ctrl+D, and exit commands properly
 - Suitable for interactive programs that expect a terminal (editors, REPLs, shells)
 - Non-blocking I/O prevents hanging when processes exit
+
+**Permission Requirements:**
+- **Rootless Mode** (default for non-root users):
+  - No elevated privileges required
+  - Uses `unshare` with user namespaces to exec into containers
+  - Container root is mapped to your user on the host
+  - See [Rootless Documentation](./rootless.md) for details
+- **Root Mode** (when running as root):
+  - Uses `nsenter` to join container namespaces
+  - Will attempt sudo fallback if permission denied
+  - Full system capabilities available
 
 ### build
 Build a container image (not yet implemented).

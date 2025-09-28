@@ -1,10 +1,16 @@
 # Carrier
 A lightweight, secure, rootless container runtime and management tool written in Rust.
 
+## Rootless Containers - No sudo required!
+
+Carrier supports fully rootless container execution, similar to Podman. Regular users can create and manage containers without needing root privileges or sudo access. This provides better security isolation and makes containers accessible to all users.
+
+See [Rootless Documentation](docs/rootless.md) for setup and usage details.
+
 ## Features
 
 ### Core Capabilities
-- **Rootless by Design** - Run containers without root privileges
+- **Rootless by Design** - Run containers without root privileges using user namespaces
 - **Multi-Registry Support** - Pull from Docker Hub, Quay.io, GHCR, GCR, ECR, and more
 - **Container Lifecycle Management** - Run, stop, remove, and execute commands
 - **Multiple Execution Modes** - Interactive, detached, and exec into running containers

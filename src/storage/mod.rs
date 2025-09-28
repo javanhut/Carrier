@@ -4,7 +4,7 @@ mod overlay;
 
 pub use layer::extract_layer_rootless;
 pub use layout::StorageLayout;
-pub use overlay::{ContainerStorage, preflight_rootless_checks, StorageDriver};
+pub use overlay::{preflight_rootless_checks, ContainerStorage, StorageDriver};
 
 // Helper function for generating container IDs
 pub fn generate_container_id() -> String {

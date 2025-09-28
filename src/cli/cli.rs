@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, error::Result};
+use clap::{error::Result, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "carrier", version, about, long_about = None)]
@@ -47,7 +47,6 @@ pub enum Commands {
     },
 
     // Pull command moved below with platform option
-
     /// Run a container from an image
     Run {
         image: String,
@@ -59,6 +58,10 @@ pub enum Commands {
         /// Custom name for the container
         #[arg(long = "name")]
         name: Option<String>,
+
+        /// Run container with elevated privileges (allows operations like apt update)
+        #[arg(long = "elevated")]
+        elevated: bool,
 
         /// Optional command to override the image default
         #[arg(trailing_var_arg = true)]
@@ -74,6 +77,9 @@ pub enum Commands {
 
     /// Authenticate with a registry
     Auth { username: String, registry: String },
+
+    /// Verify stored authentication credentials
+    AuthVerify,
 
     /// Remove an image or container
     #[command(alias = "rm")]
@@ -130,18 +136,18 @@ pub enum Commands {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-    
+
     /// Open a PTY terminal inside a running container (forces TTY)
     #[command(aliases = ["term", "t"])]
     Terminal {
         /// Container ID or name
         container: String,
-        
+
         /// Command to execute (defaults to /bin/sh)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-    
+
     /// Show detailed information about a container
     #[command(alias = "inspect")]
     Info {

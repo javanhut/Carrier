@@ -1,6 +1,6 @@
-use caps::{Capability, CapSet, CapsHashSet};
-use nix::unistd::{Uid, Gid, setuid, setgid, setgroups};
+use caps::{CapSet, Capability, CapsHashSet};
 use nix::sys::prctl;
+use nix::unistd::{setgid, setgroups, setuid, Gid, Uid};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -81,47 +81,47 @@ impl SecurityManager {
     pub fn new(config: SecurityConfig) -> Self {
         Self { config }
     }
-    
+
     /// Apply all security configurations
     pub fn apply_security(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Set no-new-privileges if configured
         if self.config.no_new_privs {
             self.set_no_new_privs()?;
         }
-        
+
         // Drop capabilities
         self.apply_capabilities()?;
-        
+
         // Apply seccomp filter (simplified for now)
         self.apply_seccomp()?;
-        
+
         // Set user/group if specified
         if self.config.user.is_some() || self.config.group.is_some() {
             self.set_user_group()?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Set the no-new-privileges flag
     fn set_no_new_privs(&self) -> Result<(), Box<dyn std::error::Error>> {
         prctl::set_no_new_privs()?;
         Ok(())
     }
-    
+
     /// Apply capability restrictions
     fn apply_capabilities(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Get current capabilities
         let mut effective = caps::read(None, CapSet::Effective)?;
         let mut permitted = caps::read(None, CapSet::Permitted)?;
         let mut inheritable = caps::read(None, CapSet::Inheritable)?;
-        
+
         // Create set of capabilities to keep
         let mut keep_set = CapsHashSet::new();
         for cap in &self.config.keep_caps {
             keep_set.insert(*cap);
         }
-        
+
         // Remove capabilities not in keep list
         // We'll iterate through the explicit drop list
         for cap in &self.config.drop_caps {
@@ -129,15 +129,15 @@ impl SecurityManager {
             permitted.remove(cap);
             inheritable.remove(cap);
         }
-        
+
         // Apply the capability sets
         caps::set(None, CapSet::Effective, &effective)?;
         caps::set(None, CapSet::Permitted, &permitted)?;
         caps::set(None, CapSet::Inheritable, &inheritable)?;
-        
+
         Ok(())
     }
-    
+
     /// Apply seccomp filtering (simplified implementation)
     fn apply_seccomp(&self) -> Result<(), Box<dyn std::error::Error>> {
         match &self.config.seccomp_profile {
@@ -173,20 +173,20 @@ impl SecurityManager {
         }
         Ok(())
     }
-    
+
     /// Set user and group for the process
     fn set_user_group(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Set supplementary groups first
         if !self.config.supplementary_groups.is_empty() {
-            let gids: Vec<Gid> = self.config.supplementary_groups
+            let gids: Vec<Gid> = self
+                .config
+                .supplementary_groups
                 .iter()
-                .filter_map(|g| {
-                    g.parse::<u32>().ok().map(Gid::from_raw)
-                })
+                .filter_map(|g| g.parse::<u32>().ok().map(Gid::from_raw))
                 .collect();
             setgroups(&gids)?;
         }
-        
+
         // Set primary group
         if let Some(ref group) = self.config.group {
             let gid = if let Ok(gid_num) = group.parse::<u32>() {
@@ -197,7 +197,7 @@ impl SecurityManager {
             };
             setgid(gid)?;
         }
-        
+
         // Set user (must be done last)
         if let Some(ref user) = self.config.user {
             let uid = if let Ok(uid_num) = user.parse::<u32>() {
@@ -208,15 +208,15 @@ impl SecurityManager {
             };
             setuid(uid)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Make the root filesystem read-only
     pub fn make_rootfs_readonly(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if self.config.readonly_rootfs {
             use nix::mount::{mount, MsFlags};
-            
+
             // Remount rootfs as read-only
             mount(
                 None::<&str>,
@@ -279,14 +279,14 @@ pub fn drop_privileges() -> Result<(), Box<dyn std::error::Error>> {
         Capability::CAP_AUDIT_CONTROL,
         Capability::CAP_SETFCAP,
     ];
-    
+
     let security_config = SecurityConfig {
         drop_caps: all_caps,
         keep_caps: vec![],
         no_new_privs: true,
         ..Default::default()
     };
-    
+
     let manager = SecurityManager::new(security_config);
     manager.apply_security()
 }
