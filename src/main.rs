@@ -26,7 +26,15 @@ async fn main() {
             platform,
         } => {
             if command.is_empty() {
-                run_image(image, detach, name, elevated, platform, cli.storage_driver.clone()).await;
+                run_image(
+                    image,
+                    detach,
+                    name,
+                    elevated,
+                    platform,
+                    cli.storage_driver.clone(),
+                )
+                .await;
             } else {
                 // For now, just use run_image since we'll handle command override internally
                 // In the future, we can pass the command through

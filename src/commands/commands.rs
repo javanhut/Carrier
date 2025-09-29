@@ -1,4 +1,5 @@
 use crate::cli::RegistryImage;
+use crate::runtime::network::{NetworkConfig, NetworkManager};
 use crate::storage::{
     extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout,
 };
@@ -575,19 +576,23 @@ async fn exec_elevated_container(
     command: Vec<String>,
     is_interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::FileTypeExt;
     use std::process::{Command, Stdio};
 
-    println!("Executing in elevated container (PID {}) with sudo", container_pid);
+    println!(
+        "Executing in elevated container (PID {}) with sudo",
+        container_pid
+    );
 
-    // For elevated containers, use sudo unshare without user namespace
+    // For elevated containers, we need to ensure /dev is properly set up
+    // Check if /dev/null exists and is a character device
+    let dev_null_path = rootfs.join("dev/null");
+    let needs_dev_setup = !dev_null_path.exists()
+        || std::fs::metadata(&dev_null_path)
+            .map(|m| !m.file_type().is_char_device())
+            .unwrap_or(true);
+
     let mut exec_cmd = Command::new("sudo");
-
-    // Use the same namespace setup as container creation but no user namespace
-    exec_cmd.arg("unshare")
-        .arg("--mount")
-        .arg("--pid")
-        .arg("chroot")
-        .arg(rootfs);
 
     // Ensure we use full paths for commands
     let cmd_with_path = if !command.is_empty() && !command[0].starts_with('/') {
@@ -619,12 +624,56 @@ async fn exec_elevated_container(
         command.clone()
     };
 
-    exec_cmd.args(&cmd_with_path);
+    if needs_dev_setup {
+        // If /dev is not properly set up, we need to fix it
+        println!("Setting up /dev filesystem for elevated container...");
 
-    // Set up environment
-    exec_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    exec_cmd.env("HOME", "/root");
-    exec_cmd.env("TERM", "xterm");
+        let setup_and_exec = format!(
+            "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
+             mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
+             mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
+             mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
+             mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
+             mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
+             mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
+             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
+             ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
+             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+             export HOME=/root; \
+             export TERM=xterm; \
+             chroot {} {}",
+            rootfs.display(), rootfs.display(), rootfs.display(),
+            rootfs.display(), rootfs.display(), rootfs.display(),
+            rootfs.display(), rootfs.display(), rootfs.display(),
+            rootfs.display(), rootfs.display(), cmd_with_path.join(" ")
+        );
+
+        exec_cmd
+            .arg("unshare")
+            .arg("--mount")
+            .arg("--pid")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(setup_and_exec);
+    } else {
+        // /dev is already set up, just chroot and execute
+        exec_cmd
+            .arg("unshare")
+            .arg("--mount")
+            .arg("--pid")
+            .arg("chroot")
+            .arg(rootfs);
+
+        exec_cmd.args(&cmd_with_path);
+
+        // Set up environment
+        exec_cmd.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+        exec_cmd.env("HOME", "/root");
+        exec_cmd.env("TERM", "xterm");
+    }
 
     if is_interactive {
         println!("Starting interactive session with elevated privileges...");
@@ -635,28 +684,61 @@ async fn exec_elevated_container(
 
         if is_tty {
             // Try using PTY for interactive session with sudo
-            let mut sudo_args = vec![
-                "unshare".to_string(),
-                "--mount".to_string(),
-                "--pid".to_string(),
-                "chroot".to_string(),
-                rootfs.to_string_lossy().to_string(),
-            ];
-            sudo_args.extend(cmd_with_path.clone());
+            let mut sudo_args = vec![];
 
-            let exit_code = spawn_with_pty("sudo", &sudo_args)
-                .unwrap_or_else(|_| {
-                    // Fallback to regular execution
-                    let mut child = exec_cmd
-                        .stdin(Stdio::inherit())
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .spawn()
-                        .expect("Failed to spawn unshare");
+            if needs_dev_setup {
+                // Need to run the full setup script
+                let setup_and_exec = format!(
+                    "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
+                     mkdir -p {}/dev/pts 2>/dev/null || true; \
+                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
+                     ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
+                     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+                     export HOME=/root; \
+                     export TERM=xterm; \
+                     chroot {} {}",
+                    rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), cmd_with_path.join(" ")
+                );
 
-                    let status = child.wait().expect("Failed to wait for child");
-                    status.code().unwrap_or(1)
-                });
+                sudo_args = vec![
+                    "unshare".to_string(),
+                    "--mount".to_string(),
+                    "--pid".to_string(),
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    setup_and_exec,
+                ];
+            } else {
+                sudo_args = vec![
+                    "unshare".to_string(),
+                    "--mount".to_string(),
+                    "--pid".to_string(),
+                    "chroot".to_string(),
+                    rootfs.to_string_lossy().to_string(),
+                ];
+                sudo_args.extend(cmd_with_path.clone());
+            }
+
+            let exit_code = spawn_with_pty("sudo", &sudo_args).unwrap_or_else(|_| {
+                // Fallback to regular execution
+                let mut child = exec_cmd
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("Failed to spawn unshare");
+
+                let status = child.wait().expect("Failed to wait for child");
+                status.code().unwrap_or(1)
+            });
 
             if exit_code != 0 {
                 return Err(format!("Command exited with code {}", exit_code).into());
@@ -709,67 +791,28 @@ async fn exec_rootless_container(
     // Check if we're running as root (e.g., with sudo)
     let is_root = nix::unistd::Uid::effective().is_root();
 
-    let mut exec_cmd = if is_root {
-        // If running as root, use nsenter directly
-        let mut cmd = Command::new("nsenter");
-        cmd.arg("--target").arg(container_pid.to_string())
-           .arg("--mount")
-           .arg("--uts")
-           .arg("--net")
-           .arg("--pid")
-           .arg("--root").arg(rootfs)  // Set the root filesystem
-           .arg("--wd=/");  // Set working directory to /
-        cmd
-    } else {
-        // If not root, we need to use unshare approach since nsenter requires root
-        let mut cmd = Command::new("unshare");
-        cmd.arg("--user")
-           .arg("--map-root-user")  // Map current user to root
-           .arg("--mount")
-           .arg("--pid")
-           .arg("chroot")
-           .arg(rootfs);
-        cmd
-    };
+    // For entering an already running container, we should use nsenter to join its namespaces
+    // Check if we're running as root (e.g., with sudo)
+    let mut exec_cmd = Command::new("nsenter");
+    exec_cmd
+        .arg("--target")
+        .arg(container_pid.to_string())
+        .arg("--mount")
+        .arg("--uts")
+        .arg("--net")
+        .arg("--pid")
+        .arg("--root")
+        .arg(rootfs) // Set the root filesystem
+        .arg("--wd=/"); // Set working directory to /
 
-    // For nsenter with --root, we don't need full paths as nsenter handles the root change
-    // For unshare with chroot, we do need full paths
-    let cmd_with_path = if is_root {
-        // With nsenter, use commands as-is since --root handles the filesystem
-        command.clone()
-    } else if !command.is_empty() && !command[0].starts_with('/') {
-        // Try to find the command in common locations
-        let cmd_name = &command[0];
-        let possible_paths = vec![
-            format!("/bin/{}", cmd_name),
-            format!("/usr/bin/{}", cmd_name),
-            format!("/sbin/{}", cmd_name),
-            format!("/usr/sbin/{}", cmd_name),
-        ];
-
-        // Check which path exists in the rootfs
-        let mut found_path = format!("/bin/{}", cmd_name); // default
-        for path in &possible_paths {
-            let full_path = rootfs.join(&path[1..]); // Remove leading /
-            if full_path.exists() {
-                found_path = path.clone();
-                break;
-            }
-        }
-
-        let mut full_path_cmd = vec![found_path];
-        if command.len() > 1 {
-            full_path_cmd.extend(command[1..].iter().cloned());
-        }
-        full_path_cmd
-    } else {
-        command.clone()
-    };
-
-    exec_cmd.args(&cmd_with_path);
+    // Add the command to run
+    exec_cmd.args(&command);
 
     // Set up environment
-    exec_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    exec_cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     exec_cmd.env("HOME", "/root");
     exec_cmd.env("TERM", "xterm");
 
@@ -795,35 +838,57 @@ async fn exec_rootless_container(
                     rootfs.to_string_lossy().to_string(),
                     "--wd=/".to_string(),
                 ];
-                nsenter_args.extend(cmd_with_path.clone());
+                nsenter_args.extend(command.clone());
                 ("nsenter", nsenter_args)
             } else {
-                // Use unshare for non-root
-                let mut unshare_args = vec![
+                // Use unshare for non-root - need to wrap with device setup
+                let inner_cmd = if !command.is_empty() {
+                    command.join(" ")
+                } else {
+                    "/bin/sh".to_string()
+                };
+
+                let setup_script = format!(
+                    "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
+                     mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
+                     mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
+                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
+                     ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
+                     exec chroot {} {}",
+                    rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), rootfs.display(), rootfs.display(), rootfs.display(),
+                    rootfs.display(), inner_cmd
+                );
+
+                let unshare_args = vec![
                     "--user".to_string(),
                     "--map-root-user".to_string(),
                     "--mount".to_string(),
                     "--pid".to_string(),
-                    "chroot".to_string(),
-                    rootfs.to_string_lossy().to_string(),
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    setup_script,
                 ];
-                unshare_args.extend(cmd_with_path.clone());
                 ("unshare", unshare_args)
             };
 
-            let exit_code = spawn_with_pty(cmd_name, &args)
-                .unwrap_or_else(|_| {
-                    // Fallback to regular execution
-                    let mut child = exec_cmd
-                        .stdin(Stdio::inherit())
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .spawn()
-                        .expect("Failed to spawn unshare");
+            let exit_code = spawn_with_pty(cmd_name, &args).unwrap_or_else(|_| {
+                // Fallback to regular execution
+                let mut child = exec_cmd
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("Failed to spawn unshare");
 
-                    let status = child.wait().expect("Failed to wait for child");
-                    status.code().unwrap_or(1)
-                });
+                let status = child.wait().expect("Failed to wait for child");
+                status.code().unwrap_or(1)
+            });
 
             if exit_code != 0 {
                 return Err(format!("Command exited with code {}", exit_code).into());
@@ -943,6 +1008,10 @@ pub async fn exec_in_container(
         .into());
     }
 
+    // Set up essential files and networking for the container if not already done
+    setup_container_essential_files(&rootfs)?;
+    setup_container_network_if_needed(&container_dir, &rootfs, pid)?;
+
     // Prepare the command to execute
     let cmd_to_run = if command.is_empty() {
         vec!["/bin/sh".to_string()]
@@ -973,13 +1042,27 @@ pub async fn exec_in_container(
     // Handle based on how the container was created
     if !elevated {
         // Container was created as rootless, use rootless exec regardless of current privileges
-        return exec_rootless_container(&container_dir, &rootfs, container_pid, cmd_to_run, is_interactive).await;
+        return exec_rootless_container(
+            &container_dir,
+            &rootfs,
+            container_pid,
+            cmd_to_run,
+            is_interactive,
+        )
+        .await;
     }
 
     // For elevated/root containers, check if we need special handling
     if !is_root && elevated {
         // Running as non-root but container needs elevated privileges
-        return exec_elevated_container(&container_dir, &rootfs, container_pid, cmd_to_run, is_interactive).await;
+        return exec_elevated_container(
+            &container_dir,
+            &rootfs,
+            container_pid,
+            cmd_to_run,
+            is_interactive,
+        )
+        .await;
     }
 
     // For root containers running with root privileges, use nsenter
@@ -994,15 +1077,63 @@ pub async fn exec_in_container(
         format!("--root={}", rootfs.to_string_lossy()),
         "--".into(),
     ];
-    
-    // Wrap the command to ensure we're in a valid directory
+
+    // Wrap the command to ensure we're in a valid directory and fix /dev if needed
     let wrapped_cmd = if cmd_to_run.is_empty() {
-        vec!["sh".to_string(), "-c".to_string(), "cd / 2>/dev/null || true; exec /bin/sh".to_string()]
+        vec!["sh".to_string(), "-c".to_string(),
+            "cd / 2>/dev/null || true; \
+             if [ ! -e /dev/null ] || [ ! -c /dev/null ]; then \
+               mount -t tmpfs -o mode=755,size=65536k tmpfs /dev 2>/dev/null || true; \
+               rm -f /dev/null 2>/dev/null || true; \
+               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
+               rm -f /dev/zero 2>/dev/null || true; \
+               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
+               rm -f /dev/random 2>/dev/null || true; \
+               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
+               rm -f /dev/urandom 2>/dev/null || true; \
+               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
+               rm -f /dev/tty 2>/dev/null || true; \
+               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
+               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
+               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
+               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
+            fi; \
+             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
+               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
+               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+             fi; \
+             exec /bin/sh".to_string()]
     } else {
         let cmd_str = cmd_to_run.join(" ");
-        vec!["sh".to_string(), "-c".to_string(), format!("cd / 2>/dev/null || true; exec {}", cmd_str)]
+        vec!["sh".to_string(), "-c".to_string(), format!(
+            "cd / 2>/dev/null || true; \
+             if [ ! -e /dev/null ] || [ ! -c /dev/null ]; then \
+               mount -t tmpfs -o mode=755,size=65536k tmpfs /dev 2>/dev/null || true; \
+               rm -f /dev/null 2>/dev/null || true; \
+               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
+               rm -f /dev/zero 2>/dev/null || true; \
+               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
+               rm -f /dev/random 2>/dev/null || true; \
+               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
+               rm -f /dev/urandom 2>/dev/null || true; \
+               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
+               rm -f /dev/tty 2>/dev/null || true; \
+               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
+               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
+               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
+               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
+            fi; \
+             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
+               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
+               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
+             fi; \
+             exec {}", cmd_str)]
     };
-    
+
     nsenter_args.extend(wrapped_cmd);
 
     if is_interactive {
@@ -1043,7 +1174,10 @@ pub async fn exec_in_container(
             // Try nsenter first
             let mut exec_cmd = Command::new("nsenter");
             exec_cmd.args(&nsenter_args);
-            exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit()).stdin(Stdio::inherit());
+            exec_cmd
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .stdin(Stdio::inherit());
 
             match exec_cmd.spawn() {
                 Ok(mut child) => {
@@ -1063,11 +1197,15 @@ pub async fn exec_in_container(
 
                     let mut sudo_cmd = Command::new("sudo");
                     sudo_cmd.args(&sudo_args);
-                    sudo_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit()).stdin(Stdio::inherit());
+                    sudo_cmd
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .stdin(Stdio::inherit());
 
                     let mut child = sudo_cmd.spawn().map_err(|e| {
                         if e.kind() == std::io::ErrorKind::NotFound {
-                            "sudo command not found. Please run as root or install sudo.".to_string()
+                            "sudo command not found. Please run as root or install sudo."
+                                .to_string()
                         } else {
                             format!("Failed to execute command with sudo: {}", e)
                         }
@@ -1083,7 +1221,9 @@ pub async fn exec_in_container(
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        return Err("nsenter command not found. Please install util-linux package.".into());
+                        return Err(
+                            "nsenter command not found. Please install util-linux package.".into(),
+                        );
                     } else {
                         return Err(format!("Failed to execute command: {}", e).into());
                     }
@@ -1139,7 +1279,9 @@ pub async fn exec_in_container(
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err("nsenter command not found. Please install util-linux package.".into());
+                    return Err(
+                        "nsenter command not found. Please install util-linux package.".into(),
+                    );
                 } else {
                     return Err(format!("Failed to execute command: {}", e).into());
                 }
@@ -2072,19 +2214,44 @@ async fn download_blob_with_progress(
     }
 }
 
-/// Set up essential network configuration files in the container
-fn setup_container_network_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Set up essential directories and files in the container
+fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure essential directories exist
+    let essential_dirs = vec![
+        "etc",
+        "tmp",
+        "var",
+        "var/tmp",
+        "var/cache",
+        "var/cache/apt",
+        "dev",
+        "proc",
+        "sys",
+    ];
+
+    for dir in essential_dirs {
+        let dir_path = rootfs.join(dir);
+        if !dir_path.exists() {
+            println!("Creating directory: {}", dir);
+            std::fs::create_dir_all(&dir_path)?;
+        }
+
+        // Make tmp directories world-writable
+        if dir.contains("tmp") {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dir_path)?.permissions();
+            perms.set_mode(0o1777); // sticky bit + world writable
+            std::fs::set_permissions(&dir_path, perms)?;
+        }
+    }
+
+    // Set up network files
     let etc_dir = rootfs.join("etc");
-    
-    println!("Setting up network files in: {}", etc_dir.display());
-    
-    // Ensure /etc exists
-    std::fs::create_dir_all(&etc_dir)?;
-    
+
     // Copy host's resolv.conf for DNS resolution
     let host_resolv = Path::new("/etc/resolv.conf");
     let container_resolv = etc_dir.join("resolv.conf");
-    
+
     // Always overwrite resolv.conf to ensure DNS works
     if host_resolv.exists() {
         println!("Copying host resolv.conf to container");
@@ -2094,17 +2261,14 @@ fn setup_container_network_files(rootfs: &Path) -> Result<(), Box<dyn std::error
         // Create a basic resolv.conf with common DNS servers
         std::fs::write(
             &container_resolv,
-            "# Generated by carrier\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n"
+            "# Generated by carrier\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n",
         )?;
     }
-    
+
     // Set up hosts file (always overwrite for consistency)
     let container_hosts = etc_dir.join("hosts");
-    std::fs::write(
-        &container_hosts,
-        "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
-    )?;
-    
+    std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n")?;
+
     Ok(())
 }
 
@@ -2153,9 +2317,9 @@ async fn run_container_with_storage(
     };
 
     println!("Container filesystem ready at: {}", rootfs.display());
-    
-    // Set up essential files for networking
-    setup_container_network_files(&rootfs)?;
+
+    // Set up essential directories and files
+    setup_container_essential_files(&rootfs)?;
 
     // Read image config to get command and env
     let config_blob_path = storage.blob_cache_path(&manifest.config.digest);
@@ -2210,11 +2374,14 @@ async fn run_container_with_storage(
     }
 
     // For detached containers with no explicit command or only a shell, use sleep infinity
-    if detach && (command.is_empty()
-        || (command.len() == 1 && (command[0] == "/bin/sh"
-            || command[0] == "/bin/bash"
-            || command[0] == "sh"
-            || command[0] == "bash"))) {
+    if detach
+        && (command.is_empty()
+            || (command.len() == 1
+                && (command[0] == "/bin/sh"
+                    || command[0] == "/bin/bash"
+                    || command[0] == "sh"
+                    || command[0] == "bash")))
+    {
         println!("No persistent command specified for detached container, using 'sleep infinity'");
         command = vec!["sleep".to_string(), "infinity".to_string()];
     }
@@ -2233,10 +2400,13 @@ async fn run_container_with_storage(
     // Clone command for later use
     let command_to_run = command.clone();
 
-    // Configure container
+    // Configure container with proper network settings
+    let mut network_config = NetworkConfig::default();
+    network_config.enable_network = !elevated; // Disable network for elevated containers (use host network)
+
     let container_config = ContainerConfig {
         id: container_id.clone(),
-        name: None,
+        name: name.clone(),
         image: parsed_image.to_string(),
         rootfs: rootfs.clone(),
         command,
@@ -2245,11 +2415,7 @@ async fn run_container_with_storage(
         hostname: Some(format!("carrier-{}", &container_id[..8])),
         user: None,
         readonly_rootfs: false,
-        network_config: NetworkConfig {
-            enable_network: true,
-            network_mode: NetworkMode::Slirp4netns,
-            ..Default::default()
-        },
+        network_config,
         ..Default::default()
     };
 
@@ -2314,40 +2480,105 @@ async fn run_container_with_storage(
     let mut cmd = if elevated {
         println!("Running container with elevated privileges (using sudo)...");
         // For elevated mode, use sudo to run unshare without user namespace
-        // Use host networking for elevated containers to ensure network connectivity
+        // We need to set up /dev properly before chroot
         let mut c = Command::new("sudo");
+
+        let root_dir = rootfs.display().to_string();
+        let command_str = command_to_run.join(" ");
+
+        // Create a shell script that sets up the container environment properly
+        let setup_and_run = format!(
+            "mount -t proc proc {root}/proc 2>/dev/null || true; \
+             mount -t sysfs sysfs {root}/sys 2>/dev/null || true; \
+             mount -t tmpfs -o mode=755,size=65536k tmpfs {root}/dev 2>/dev/null || true; \
+             rm -f {root}/dev/null 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/null c 1 3 2>/dev/null || true; \
+             rm -f {root}/dev/zero 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/zero c 1 5 2>/dev/null || true; \
+             rm -f {root}/dev/random 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/random c 1 8 2>/dev/null || true; \
+             rm -f {root}/dev/urandom 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
+             rm -f {root}/dev/tty 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/tty c 5 0 2>/dev/null || true; \
+             rm -f {root}/dev/console 2>/dev/null || true; \
+             mknod -m 600 {root}/dev/console c 5 1 2>/dev/null || true; \
+             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
+             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
+             mount -t tmpfs -o mode=1777,size=65536k shm {root}/dev/shm 2>/dev/null || true; \
+             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
+             ln -sf /proc/self/fd {root}/dev/fd 2>/dev/null || true; \
+             ln -sf /proc/self/fd/0 {root}/dev/stdin 2>/dev/null || true; \
+             ln -sf /proc/self/fd/1 {root}/dev/stdout 2>/dev/null || true; \
+             ln -sf /proc/self/fd/2 {root}/dev/stderr 2>/dev/null || true; \
+             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
+             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+             export HOME=/root; \
+             export TERM=xterm; \
+             export HOSTNAME=carrier-{host}; \
+             chroot {root} {cmd}",
+            root = root_dir,
+            host = &container_id[..8],
+            cmd = command_str
+        );
+
         c.arg("unshare")
             .arg("--mount")
             .arg("--pid")
-            .arg("--fork")  // Fork to properly handle PID namespace
-            .arg("chroot")
-            .arg(&rootfs);
+            .arg("--fork") // Fork to properly handle PID namespace
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(setup_and_run);
         c
     } else {
         // For rootless mode, use user namespaces for better isolation
+        // We need to set up /dev properly before chroot for rootless containers too
         let mut c = Command::new("unshare");
+
+        let root_dir = rootfs.display().to_string();
+        let command_str = command_to_run.join(" ");
+
+        // Create a shell script that sets up the container environment properly for rootless
+        let setup_and_run = format!(
+            "mount -t tmpfs -o mode=755,size=65536k tmpfs {root}/dev 2>/dev/null || true; \
+             rm -f {root}/dev/null 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/null c 1 3 2>/dev/null || true; \
+             rm -f {root}/dev/zero 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/zero c 1 5 2>/dev/null || true; \
+             rm -f {root}/dev/random 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/random c 1 8 2>/dev/null || true; \
+             rm -f {root}/dev/urandom 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
+             rm -f {root}/dev/tty 2>/dev/null || true; \
+             mknod -m 666 {root}/dev/tty c 5 0 2>/dev/null || true; \
+             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
+             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
+             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
+             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
+             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+             export HOME=/root; \
+             export TERM=xterm; \
+             export HOSTNAME=carrier-{host}; \
+             exec chroot {root} {cmd}",
+            root = root_dir,
+            host = &container_id[..8],
+            cmd = command_str
+        );
+
         c.arg("--user")
             .arg("--map-root-user") // Map current user to root in container
             .arg("--mount")
             .arg("--pid")
-            .arg("--fork")  // Fork to properly handle PID namespace
-            .arg("--net")   // Create network namespace for rootless
-            .arg("chroot")
-            .arg(&rootfs);
+            .arg("--fork") // Fork to properly handle PID namespace
+            .arg("--net") // Create network namespace for rootless
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(setup_and_run);
         c
     };
 
-    // Set up environment
-    cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    )
-    .env("HOME", "/root")
-    .env("TERM", "xterm")
-    .env("HOSTNAME", format!("carrier-{}", &container_id[..8]));
-
-    // Add the actual command
-    cmd.args(&command_to_run);
+    // For elevated containers, environment is already set in the shell command
+    // For rootless, it was set above
 
     if detach {
         // For detached containers, pipe stdout/stderr and write timestamped lines to log file
@@ -2362,6 +2593,16 @@ async fn run_container_with_storage(
         // Save the PID to a file
         let pid_file = storage.container_path(&container_id).join("pid");
         std::fs::write(&pid_file, child.id().to_string())?;
+
+        // Set up network for rootless containers
+        if !elevated {
+            let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+            setup_container_network_if_needed(
+                &storage.container_path(&container_id),
+                &rootfs,
+                container_pid,
+            )?;
+        }
 
         // Spawn logging threads
         let log_file = std::fs::OpenOptions::new()
@@ -2414,11 +2655,23 @@ async fn run_container_with_storage(
             "--map-root-user".into(),
             "--mount".into(),
             "--pid".into(),
-                "chroot".into(),
-            rootfs.display().to_string(),
         ];
+
+        // Add network namespace for rootless containers
+        if !elevated {
+            args.push("--net".into());
+        }
+
+        args.extend(vec!["chroot".into(), rootfs.display().to_string()]);
         args.extend(command_to_run.clone());
-        let exit_code = spawn_with_pty("unshare", &args)?;
+
+        let exit_code = spawn_with_pty_and_network(
+            "unshare",
+            &args,
+            Some(&storage.container_path(&container_id)),
+            Some(&rootfs),
+            !elevated, // needs_network
+        )?;
 
         // Remove PID file after process exits
         let pid_file = storage.container_path(&container_id).join("pid");
@@ -2543,6 +2796,66 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
+/// Set up network for an existing container if not already configured
+fn setup_container_network_if_needed(
+    container_dir: &Path,
+    rootfs: &Path,
+    container_pid: nix::unistd::Pid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if network is already set up by looking for network helper processes
+    let pid_raw = container_pid.as_raw();
+
+    // Check for existing pasta or slirp4netns processes for this container
+    let check_pasta = Command::new("pgrep")
+        .args(&["-f", &format!("pasta.*{}", pid_raw)])
+        .output();
+
+    let check_slirp = Command::new("pgrep")
+        .args(&["-f", &format!("slirp4netns.*{}", pid_raw)])
+        .output();
+
+    let network_exists = (check_pasta.is_ok() && check_pasta.unwrap().status.success())
+        || (check_slirp.is_ok() && check_slirp.unwrap().status.success());
+
+    if network_exists {
+        println!("Network already configured for container");
+        return Ok(());
+    }
+
+    println!("Setting up network for container...");
+
+    // Create network configuration
+    let network_config = NetworkConfig::default();
+    let mut network_mgr = NetworkManager::new(network_config);
+
+    // Set up DNS configuration files
+    network_mgr.setup_dns(rootfs)?;
+
+    // Start network helper (pasta or slirp4netns)
+    network_mgr.setup_network(container_pid)?;
+
+    // Store network manager info for cleanup later
+    let network_pid_file = container_dir.join("network.pid");
+    if let Ok(output) = Command::new("pgrep")
+        .args(&["-f", &format!("(pasta|slirp4netns).*{}", pid_raw)])
+        .output()
+    {
+        if output.status.success() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_pid) = pids.lines().next() {
+                std::fs::write(&network_pid_file, first_pid)?;
+            }
+        }
+    }
+
+    println!("Network setup complete");
+
+    // Keep network manager alive by leaking it - it will be cleaned up when container stops
+    std::mem::forget(network_mgr);
+
+    Ok(())
+}
+
 // Spawn a Command under a pseudo-terminal with TTY semantics, window resizing, and raw mode
 /// Detect a compatible terminal type for maximum portability
 fn detect_compatible_term() -> &'static str {
@@ -2557,7 +2870,7 @@ fn detect_compatible_term() -> &'static str {
         } else if term == "tmux" || term.starts_with("tmux") {
             "screen"
         } else if term == "linux" || term == "vt100" || term == "vt102" {
-            term.leak()  // These are basic and widely supported
+            term.leak() // These are basic and widely supported
         } else {
             // Default to most basic terminal that should work everywhere
             "xterm"
@@ -2566,6 +2879,47 @@ fn detect_compatible_term() -> &'static str {
         // No TERM set, use most compatible option
         "xterm"
     }
+}
+
+fn spawn_with_pty_and_network(
+    program: &str,
+    args: &[String],
+    container_dir: Option<&Path>,
+    rootfs: Option<&Path>,
+    needs_network: bool,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::process::Stdio;
+
+    // First spawn the process to get its PID for network setup
+    if needs_network && container_dir.is_some() && rootfs.is_some() {
+        let mut initial_cmd = Command::new(program);
+        initial_cmd.args(args);
+        initial_cmd.stdin(Stdio::null());
+        initial_cmd.stdout(Stdio::null());
+        initial_cmd.stderr(Stdio::null());
+
+        let mut child = initial_cmd.spawn()?;
+        let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+
+        // Give the process a moment to set up namespaces
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Set up networking
+        if let Err(e) = setup_container_network_if_needed(
+            container_dir.unwrap(),
+            rootfs.unwrap(),
+            container_pid,
+        ) {
+            eprintln!("Warning: Failed to set up network: {}", e);
+        }
+
+        // Kill the initial process
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // Now run the actual PTY session
+    spawn_with_pty(program, args)
 }
 
 fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -2596,7 +2950,8 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
         // Set terminal to raw mode for proper input handling
         let mut raw_attrs = attrs;
         raw_attrs.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-        raw_attrs.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw_attrs.c_iflag &=
+            !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
         raw_attrs.c_cflag &= !(libc::CSIZE | libc::PARENB);
         raw_attrs.c_cflag |= libc::CS8;
         raw_attrs.c_oflag &= !(libc::OPOST);
@@ -2628,17 +2983,20 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
     // Build command
     let mut builder = CommandBuilder::new(program);
     builder.args(args.iter().map(|s| s.as_str()));
-    
+
     // Set up compatible environment variables for maximum portability
     builder.env("TERM", detect_compatible_term());
-    builder.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    builder.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     builder.env("HOME", "/root");
     builder.env("USER", "root");
     builder.env("LOGNAME", "root");
-    builder.env("SHELL", "/bin/sh");  // Most compatible shell
-    builder.env("LANG", "C.UTF-8");   // UTF-8 support with C locale fallback
-    builder.env("LC_ALL", "C");        // Override all locale settings for compatibility
-    builder.env("PWD", "/");           // Set initial working directory
+    builder.env("SHELL", "/bin/sh"); // Most compatible shell
+    builder.env("LANG", "C.UTF-8"); // UTF-8 support with C locale fallback
+    builder.env("LC_ALL", "C"); // Override all locale settings for compatibility
+    builder.env("PWD", "/"); // Set initial working directory
 
     // Spawn the child connected to the slave end of the PTY
     let mut child = pair.slave.spawn_command(builder)?;
@@ -3869,6 +4227,41 @@ pub async fn stop_container(
 
         // Remove PID file
         let _ = std::fs::remove_file(&pid_file);
+    }
+
+    // Clean up network processes (pasta or slirp4netns)
+    let network_pid_file = container_dir.join("network.pid");
+    if network_pid_file.exists() {
+        if let Ok(net_pid_str) = std::fs::read_to_string(&network_pid_file) {
+            if let Ok(net_pid) = net_pid_str.trim().parse::<i32>() {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+
+                let network_pid = Pid::from_raw(net_pid);
+                println!("Stopping network helper (PID {})...", net_pid);
+                let _ = kill(network_pid, Signal::SIGTERM);
+            }
+        }
+        let _ = std::fs::remove_file(&network_pid_file);
+    }
+
+    // Also try to find and kill any pasta/slirp4netns processes for this container
+    if let Ok(output) = Command::new("pgrep")
+        .args(&["-f", &format!("(pasta|slirp4netns).*{}", full_container_id)])
+        .output()
+    {
+        if output.status.success() {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    use nix::sys::signal::{kill, Signal};
+                    use nix::unistd::Pid;
+
+                    let net_pid = Pid::from_raw(pid);
+                    let _ = kill(net_pid, Signal::SIGTERM);
+                }
+            }
+        }
     }
 
     // Try to unmount the overlay filesystem if it's mounted

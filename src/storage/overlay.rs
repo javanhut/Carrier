@@ -1,8 +1,13 @@
+use nix::errno::Errno;
 use nix::mount::{mount, umount, MsFlags};
+use nix::sys::stat::{major, makedev, minor, mknod, Mode, SFlag};
+use nix::unistd::mkfifo;
+use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::env;
 
 /// Get runtime directory with auto-detection and fallback
 fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -66,8 +71,7 @@ impl ContainerStorage {
         fs::create_dir_all(&persistent_dir)?;
 
         // Runtime base (XDG_RUNTIME_DIR) with auto-detection
-        let runtime_dir = get_runtime_dir()?
-            .join("carrier");
+        let runtime_dir = get_runtime_dir()?.join("carrier");
         fs::create_dir_all(&runtime_dir)?;
 
         // Check if we can use native overlayfs or need fuse-overlayfs
@@ -342,18 +346,108 @@ impl ContainerStorage {
             let name = entry.file_name();
             let target = dst.join(&name);
             let path = entry.path();
+
             if ty.is_dir() {
                 fs::create_dir_all(&target)?;
                 self.copy_recursive(&path, &target)?;
-            } else if ty.is_file() {
-                // If exists, overwrite
-                let _ = fs::copy(&path, &target)?;
-            } else if ty.is_symlink() {
+                continue;
+            }
+
+            if ty.is_symlink() {
                 #[cfg(unix)]
                 {
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
                     let link_target = fs::read_link(&path)?;
                     let _ = std::os::unix::fs::symlink(&link_target, &target);
                 }
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                let metadata = fs::metadata(&path)?;
+                let mode_bits = metadata.mode() & 0o7777;
+                let perm = Mode::from_bits_truncate(mode_bits as u32);
+
+                if ty.is_char_device() {
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
+                    let dev = metadata.rdev();
+                    if let Err(e) = mknod(
+                        &target,
+                        SFlag::S_IFCHR,
+                        perm,
+                        makedev(major(dev), minor(dev)),
+                    ) {
+                        if e != Errno::EPERM {
+                            return Err(format!(
+                                "Failed to create char device {}: {}",
+                                target.display(),
+                                e
+                            )
+                            .into());
+                        }
+                    }
+                    continue;
+                }
+
+                if ty.is_block_device() {
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
+                    let dev = metadata.rdev();
+                    if let Err(e) = mknod(
+                        &target,
+                        SFlag::S_IFBLK,
+                        perm,
+                        makedev(major(dev), minor(dev)),
+                    ) {
+                        if e != Errno::EPERM {
+                            return Err(format!(
+                                "Failed to create block device {}: {}",
+                                target.display(),
+                                e
+                            )
+                            .into());
+                        }
+                    }
+                    continue;
+                }
+
+                if ty.is_fifo() {
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
+                    if let Err(e) = mkfifo(&target, perm) {
+                        if e != Errno::EPERM {
+                            return Err(format!(
+                                "Failed to create FIFO {}: {}",
+                                target.display(),
+                                e
+                            )
+                            .into());
+                        }
+                    }
+                    continue;
+                }
+
+                if ty.is_socket() {
+                    // Skip Unix sockets; they will be recreated by the application as needed
+                    continue;
+                }
+
+                if ty.is_file() {
+                    let _ = fs::copy(&path, &target)?;
+                    fs::set_permissions(&target, metadata.permissions())?;
+                    continue;
+                }
+            }
+
+            if ty.is_file() {
+                let _ = fs::copy(&path, &target)?;
             }
         }
         Ok(())

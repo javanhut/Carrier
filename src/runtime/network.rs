@@ -125,8 +125,9 @@ impl NetworkManager {
         let mut cmd = Command::new("pasta");
 
         // Basic options
-        cmd.arg("--config-net")  // Configure network in namespace
-           .arg("--netns").arg(format!("/proc/{}/ns/net", container_pid.as_raw()));
+        cmd.arg("--config-net") // Configure network in namespace
+            .arg("--netns")
+            .arg(format!("/proc/{}/ns/net", container_pid.as_raw()));
 
         // Add port mappings
         for mapping in &self.config.port_mappings {
@@ -134,13 +135,14 @@ impl NetworkManager {
                 Protocol::TCP => "tcp",
                 Protocol::UDP => "udp",
             };
-            cmd.arg("-t" ).arg(format!("{}:{}", mapping.host_port, mapping.container_port));
+            cmd.arg("-t")
+                .arg(format!("{}:{}", mapping.host_port, mapping.container_port));
         }
 
         // Additional options for better performance
-        cmd.arg("--no-ndp")  // Disable NDP proxy
-           .arg("--no-dhcpv6")  // Disable DHCPv6
-           .arg("--no-ra");  // Disable router advertisements
+        cmd.arg("--no-ndp") // Disable NDP proxy
+            .arg("--no-dhcpv6") // Disable DHCPv6
+            .arg("--no-ra"); // Disable router advertisements
 
         // Start pasta
         let pasta = cmd
