@@ -5,7 +5,7 @@
 ### Building from Source
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/carrier
+git clone https://github.com/javanhut/carrier
 cd carrier
 
 # Build in release mode

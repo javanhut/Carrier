@@ -20,8 +20,10 @@ TEST_IMAGE="docker.io/library/hello-world:latest"  # Use smaller image to reduce
 ITERATIONS=${1:-3}
 PULL_ITERS=${PULL_ITERS:-2}  # Reduce pull iterations to avoid rate limits
 
-# Setup
-CARRIER="./target/release/carrier"
+# Setup - adjust path based on execution location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CARRIER="$PROJECT_ROOT/target/release/carrier"
 [ ! -x "$CARRIER" ] && CARRIER="carrier"
 
 # Check if we need sudo for Docker

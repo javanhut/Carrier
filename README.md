@@ -23,6 +23,7 @@ See [Rootless Documentation](docs/rootless.md) for setup and usage details.
 - **Namespace Isolation** - Full Linux namespace support (PID, Network, Mount, UTS, IPC, User)
 - **Cgroups v2** - Resource limits and accounting
 - **Security** - Capability dropping, seccomp filters, no-new-privileges
+- **Device Management** - Proper /dev mounting with automatic fallback from devtmpfs to tmpfs, ensuring correct device node permissions
 
 ## Quick Start
 
@@ -181,10 +182,11 @@ carrier/
 -  Direct execution model
 
 ### vs Podman
-- x No external runtime dependency (runc/crun)
+-  No external runtime dependency (runc/crun)
 -  Simpler architecture
 -  Faster container startup
 -  Integrated runtime
+-  Robust device node handling with proper permission management
 
 ## Contributing
 
