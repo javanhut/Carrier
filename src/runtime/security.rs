@@ -48,7 +48,6 @@ impl Default for SecurityConfig {
                 Capability::CAP_SYS_NICE,
                 Capability::CAP_SYS_RESOURCE,
                 Capability::CAP_SYS_TIME,
-                Capability::CAP_MKNOD,
                 Capability::CAP_NET_ADMIN,
             ],
             // Keep basic capabilities

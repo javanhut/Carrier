@@ -576,7 +576,6 @@ async fn exec_elevated_container(
     command: Vec<String>,
     is_interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::FileTypeExt;
     use std::process::{Command, Stdio};
 
     println!(
@@ -584,95 +583,71 @@ async fn exec_elevated_container(
         container_pid
     );
 
-    // For elevated containers, we need to ensure /dev is properly set up
-    // Check if /dev/null exists and is a character device
-    let dev_null_path = rootfs.join("dev/null");
-    let needs_dev_setup = !dev_null_path.exists()
-        || std::fs::metadata(&dev_null_path)
-            .map(|m| !m.file_type().is_char_device())
-            .unwrap_or(true);
+    ensure_host_dev_null_ready()?;
 
+    // Use nsenter to properly enter the container's namespaces first
     let mut exec_cmd = Command::new("sudo");
 
-    // Ensure we use full paths for commands
-    let cmd_with_path = if !command.is_empty() && !command[0].starts_with('/') {
-        // Try to find the command in common locations
-        let cmd_name = &command[0];
-        let possible_paths = vec![
-            format!("/bin/{}", cmd_name),
-            format!("/usr/bin/{}", cmd_name),
-            format!("/sbin/{}", cmd_name),
-            format!("/usr/sbin/{}", cmd_name),
-        ];
+    // Enter all the container's namespaces
+    exec_cmd
+        .arg("nsenter")
+        .arg("-t")
+        .arg(container_pid.to_string())
+        .arg("-m") // Mount namespace - CRITICAL for /dev access
+        .arg("-u") // UTS namespace
+        .arg("-i") // IPC namespace
+        .arg("-n") // Network namespace
+        .arg("-p") // PID namespace
+        .arg("-r") // Set root directory to container's root
+        .arg("-w"); // Set working directory to container's cwd
 
-        // Check which path exists in the rootfs
-        let mut found_path = format!("/bin/{}", cmd_name); // default
-        for path in &possible_paths {
-            let full_path = rootfs.join(&path[1..]); // Remove leading /
-            if full_path.exists() {
-                found_path = path.clone();
-                break;
-            }
-        }
-
-        let mut full_path_cmd = vec![found_path];
-        if command.len() > 1 {
-            full_path_cmd.extend(command[1..].iter().cloned());
-        }
-        full_path_cmd
-    } else {
-        command.clone()
-    };
-
-    if needs_dev_setup {
-        // If /dev is not properly set up, we need to fix it
-        println!("Setting up /dev filesystem for elevated container...");
-
-        let setup_and_exec = format!(
-            "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
-             mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
-             mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
-             mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
-             mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
-             mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
-             mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
-             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
-             ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-             export HOME=/root; \
-             export TERM=xterm; \
-             chroot {} {}",
-            rootfs.display(), rootfs.display(), rootfs.display(),
-            rootfs.display(), rootfs.display(), rootfs.display(),
-            rootfs.display(), rootfs.display(), rootfs.display(),
-            rootfs.display(), rootfs.display(), cmd_with_path.join(" ")
+    // For interactive sessions, we need to ensure /dev is properly set up
+    // But we check and fix it from INSIDE the namespace
+    if is_interactive {
+        // Create a script that checks and fixes /dev if needed, then runs the command
+        let cmd_str = command.join(" ");
+        let check_and_exec = format!(
+            "#!/bin/sh\n\
+             # Check if /dev/null is properly set up\n\
+             if [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then\n\
+                 echo 'Fixing /dev filesystem...'\n\
+                 mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
+                 mount -o remount,dev /dev 2>/dev/null || \
+                 mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
+                 mount -o remount,dev /dev 2>/dev/null || true\n\
+                 # Create device nodes with proper permissions\n\
+                 mknod -m 0666 /dev/null c 1 3\n\
+                 mknod -m 0666 /dev/zero c 1 5\n\
+                 mknod -m 0666 /dev/random c 1 8\n\
+                 mknod -m 0666 /dev/urandom c 1 9\n\
+                 mknod -m 0666 /dev/tty c 5 0\n\
+                 mknod -m 0600 /dev/console c 5 1\n\
+                 # Create pts directory if needed\n\
+                 mkdir -p /dev/pts /dev/shm\n\
+                 # Mount devpts if not already mounted\n\
+                 if ! mountpoint -q /dev/pts; then\n\
+                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts\n\
+                 fi\n\
+                 # Create ptmx symlink\n\
+                 [ ! -e /dev/ptmx ] && ln -sf /dev/pts/ptmx /dev/ptmx\n\
+                 # Mount shm if not already mounted\n\
+                 if ! mountpoint -q /dev/shm; then\n\
+                     mount -t tmpfs -o mode=1777,size=65536k shm /dev/shm\n\
+                 fi\n\
+             fi\n\
+             # Set up environment\n\
+             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             export HOME=/root\n\
+             export TERM=xterm\n\
+             # Execute the actual command\n\
+             exec {}",
+            cmd_str
         );
 
-        exec_cmd
-            .arg("unshare")
-            .arg("--mount")
-            .arg("--pid")
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(setup_and_exec);
+        exec_cmd.arg("/bin/sh").arg("-c").arg(check_and_exec);
     } else {
-        // /dev is already set up, just chroot and execute
-        exec_cmd
-            .arg("unshare")
-            .arg("--mount")
-            .arg("--pid")
-            .arg("chroot")
-            .arg(rootfs);
-
-        exec_cmd.args(&cmd_with_path);
-
-        // Set up environment
-        exec_cmd.env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-        exec_cmd.env("HOME", "/root");
-        exec_cmd.env("TERM", "xterm");
+        // For non-interactive, just run the command directly
+        exec_cmd.args(&command);
     }
 
     if is_interactive {
@@ -683,58 +658,37 @@ async fn exec_elevated_container(
         let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
 
         if is_tty {
-            // Try using PTY for interactive session with sudo
-            let mut sudo_args = vec![];
+            // Build the complete nsenter command arguments
+            let nsenter_args = vec![
+                "nsenter".to_string(),
+                "-t".to_string(),
+                container_pid.to_string(),
+                "-m".to_string(), // Mount namespace
+                "-u".to_string(), // UTS namespace
+                "-i".to_string(), // IPC namespace
+                "-n".to_string(), // Network namespace
+                "-p".to_string(), // PID namespace
+                "-r".to_string(), // Root directory
+                "-w".to_string(), // Working directory
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                // The check_and_exec script we built above
+                exec_cmd
+                    .get_args()
+                    .last()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ];
 
-            if needs_dev_setup {
-                // Need to run the full setup script
-                let setup_and_exec = format!(
-                    "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
-                     mkdir -p {}/dev/pts 2>/dev/null || true; \
-                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
-                     ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
-                     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-                     export HOME=/root; \
-                     export TERM=xterm; \
-                     chroot {} {}",
-                    rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), cmd_with_path.join(" ")
-                );
-
-                sudo_args = vec![
-                    "unshare".to_string(),
-                    "--mount".to_string(),
-                    "--pid".to_string(),
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    setup_and_exec,
-                ];
-            } else {
-                sudo_args = vec![
-                    "unshare".to_string(),
-                    "--mount".to_string(),
-                    "--pid".to_string(),
-                    "chroot".to_string(),
-                    rootfs.to_string_lossy().to_string(),
-                ];
-                sudo_args.extend(cmd_with_path.clone());
-            }
-
-            let exit_code = spawn_with_pty("sudo", &sudo_args).unwrap_or_else(|_| {
+            let exit_code = spawn_with_pty("sudo", &nsenter_args).unwrap_or_else(|_| {
                 // Fallback to regular execution
                 let mut child = exec_cmd
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
                     .spawn()
-                    .expect("Failed to spawn unshare");
+                    .expect("Failed to spawn nsenter");
 
                 let status = child.wait().expect("Failed to wait for child");
                 status.code().unwrap_or(1)
@@ -849,20 +803,34 @@ async fn exec_rootless_container(
                 };
 
                 let setup_script = format!(
-                    "mount -t tmpfs -o mode=755,size=65536k tmpfs {}/dev 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/null c 1 3 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/zero c 1 5 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/random c 1 8 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/urandom c 1 9 2>/dev/null || true; \
-                     mknod -m 666 {}/dev/tty c 5 0 2>/dev/null || true; \
+                    "mount -t devtmpfs -o mode=755 devtmpfs {}/dev 2>/dev/null || \
+                     mount -o remount,dev {}/dev 2>/dev/null || \
+                     mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {}/dev 2>/dev/null || \
+                     mount -o remount,dev {}/dev 2>/dev/null || true; \
+                     mknod -m 0666 {}/dev/null c 1 3 2>/dev/null || true; \
+                     mknod -m 0666 {}/dev/zero c 1 5 2>/dev/null || true; \
+                     mknod -m 0666 {}/dev/random c 1 8 2>/dev/null || true; \
+                     mknod -m 0666 {}/dev/urandom c 1 9 2>/dev/null || true; \
+                     mknod -m 0666 {}/dev/tty c 5 0 2>/dev/null || true; \
                      mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
                      mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
                      ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
                      exec chroot {} {}",
-                    rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), rootfs.display(), rootfs.display(), rootfs.display(),
-                    rootfs.display(), inner_cmd
+                    rootfs.display(), // mount devtmpfs
+                    rootfs.display(), // remount dev
+                    rootfs.display(), // tmpfs fallback
+                    rootfs.display(), // remount dev after fallback
+                    rootfs.display(), // /dev/null
+                    rootfs.display(), // /dev/zero
+                    rootfs.display(), // /dev/random
+                    rootfs.display(), // /dev/urandom
+                    rootfs.display(), // /dev/tty
+                    rootfs.display(), // /dev/pts mkdir
+                    rootfs.display(), // /dev/shm mkdir
+                    rootfs.display(), // mount devpts
+                    rootfs.display(), // symlink ptmx
+                    rootfs.display(), // chroot path
+                    inner_cmd
                 );
 
                 let unshare_args = vec![
@@ -1082,8 +1050,11 @@ pub async fn exec_in_container(
     let wrapped_cmd = if cmd_to_run.is_empty() {
         vec!["sh".to_string(), "-c".to_string(),
             "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ]; then \
-               mount -t tmpfs -o mode=755,size=65536k tmpfs /dev 2>/dev/null || true; \
+             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
+               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
+               mount -o remount,dev /dev 2>/dev/null || \
+               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
+               mount -o remount,dev /dev 2>/dev/null || true; \
                rm -f /dev/null 2>/dev/null || true; \
                mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
                rm -f /dev/zero 2>/dev/null || true; \
@@ -1109,8 +1080,11 @@ pub async fn exec_in_container(
         let cmd_str = cmd_to_run.join(" ");
         vec!["sh".to_string(), "-c".to_string(), format!(
             "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ]; then \
-               mount -t tmpfs -o mode=755,size=65536k tmpfs /dev 2>/dev/null || true; \
+             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
+               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
+               mount -o remount,dev /dev 2>/dev/null || \
+               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
+               mount -o remount,dev /dev 2>/dev/null || true; \
                rm -f /dev/null 2>/dev/null || true; \
                mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
                rm -f /dev/zero 2>/dev/null || true; \
@@ -2272,6 +2246,47 @@ fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+fn ensure_host_dev_null_ready() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::metadata("/dev/null").map_err(|err| {
+        format!(
+            "Host /dev/null is not accessible: {}. Elevated containers require a working /dev/null.\nFix with:\n  sudo rm -f /dev/null\n  sudo mknod -m 666 /dev/null c 1 3\n  sudo chown root:root /dev/null",
+            err
+        )
+    })?;
+
+    if !metadata.file_type().is_char_device() {
+        return Err(
+            "Host /dev/null is not a character device. Recreate it with:\n  sudo rm -f /dev/null\n  sudo mknod -m 666 /dev/null c 1 3\n  sudo chown root:root /dev/null"
+                .into(),
+        );
+    }
+
+    let rdev = metadata.rdev();
+    let major = libc::major(rdev);
+    let minor = libc::minor(rdev);
+    if major != 1 || minor != 3 {
+        return Err(
+            format!(
+                "Host /dev/null has unexpected device numbers ({}:{}) — expected 1:3. Recreate it with:\n  sudo rm -f /dev/null\n  sudo mknod -m 666 /dev/null c 1 3\n  sudo chown root:root /dev/null",
+                major, minor
+            )
+            .into(),
+        );
+    }
+
+    if OpenOptions::new().write(true).open("/dev/null").is_err() {
+        return Err(
+            "Host /dev/null is not writable. Fix permissions with:\n  sudo chown root:root /dev/null\n  sudo chmod 666 /dev/null"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
 async fn run_container_with_storage(
     parsed_image: &RegistryImage,
     manifest: &ManifestV2,
@@ -2300,6 +2315,11 @@ async fn run_container_with_storage(
 
     // Create container with overlay filesystem
     println!("Setting up container filesystem with overlay...");
+
+    // Elevated containers need a healthy host /dev/null to create device nodes inside the namespace
+    if elevated {
+        ensure_host_dev_null_ready()?;
+    }
 
     // Preflight checks for rootless operation
     crate::storage::preflight_rootless_checks();
@@ -2490,19 +2510,28 @@ async fn run_container_with_storage(
         let setup_and_run = format!(
             "mount -t proc proc {root}/proc 2>/dev/null || true; \
              mount -t sysfs sysfs {root}/sys 2>/dev/null || true; \
-             mount -t tmpfs -o mode=755,size=65536k tmpfs {root}/dev 2>/dev/null || true; \
-             rm -f {root}/dev/null 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/null c 1 3 2>/dev/null || true; \
-             rm -f {root}/dev/zero 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-             rm -f {root}/dev/random 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/random c 1 8 2>/dev/null || true; \
-             rm -f {root}/dev/urandom 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-             rm -f {root}/dev/tty 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-             rm -f {root}/dev/console 2>/dev/null || true; \
-             mknod -m 600 {root}/dev/console c 5 1 2>/dev/null || true; \
+             mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
+             mount -o remount,dev {root}/dev 2>/dev/null || \
+             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
+             mount -o remount,dev {root}/dev 2>/dev/null || true; \
+              rm -f {root}/dev/null 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
+              chown 0:0 {root}/dev/null 2>/dev/null || true; \
+              rm -f {root}/dev/zero 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
+              chown 0:0 {root}/dev/zero 2>/dev/null || true; \
+              rm -f {root}/dev/random 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
+              chown 0:0 {root}/dev/random 2>/dev/null || true; \
+              rm -f {root}/dev/urandom 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
+              chown 0:0 {root}/dev/urandom 2>/dev/null || true; \
+              rm -f {root}/dev/tty 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
+              chown 0:0 {root}/dev/tty 2>/dev/null || true; \
+              rm -f {root}/dev/console 2>/dev/null || true; \
+              mknod -m 0600 {root}/dev/console c 5 1 2>/dev/null || true; \
+              chown 0:0 {root}/dev/console 2>/dev/null || true; \
              mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
              mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
              mount -t tmpfs -o mode=1777,size=65536k shm {root}/dev/shm 2>/dev/null || true; \
@@ -2540,17 +2569,20 @@ async fn run_container_with_storage(
 
         // Create a shell script that sets up the container environment properly for rootless
         let setup_and_run = format!(
-            "mount -t tmpfs -o mode=755,size=65536k tmpfs {root}/dev 2>/dev/null || true; \
-             rm -f {root}/dev/null 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/null c 1 3 2>/dev/null || true; \
-             rm -f {root}/dev/zero 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-             rm -f {root}/dev/random 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/random c 1 8 2>/dev/null || true; \
-             rm -f {root}/dev/urandom 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-             rm -f {root}/dev/tty 2>/dev/null || true; \
-             mknod -m 666 {root}/dev/tty c 5 0 2>/dev/null || true; \
+            "mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
+             mount -o remount,dev {root}/dev 2>/dev/null || \
+             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
+             mount -o remount,dev {root}/dev 2>/dev/null || true; \
+              rm -f {root}/dev/null 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
+              rm -f {root}/dev/zero 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
+              rm -f {root}/dev/random 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
+              rm -f {root}/dev/urandom 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
+              rm -f {root}/dev/tty 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
              mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
              mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
              ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \

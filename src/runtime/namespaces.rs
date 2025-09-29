@@ -251,16 +251,33 @@ impl NamespaceManager {
         if !dev_target.exists() {
             fs::create_dir_all(&dev_target)?;
         }
-        mount(
-            Some("tmpfs"),
-            &dev_target,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
-            Some("mode=755,size=65536k"),
-        )?;
 
-        // Create essential devices
-        self.create_devices(&dev_target)?;
+        // Try to mount devtmpfs first
+        let dev_mount_flags = MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME;
+        let devtmpfs_mounted = mount(
+            Some("devtmpfs"),
+            &dev_target,
+            Some("devtmpfs"),
+            dev_mount_flags,
+            Some("mode=755"),
+        ).is_ok();
+
+        if !devtmpfs_mounted {
+            // Fall back to tmpfs when devtmpfs is not permitted (e.g. inside user namespaces)
+            mount(
+                Some("tmpfs"),
+                &dev_target,
+                Some("tmpfs"),
+                dev_mount_flags,
+                Some("mode=755,size=65536k"),
+            )?;
+
+            // When using tmpfs, we need to create all device nodes manually
+            self.create_devices(&dev_target)?;
+        } else {
+            // devtmpfs provides most devices, but we still need to ensure essential ones exist
+            self.create_devices(&dev_target)?;
+        }
 
         // Mount /dev/pts
         let pts_target = dev_target.join("pts");
@@ -294,7 +311,7 @@ impl NamespaceManager {
     /// Create essential device nodes
     fn create_devices(&self, dev_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         use nix::sys::stat::{mknod, Mode, SFlag};
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         // Create /dev/null
         let null_path = dev_path.join("null");
@@ -302,10 +319,17 @@ impl NamespaceManager {
             mknod(
                 &null_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
+                Mode::S_IRUSR
+                    | Mode::S_IWUSR
+                    | Mode::S_IRGRP
+                    | Mode::S_IWGRP
+                    | Mode::S_IROTH
+                    | Mode::S_IWOTH,
                 nix::sys::stat::makedev(1, 3),
             )?;
         }
+        // Ensure correct permissions on /dev/null (mode 0666)
+        fs::set_permissions(&null_path, fs::Permissions::from_mode(0o666))?;
 
         // Create /dev/zero
         let zero_path = dev_path.join("zero");
@@ -313,10 +337,17 @@ impl NamespaceManager {
             mknod(
                 &zero_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
+                Mode::S_IRUSR
+                    | Mode::S_IWUSR
+                    | Mode::S_IRGRP
+                    | Mode::S_IWGRP
+                    | Mode::S_IROTH
+                    | Mode::S_IWOTH,
                 nix::sys::stat::makedev(1, 5),
             )?;
         }
+        // Ensure correct permissions on /dev/zero (mode 0666)
+        fs::set_permissions(&zero_path, fs::Permissions::from_mode(0o666))?;
 
         // Create /dev/random
         let random_path = dev_path.join("random");
@@ -324,10 +355,17 @@ impl NamespaceManager {
             mknod(
                 &random_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
+                Mode::S_IRUSR
+                    | Mode::S_IWUSR
+                    | Mode::S_IRGRP
+                    | Mode::S_IWGRP
+                    | Mode::S_IROTH
+                    | Mode::S_IWOTH,
                 nix::sys::stat::makedev(1, 8),
             )?;
         }
+        // Ensure correct permissions on /dev/random (mode 0666)
+        fs::set_permissions(&random_path, fs::Permissions::from_mode(0o666))?;
 
         // Create /dev/urandom
         let urandom_path = dev_path.join("urandom");
@@ -335,10 +373,17 @@ impl NamespaceManager {
             mknod(
                 &urandom_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
+                Mode::S_IRUSR
+                    | Mode::S_IWUSR
+                    | Mode::S_IRGRP
+                    | Mode::S_IWGRP
+                    | Mode::S_IROTH
+                    | Mode::S_IWOTH,
                 nix::sys::stat::makedev(1, 9),
             )?;
         }
+        // Ensure correct permissions on /dev/urandom (mode 0666)
+        fs::set_permissions(&urandom_path, fs::Permissions::from_mode(0o666))?;
 
         // Create /dev/tty
         let tty_path = dev_path.join("tty");
@@ -346,10 +391,17 @@ impl NamespaceManager {
             mknod(
                 &tty_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o666),
+                Mode::S_IRUSR
+                    | Mode::S_IWUSR
+                    | Mode::S_IRGRP
+                    | Mode::S_IWGRP
+                    | Mode::S_IROTH
+                    | Mode::S_IWOTH,
                 nix::sys::stat::makedev(5, 0),
             )?;
         }
+        // Ensure correct permissions on /dev/tty (mode 0666)
+        fs::set_permissions(&tty_path, fs::Permissions::from_mode(0o666))?;
 
         // Create /dev/console
         let console_path = dev_path.join("console");
@@ -357,10 +409,12 @@ impl NamespaceManager {
             mknod(
                 &console_path,
                 SFlag::S_IFCHR,
-                Mode::from_bits_truncate(0o600),
+                Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IWGRP,
                 nix::sys::stat::makedev(5, 1),
             )?;
         }
+        // Ensure correct permissions on /dev/console (mode 0620)
+        fs::set_permissions(&console_path, fs::Permissions::from_mode(0o620))?;
 
         // Symlink /dev/ptmx to /dev/pts/ptmx
         let ptmx_path = dev_path.join("ptmx");
