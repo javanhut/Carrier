@@ -47,10 +47,37 @@ cargo build --release
 
 ## Installation
 
-### From Source
+### Quick Install (Recommended)
 ```bash
-git clone https://github.com/yourusername/carrier
-cd carrier
+# Using curl
+curl -LsSf https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh | sh
+
+# Using wget
+wget -qO- https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh | sh
+
+# Or download and run manually
+curl -LO https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh
+chmod +x setup.sh
+./setup.sh install
+```
+
+The installer will:
+- Check and install Rust if needed
+- Install system dependencies
+- Build Carrier from source
+- Install the binary to `/usr/local/bin`
+
+To uninstall:
+```bash
+curl -LsSf https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh | sh -s -- uninstall
+# Or if you have the script locally
+./setup.sh uninstall
+```
+
+### From Source (Manual)
+```bash
+git clone https://github.com/javanhut/Carrier
+cd Carrier
 cargo build --release
 sudo cp target/release/carrier /usr/local/bin/
 ```
