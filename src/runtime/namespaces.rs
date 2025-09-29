@@ -260,7 +260,8 @@ impl NamespaceManager {
             Some("devtmpfs"),
             dev_mount_flags,
             Some("mode=755"),
-        ).is_ok();
+        )
+        .is_ok();
 
         if !devtmpfs_mounted {
             // Fall back to tmpfs when devtmpfs is not permitted (e.g. inside user namespaces)

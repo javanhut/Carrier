@@ -579,109 +579,57 @@ async fn exec_elevated_container(
     use std::process::{Command, Stdio};
 
     println!(
-        "Executing in elevated container (PID {}) with sudo",
+        "Executing in elevated container (PID {}) rootless",
         container_pid
     );
 
-    ensure_host_dev_null_ready()?;
-
-    // Use nsenter to properly enter the container's namespaces first
-    let mut exec_cmd = Command::new("sudo");
-
-    // Enter all the container's namespaces
+    // For entering an already running container, we should use nsenter to join its namespaces
+    let mut exec_cmd = Command::new("nsenter");
     exec_cmd
-        .arg("nsenter")
-        .arg("-t")
+        .arg("--target")
         .arg(container_pid.to_string())
-        .arg("-m") // Mount namespace - CRITICAL for /dev access
-        .arg("-u") // UTS namespace
-        .arg("-i") // IPC namespace
-        .arg("-n") // Network namespace
-        .arg("-p") // PID namespace
-        .arg("-r") // Set root directory to container's root
-        .arg("-w"); // Set working directory to container's cwd
+        .arg("--mount")
+        .arg("--uts")
+        .arg("--net")
+        .arg("--pid")
+        .arg("--root")
+        .arg(rootfs) // Set the root filesystem
+        .arg("--wd=/"); // Set working directory to /
 
-    // For interactive sessions, we need to ensure /dev is properly set up
-    // But we check and fix it from INSIDE the namespace
-    if is_interactive {
-        // Create a script that checks and fixes /dev if needed, then runs the command
-        let cmd_str = command.join(" ");
-        let check_and_exec = format!(
-            "#!/bin/sh\n\
-             # Check if /dev/null is properly set up\n\
-             if [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then\n\
-                 echo 'Fixing /dev filesystem...'\n\
-                 mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-                 mount -o remount,dev /dev 2>/dev/null || \
-                 mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-                 mount -o remount,dev /dev 2>/dev/null || true\n\
-                 # Create device nodes with proper permissions\n\
-                 mknod -m 0666 /dev/null c 1 3\n\
-                 mknod -m 0666 /dev/zero c 1 5\n\
-                 mknod -m 0666 /dev/random c 1 8\n\
-                 mknod -m 0666 /dev/urandom c 1 9\n\
-                 mknod -m 0666 /dev/tty c 5 0\n\
-                 mknod -m 0600 /dev/console c 5 1\n\
-                 # Create pts directory if needed\n\
-                 mkdir -p /dev/pts /dev/shm\n\
-                 # Mount devpts if not already mounted\n\
-                 if ! mountpoint -q /dev/pts; then\n\
-                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts\n\
-                 fi\n\
-                 # Create ptmx symlink\n\
-                 [ ! -e /dev/ptmx ] && ln -sf /dev/pts/ptmx /dev/ptmx\n\
-                 # Mount shm if not already mounted\n\
-                 if ! mountpoint -q /dev/shm; then\n\
-                     mount -t tmpfs -o mode=1777,size=65536k shm /dev/shm\n\
-                 fi\n\
-             fi\n\
-             # Set up environment\n\
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-             export HOME=/root\n\
-             export TERM=xterm\n\
-             # Execute the actual command\n\
-             exec {}",
-            cmd_str
-        );
+    // Add the command to run
+    exec_cmd.args(&command);
 
-        exec_cmd.arg("/bin/sh").arg("-c").arg(check_and_exec);
-    } else {
-        // For non-interactive, just run the command directly
-        exec_cmd.args(&command);
-    }
+    // Set up environment
+    exec_cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+    exec_cmd.env("HOME", "/root");
+    exec_cmd.env("TERM", "xterm");
 
     if is_interactive {
-        println!("Starting interactive session with elevated privileges...");
+        println!("Starting interactive session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
 
         // Check if we're in a TTY
         let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
 
         if is_tty {
-            // Build the complete nsenter command arguments
-            let nsenter_args = vec![
-                "nsenter".to_string(),
-                "-t".to_string(),
+            // For elevated containers, use nsenter directly (no user namespace mapping)
+            let mut nsenter_args = vec![
+                "--target".to_string(),
                 container_pid.to_string(),
-                "-m".to_string(), // Mount namespace
-                "-u".to_string(), // UTS namespace
-                "-i".to_string(), // IPC namespace
-                "-n".to_string(), // Network namespace
-                "-p".to_string(), // PID namespace
-                "-r".to_string(), // Root directory
-                "-w".to_string(), // Working directory
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                // The check_and_exec script we built above
-                exec_cmd
-                    .get_args()
-                    .last()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
+                "--mount".to_string(),
+                "--uts".to_string(),
+                "--net".to_string(),
+                "--pid".to_string(),
+                "--root".to_string(),
+                rootfs.to_string_lossy().to_string(),
+                "--wd=/".to_string(),
             ];
+            nsenter_args.extend(command.clone());
 
-            let exit_code = spawn_with_pty("sudo", &nsenter_args).unwrap_or_else(|_| {
+            let exit_code = spawn_with_pty("nsenter", &nsenter_args).unwrap_or_else(|_| {
                 // Fallback to regular execution
                 let mut child = exec_cmd
                     .stdin(Stdio::inherit())
@@ -1020,9 +968,8 @@ pub async fn exec_in_container(
         .await;
     }
 
-    // For elevated/root containers, check if we need special handling
-    if !is_root && elevated {
-        // Running as non-root but container needs elevated privileges
+    // For elevated containers, use elevated exec (rootless but without user namespace mapping)
+    if elevated {
         return exec_elevated_container(
             &container_dir,
             &rootfs,
@@ -1033,235 +980,10 @@ pub async fn exec_in_container(
         .await;
     }
 
-    // For root containers running with root privileges, use nsenter
-    let mut nsenter_args: Vec<String> = vec![
-        "--target".into(),
-        container_pid.to_string(),
-        "--mount".into(),
-        "--uts".into(),
-        "--ipc".into(),
-        "--net".into(),
-        "--pid".into(),
-        format!("--root={}", rootfs.to_string_lossy()),
-        "--".into(),
-    ];
-
-    // Wrap the command to ensure we're in a valid directory and fix /dev if needed
-    let wrapped_cmd = if cmd_to_run.is_empty() {
-        vec!["sh".to_string(), "-c".to_string(),
-            "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
-               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || \
-               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || true; \
-               rm -f /dev/null 2>/dev/null || true; \
-               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
-               rm -f /dev/zero 2>/dev/null || true; \
-               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
-               rm -f /dev/random 2>/dev/null || true; \
-               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
-               rm -f /dev/urandom 2>/dev/null || true; \
-               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
-               rm -f /dev/tty 2>/dev/null || true; \
-               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
-               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
-               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
-               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
-            fi; \
-             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
-               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
-               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-             fi; \
-             exec /bin/sh".to_string()]
-    } else {
-        let cmd_str = cmd_to_run.join(" ");
-        vec!["sh".to_string(), "-c".to_string(), format!(
-            "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
-               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || \
-               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || true; \
-               rm -f /dev/null 2>/dev/null || true; \
-               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
-               rm -f /dev/zero 2>/dev/null || true; \
-               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
-               rm -f /dev/random 2>/dev/null || true; \
-               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
-               rm -f /dev/urandom 2>/dev/null || true; \
-               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
-               rm -f /dev/tty 2>/dev/null || true; \
-               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
-               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
-               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
-               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
-            fi; \
-             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
-               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
-               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-             fi; \
-             exec {}", cmd_str)]
-    };
-
-    nsenter_args.extend(wrapped_cmd);
-
-    if is_interactive {
-        println!("Starting interactive shell session...");
-        println!("Type 'exit' or press Ctrl+D to exit.\n");
-
-        // Check if we're running in a TTY
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-
-        if is_tty {
-            // Try nsenter first, then fallback to sudo if permission denied
-            match spawn_with_pty("nsenter", &nsenter_args) {
-                Ok(exit_code) => {
-                    if exit_code != 0 {
-                        return Err(format!("Command exited with code {}", exit_code).into());
-                    }
-                    return Ok(());
-                }
-                Err(e) if e.to_string().contains("Operation not permitted") => {
-                    println!("Permission denied with nsenter, trying with sudo...");
-                    let mut sudo_args = vec!["nsenter".to_string()];
-                    sudo_args.extend(nsenter_args);
-
-                    let exit_code = spawn_with_pty("sudo", &sudo_args)
-                        .map_err(|e| format!("Failed to start PTY session with sudo: {}", e))?;
-                    if exit_code != 0 {
-                        return Err(format!("Command exited with code {}", exit_code).into());
-                    }
-                    return Ok(());
-                }
-                Err(e) => return Err(format!("Failed to start PTY session: {}", e).into()),
-            }
-        } else {
-            // Not in a TTY, fall back to regular command execution
-            println!("Not running in a TTY, using regular command execution...");
-            use std::process::{Command, Stdio};
-
-            // Try nsenter first
-            let mut exec_cmd = Command::new("nsenter");
-            exec_cmd.args(&nsenter_args);
-            exec_cmd
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .stdin(Stdio::inherit());
-
-            match exec_cmd.spawn() {
-                Ok(mut child) => {
-                    let status = child.wait()?;
-                    if !status.success() {
-                        if let Some(code) = status.code() {
-                            return Err(format!("Command exited with code {}", code).into());
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(e) if e.to_string().contains("Operation not permitted") => {
-                    println!("Permission denied with nsenter, trying with sudo...");
-
-                    let mut sudo_args = vec!["nsenter".to_string()];
-                    sudo_args.extend(nsenter_args);
-
-                    let mut sudo_cmd = Command::new("sudo");
-                    sudo_cmd.args(&sudo_args);
-                    sudo_cmd
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .stdin(Stdio::inherit());
-
-                    let mut child = sudo_cmd.spawn().map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            "sudo command not found. Please run as root or install sudo."
-                                .to_string()
-                        } else {
-                            format!("Failed to execute command with sudo: {}", e)
-                        }
-                    })?;
-
-                    let status = child.wait()?;
-                    if !status.success() {
-                        if let Some(code) = status.code() {
-                            return Err(format!("Command exited with code {}", code).into());
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Err(
-                            "nsenter command not found. Please install util-linux package.".into(),
-                        );
-                    } else {
-                        return Err(format!("Failed to execute command: {}", e).into());
-                    }
-                }
-            }
-        }
-    } else {
-        // For non-interactive commands, just inherit stdout/stderr
-        use std::process::{Command, Stdio};
-
-        // Try nsenter first
-        let mut exec_cmd = Command::new("nsenter");
-        exec_cmd.args(&nsenter_args);
-        exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-
-        match exec_cmd.spawn() {
-            Ok(mut child) => {
-                // Wait for the command to complete
-                let status = child.wait()?;
-                if !status.success() {
-                    if let Some(code) = status.code() {
-                        return Err(format!("Command exited with code {}", code).into());
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) if e.to_string().contains("Operation not permitted") => {
-                println!("Permission denied with nsenter, trying with sudo...");
-
-                // Try with sudo
-                let mut sudo_args = vec!["nsenter".to_string()];
-                sudo_args.extend(nsenter_args);
-
-                let mut sudo_cmd = Command::new("sudo");
-                sudo_cmd.args(&sudo_args);
-                sudo_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-
-                let mut child = sudo_cmd.spawn().map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        "sudo command not found. Please run as root or install sudo.".to_string()
-                    } else {
-                        format!("Failed to execute command with sudo: {}", e)
-                    }
-                })?;
-
-                let status = child.wait()?;
-                if !status.success() {
-                    if let Some(code) = status.code() {
-                        return Err(format!("Command exited with code {}", code).into());
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err(
-                        "nsenter command not found. Please install util-linux package.".into(),
-                    );
-                } else {
-                    return Err(format!("Failed to execute command: {}", e).into());
-                }
-            }
-        }
-    }
+    // This should never be reached - all containers should be either rootless or elevated (but still rootless)
+    return Err(
+        "Invalid container execution path - all containers should use rootless execution".into(),
+    );
 }
 
 pub async fn show_container_logs(
@@ -2252,7 +1974,7 @@ fn ensure_host_dev_null_ready() -> Result<(), Box<dyn std::error::Error>> {
 
     let metadata = std::fs::metadata("/dev/null").map_err(|err| {
         format!(
-            "Host /dev/null is not accessible: {}. Elevated containers require a working /dev/null.\nFix with:\n  sudo rm -f /dev/null\n  sudo mknod -m 666 /dev/null c 1 3\n  sudo chown root:root /dev/null",
+            "Host /dev/null is not accessible: {}. Containers require a working /dev/null.\nThis is typically a system configuration issue.",
             err
         )
     })?;
@@ -2498,10 +2220,10 @@ async fn run_container_with_storage(
 
     // Use different approach based on elevated flag
     let mut cmd = if elevated {
-        println!("Running container with elevated privileges (using sudo)...");
-        // For elevated mode, use sudo to run unshare without user namespace
-        // We need to set up /dev properly before chroot
-        let mut c = Command::new("sudo");
+        println!("Running container with elevated privileges (rootless)...");
+        // For elevated mode, still use unshare but without user namespace mapping
+        // This gives access to host UIDs/GIDs while maintaining other isolation
+        let mut c = Command::new("unshare");
 
         let root_dir = rootfs.display().to_string();
         let command_str = command_to_run.join(" ");
@@ -2515,23 +2237,17 @@ async fn run_container_with_storage(
              mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
              mount -o remount,dev {root}/dev 2>/dev/null || true; \
               rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
-              chown 0:0 {root}/dev/null 2>/dev/null || true; \
+              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; 
               rm -f {root}/dev/zero 2>/dev/null || true; \
               mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-              chown 0:0 {root}/dev/zero 2>/dev/null || true; \
               rm -f {root}/dev/random 2>/dev/null || true; \
               mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
-              chown 0:0 {root}/dev/random 2>/dev/null || true; \
               rm -f {root}/dev/urandom 2>/dev/null || true; \
               mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-              chown 0:0 {root}/dev/urandom 2>/dev/null || true; \
               rm -f {root}/dev/tty 2>/dev/null || true; \
               mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-              chown 0:0 {root}/dev/tty 2>/dev/null || true; \
               rm -f {root}/dev/console 2>/dev/null || true; \
               mknod -m 0600 {root}/dev/console c 5 1 2>/dev/null || true; \
-              chown 0:0 {root}/dev/console 2>/dev/null || true; \
              mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
              mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
              mount -t tmpfs -o mode=1777,size=65536k shm {root}/dev/shm 2>/dev/null || true; \
@@ -2551,10 +2267,11 @@ async fn run_container_with_storage(
             cmd = command_str
         );
 
-        c.arg("unshare")
-            .arg("--mount")
+        c.arg("--mount")
             .arg("--pid")
             .arg("--fork") // Fork to properly handle PID namespace
+            .arg("--ipc") // Add IPC namespace isolation
+            .arg("--uts") // Add UTS namespace for hostname isolation
             .arg("/bin/sh")
             .arg("-c")
             .arg(setup_and_run);
@@ -3239,10 +2956,10 @@ fn fuzzy_match(text: &str, pattern: &str) -> bool {
         return true;
     }
     let mut it = text.chars();
-    for pc in pattern.chars() {
+    for pc in pattern.chars().map(|c| c.to_ascii_lowercase()) {
         let mut found = false;
         while let Some(tc) = it.next() {
-            if tc == pc {
+            if tc.to_ascii_lowercase() == pc {
                 found = true;
                 break;
             }
@@ -3333,7 +3050,7 @@ mod tests {
     fn test_parse_since_rfc3339() {
         let s = "2020-01-01T00:00:00Z";
         let dt = parse_since(s).unwrap();
-        assert_eq!(dt.to_rfc3339(), s);
+        assert_eq!(dt.to_rfc3339(), "2020-01-01T00:00:00+00:00");
     }
 
     #[test]
@@ -3420,27 +3137,31 @@ fn seek_to_last_n_lines(
     if n == 0 {
         return Ok(0);
     }
-    let pos_len = file.metadata()?.len() as i64;
-    let mut pos = pos_len;
-    let mut count = 0usize;
-    let mut buf = [0u8; 1024];
-    while pos > 0 && count <= n {
-        let read_size = std::cmp::min(buf.len() as i64, pos) as usize;
-        pos -= read_size as i64;
-        file.seek(SeekFrom::Start(pos as u64))?;
-        file.read_exact(&mut buf[..read_size])?;
-        for &b in buf[..read_size].iter().rev() {
-            if b == b'\n' {
-                count += 1;
-                if count > n {
-                    break;
-                }
-            }
+    let file_len = file.metadata()?.len();
+
+    // Read the entire file backwards to find newlines
+    let mut newline_positions = Vec::new();
+    let mut buf = vec![0u8; file_len as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut buf)?;
+
+    // Find all newline positions
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            newline_positions.push(i);
         }
     }
-    // If file shorter than requested lines, start at 0
-    let start = if count > n { pos as u64 } else { 0 };
-    Ok(start)
+
+    // If we have fewer or equal newlines than requested lines, return start of file
+    if newline_positions.len() <= n {
+        return Ok(0);
+    }
+
+    // Get the position after the newline that precedes the last n lines
+    let target_newline_idx = newline_positions.len() - n - 1;
+    let start_pos = newline_positions[target_newline_idx] + 1;
+
+    Ok(start_pos as u64)
 }
 
 // List command implementation
