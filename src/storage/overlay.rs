@@ -49,9 +49,7 @@ fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 pub struct ContainerStorage {
-    // Persistent data (upper/work) rooted under user data dir
     persistent_dir: PathBuf,
-    // Runtime mounts (merged) under XDG_RUNTIME_DIR to mirror Podman behavior
     runtime_dir: PathBuf,
     use_fuse_overlayfs: bool,
     forced_driver: Option<StorageDriver>,
@@ -74,8 +72,9 @@ impl ContainerStorage {
             .join("storage");
         fs::create_dir_all(&persistent_dir)?;
 
-        // Runtime base (XDG_RUNTIME_DIR) with auto-detection
-        let runtime_dir = get_runtime_dir()?.join("carrier");
+        // Use persistent storage for runtime dir to avoid filling tmpfs
+        // This is especially important for VFS which copies entire rootfs
+        let runtime_dir = persistent_dir.join("run");
         fs::create_dir_all(&runtime_dir)?;
 
         // Check if we can use native overlayfs or need fuse-overlayfs
@@ -106,7 +105,6 @@ impl ContainerStorage {
         container_id: &str,
         image_layers: Vec<PathBuf>,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        // Create container-specific directories
         let persist_container = self.persistent_dir.join("containers").join(container_id);
         let run_container = self.runtime_dir.join("containers").join(container_id);
         let upper_dir = persist_container.join("upper");
@@ -117,7 +115,11 @@ impl ContainerStorage {
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&merged_dir)?;
 
-        // Build lower dirs string (colon-separated, reverse order)
+        if self.is_already_mounted(&merged_dir) {
+            self.last_driver = Some(StorageDriver::OverlayFuse);
+            return Ok(merged_dir);
+        }
+
         let lower_dirs: Vec<String> = image_layers
             .iter()
             .rev()
@@ -125,53 +127,66 @@ impl ContainerStorage {
             .collect();
         let lower_dirs_str = lower_dirs.join(":");
 
-        // Decide driver
         let chosen = match self.forced_driver.clone() {
             Some(StorageDriver::OverlayFuse) => StorageDriver::OverlayFuse,
             Some(StorageDriver::OverlayNative) => StorageDriver::OverlayNative,
             Some(StorageDriver::Vfs) => StorageDriver::Vfs,
-            None => {
-                if self.use_fuse_overlayfs {
-                    StorageDriver::OverlayFuse
-                } else {
-                    StorageDriver::OverlayNative
-                }
-            }
+            None => StorageDriver::OverlayFuse,
         };
 
-        // Execute
         let mut mounted = false;
-        if matches!(chosen, StorageDriver::OverlayNative) {
-            if let Err(e) =
-                self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir)
-            {
-                eprintln!("native overlay mount failed: {}", e);
-            } else {
-                mounted = true;
+        let mut actual_driver = chosen.clone();
+        
+        if matches!(chosen, StorageDriver::OverlayFuse) {
+            match self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                Ok(_) => mounted = true,
+                Err(e) => {
+                    eprintln!("fuse-overlayfs mount failed: {}", e);
+                    if matches!(self.forced_driver, Some(StorageDriver::OverlayNative)) {
+                        if let Ok(_) = self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                            mounted = true;
+                            actual_driver = StorageDriver::OverlayNative;
+                        }
+                    }
+                }
             }
-        } else if matches!(chosen, StorageDriver::OverlayFuse) {
-            if let Err(e) =
-                self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir)
-            {
-                eprintln!("fuse-overlayfs mount failed: {}", e);
-            } else {
-                mounted = true;
+        } else if matches!(chosen, StorageDriver::OverlayNative) {
+            match self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                Ok(_) => mounted = true,
+                Err(e) => {
+                    eprintln!("native overlay mount failed: {}", e);
+                    if let Ok(_) = self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                        mounted = true;
+                        actual_driver = StorageDriver::OverlayFuse;
+                    }
+                }
             }
         }
 
-        if !mounted {
-            eprintln!("overlay mount failed; using vfs fallback");
-            eprintln!("Falling back to vfs (copy) backend. This is slower but should work.");
-            self.build_vfs_root(&lower_dirs, &upper_dir, &merged_dir)?;
-            
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            
-            self.last_driver = Some(StorageDriver::Vfs);
-        } else {
-            self.last_driver = Some(chosen);
+        if !mounted && !matches!(chosen, StorageDriver::Vfs) {
+            eprintln!("All overlay mount attempts failed; using vfs fallback");
+            self.build_vfs_root_optimized(&lower_dirs, &merged_dir)?;
+            actual_driver = StorageDriver::Vfs;
+        } else if !mounted {
+            self.build_vfs_root_optimized(&lower_dirs, &merged_dir)?;
+            actual_driver = StorageDriver::Vfs;
         }
 
+        self.last_driver = Some(actual_driver);
         Ok(merged_dir)
+    }
+
+    fn is_already_mounted(&self, path: &Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        
+        if let Ok(entries) = fs::read_dir(path) {
+            if entries.count() > 0 {
+                return true;
+            }
+        }
+        false
     }
 
     fn mount_fuse_overlayfs(
@@ -181,8 +196,7 @@ impl ContainerStorage {
         work: &Path,
         merged: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Use fuse-overlayfs for rootless containers
-        let status = Command::new("fuse-overlayfs")
+        let output = Command::new("fuse-overlayfs")
             .arg("-o")
             .arg(format!(
                 "lowerdir={},upperdir={},workdir={}",
@@ -191,10 +205,11 @@ impl ContainerStorage {
                 work.display()
             ))
             .arg(merged)
-            .status()?;
+            .output()?;
 
-        if !status.success() {
-            return Err("Failed to mount with fuse-overlayfs".into());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("fuse-overlayfs failed: {}", stderr).into());
         }
 
         Ok(())
@@ -325,29 +340,40 @@ pub fn ensure_fuse_overlayfs() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl ContainerStorage {
-    // Build a merged rootfs by copying files from lower layers (vfs fallback)
-    fn build_vfs_root(
+    fn build_vfs_root_optimized(
         &self,
         lower_dirs: &[String],
-        _upper: &Path,
         merged: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Clear merged if any content exists
-        if merged.exists() {
-            // best-effort clean
-            let _ = fs::remove_dir_all(merged);
-            fs::create_dir_all(merged)?;
+        use std::process::Command;
+        
+        if merged.exists() && fs::read_dir(merged)?.next().is_some() {
+            return Ok(());
         }
+
+        if merged.exists() {
+            let _ = fs::remove_dir_all(merged);
+        }
+        fs::create_dir_all(merged)?;
 
         for lower in lower_dirs.iter() {
             let src = Path::new(lower);
-            self.copy_recursive(src, merged)?;
+            
+            let output = Command::new("cp")
+                .arg("-a")
+                .arg(format!("{}/*", src.display()))
+                .arg(merged)
+                .output();
+                
+            if output.is_err() || !output.as_ref().unwrap().status.success() {
+                self.copy_recursive(src, merged)?;
+            }
         }
         Ok(())
     }
 
     fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::{Read, Write};
+        use std::io::copy;
         
         for entry in fs::read_dir(src)? {
             let entry = entry?;
@@ -358,7 +384,6 @@ impl ContainerStorage {
             let path = entry.path();
 
             if ty.is_dir() {
-                // Skip special directories that will be mounted later
                 if dst.to_string_lossy().ends_with("merged") && 
                    (name_str == "dev" || name_str == "proc" || name_str == "sys") {
                     fs::create_dir_all(&target)?;
@@ -434,10 +459,7 @@ impl ContainerStorage {
                     
                     let mut src_file = fs::File::open(&path)?;
                     let mut dst_file = fs::File::create(&target)?;
-                    let mut buffer = Vec::new();
-                    src_file.read_to_end(&mut buffer)?;
-                    dst_file.write_all(&buffer)?;
-                    dst_file.sync_all()?;
+                    copy(&mut src_file, &mut dst_file)?;
                     drop(dst_file);
                     
                     fs::set_permissions(&target, metadata.permissions())?;
@@ -452,11 +474,7 @@ impl ContainerStorage {
                 
                 let mut src_file = fs::File::open(&path)?;
                 let mut dst_file = fs::File::create(&target)?;
-                let mut buffer = Vec::new();
-                src_file.read_to_end(&mut buffer)?;
-                dst_file.write_all(&buffer)?;
-                dst_file.sync_all()?;
-                drop(dst_file);
+                copy(&mut src_file, &mut dst_file)?;
             }
         }
         Ok(())

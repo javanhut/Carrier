@@ -34,6 +34,34 @@ echo "$USER:100000:65536" | sudo tee -a /etc/subuid
 echo "$USER:100000:65536" | sudo tee -a /etc/subgid
 ```
 
+### 3. newuidmap/newgidmap Setup (Required for Multi-User Support)
+For proper UID/GID mapping that allows containers to use multiple users (like `_apt`, `nobody`, etc.), the `newuidmap` and `newgidmap` binaries must have setuid permissions:
+
+```bash
+# Check current permissions
+ls -l /usr/bin/newuidmap /usr/bin/newgidmap
+
+# If they don't show 'rws' (setuid), fix them:
+sudo chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap
+
+# Verify they're now setuid:
+ls -l /usr/bin/newuidmap /usr/bin/newgidmap
+# Should show: -rwsr-xr-x
+```
+
+**Why is this needed?**
+- Without setuid on these binaries, containers can only map a single UID (container root = host user)
+- With setuid, runc can map multiple UIDs using your subuid/subgid ranges
+- This allows package managers (apt, yum, dnf) and other tools to switch to unprivileged users
+- This is a **one-time system configuration**, not a security risk (these binaries are specifically designed to be setuid)
+
+**What happens without it:**
+- Container appears to work, but programs trying to switch users (like `apt`) will fail with:
+  ```
+  E: setgroups 65534 failed - setgroups (1: Operation not permitted)
+  E: seteuid 42 failed - seteuid (22: Invalid argument)
+  ```
+
 ## Running Rootless Containers
 
 ### Create and Run

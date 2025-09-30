@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::fs;
+use std::io::{BufRead, BufReader};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,7 +125,116 @@ pub struct Pids {
     pub limit: i64,
 }
 
+fn get_subid_range(username: &str, subid_file: &str) -> Result<(u32, u32), String> {
+    let file = fs::File::open(subid_file)
+        .map_err(|e| format!("Failed to open {}: {}", subid_file, e))?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        if let Ok(line) = line {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() == 3 && parts[0] == username {
+                let start = parts[1].parse::<u32>()
+                    .map_err(|e| format!("Invalid start ID: {}", e))?;
+                let count = parts[2].parse::<u32>()
+                    .map_err(|e| format!("Invalid count: {}", e))?;
+                return Ok((start, count));
+            }
+        }
+    }
+    
+    Err(format!("No entry found for user {} in {}", username, subid_file))
+}
+
+fn get_current_username() -> Result<String, String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map_err(|_| "Cannot determine current username".to_string())
+}
+
 impl OCISpec {
+    fn get_uid_mappings(uid: u32) -> Vec<IDMapping> {
+        let username = match get_current_username() {
+            Ok(u) => u,
+            Err(_) => {
+                // Fallback to single mapping if we can't get username
+                return vec![IDMapping {
+                    container_id: 0,
+                    host_id: uid,
+                    size: 1,
+                }];
+            }
+        };
+
+        match get_subid_range(&username, "/etc/subuid") {
+            Ok((start, count)) => {
+                vec![
+                    // Map container root (0) to host user
+                    IDMapping {
+                        container_id: 0,
+                        host_id: uid,
+                        size: 1,
+                    },
+                    // Map container users 1+ to subordinate UID range
+                    IDMapping {
+                        container_id: 1,
+                        host_id: start,
+                        size: count,
+                    },
+                ]
+            }
+            Err(_) => {
+                // Fallback to single mapping if subuid not configured
+                vec![IDMapping {
+                    container_id: 0,
+                    host_id: uid,
+                    size: 1,
+                }]
+            }
+        }
+    }
+
+    fn get_gid_mappings(gid: u32) -> Vec<IDMapping> {
+        let username = match get_current_username() {
+            Ok(u) => u,
+            Err(_) => {
+                // Fallback to single mapping if we can't get username
+                return vec![IDMapping {
+                    container_id: 0,
+                    host_id: gid,
+                    size: 1,
+                }];
+            }
+        };
+
+        match get_subid_range(&username, "/etc/subgid") {
+            Ok((start, count)) => {
+                vec![
+                    // Map container root group (0) to host user group
+                    IDMapping {
+                        container_id: 0,
+                        host_id: gid,
+                        size: 1,
+                    },
+                    // Map container groups 1+ to subordinate GID range
+                    IDMapping {
+                        container_id: 1,
+                        host_id: start,
+                        size: count,
+                    },
+                ]
+            }
+            Err(_) => {
+                // Fallback to single mapping if subgid not configured
+                vec![IDMapping {
+                    container_id: 0,
+                    host_id: gid,
+                    size: 1,
+                }]
+            }
+        }
+    }
+
     pub fn new_rootless(
         container_id: &str,
         rootfs: PathBuf,
@@ -250,16 +361,8 @@ impl OCISpec {
                 },
             ],
             linux: Linux {
-                uid_mappings: vec![IDMapping {
-                    container_id: 0,
-                    host_id: uid,
-                    size: 1,
-                }],
-                gid_mappings: vec![IDMapping {
-                    container_id: 0,
-                    host_id: gid,
-                    size: 1,
-                }],
+                uid_mappings: Self::get_uid_mappings(uid),
+                gid_mappings: Self::get_gid_mappings(gid),
                 namespaces: vec![
                     Namespace {
                         typ: "pid".to_string(),

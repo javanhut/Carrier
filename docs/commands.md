@@ -3,6 +3,8 @@
 ## Overview
 Carrier provides comprehensive container management with commands for pulling images, running containers (interactive or detached), executing commands in running containers, and managing container lifecycle. All commands support pulling images from various container registries including Docker Hub, Quay.io, GitHub Container Registry, and more.
 
+Carrier is optimized for performance with sub-100ms container startup times. See [performance.md](performance.md) for detailed benchmarks and optimization tips.
+
 ## Quick Start
 ```bash
 # Run a container interactively
@@ -20,6 +22,9 @@ carrier sh <container-id>
 # Stop and remove containers
 carrier stop <container-id>
 carrier rm -c  # Remove all stopped containers
+
+# Force specific storage driver for best performance
+carrier run --storage-driver overlay-fuse alpine
 ```
 
 ## Commands

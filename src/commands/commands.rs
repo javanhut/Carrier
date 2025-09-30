@@ -1,8 +1,16 @@
 use crate::cli::RegistryImage;
 use crate::runtime::network::{NetworkConfig, NetworkManager};
-use crate::storage::{
-    extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout,
-};
+use crate::storage::{extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout, StorageDriver};
+
+fn get_runc_root() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.local/share/carrier/runc", home)
+    } else {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+        format!("{}/carrier/runc", runtime_dir)
+    }
+}
 
 use base64::prelude::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -680,161 +688,70 @@ async fn exec_elevated_container(
 /// Execute a command in a rootless container by directly entering its rootfs
 async fn exec_rootless_container(
     container_dir: &Path,
-    rootfs: &Path,
-    container_pid: i32,
+    _rootfs: &Path,
+    _container_pid: i32,
     command: Vec<String>,
     is_interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
 
-    println!("Executing in rootless container (PID {})", container_pid);
+    // Get container ID from directory name
+    let container_id = container_dir
+        .file_name()
+        .ok_or("Invalid container directory")?
+        .to_string_lossy()
+        .to_string();
 
-    // For entering an already running container, we should use nsenter to join its namespaces
-    // Check if we're running as root (e.g., with sudo)
-    let is_root = nix::unistd::Uid::effective().is_root();
+    println!("Executing in container {} using runc exec", short12(&container_id));
 
-    // For entering an already running container, we should use nsenter to join its namespaces
-    // Check if we're running as root (e.g., with sudo)
-    let mut exec_cmd = Command::new("nsenter");
+    // Determine runc root directory
+    let runc_root_path = get_runc_root();
+
+    // Build runc exec command
+    let mut exec_cmd = Command::new("runc");
     exec_cmd
-        .arg("--target")
-        .arg(container_pid.to_string())
-        .arg("--mount")
-        .arg("--uts")
-        .arg("--net")
-        .arg("--pid")
         .arg("--root")
-        .arg(rootfs) // Set the root filesystem
-        .arg("--wd=/"); // Set working directory to /
+        .arg(&runc_root_path)
+        .arg("exec");
 
-    // Add the command to run
-    exec_cmd.args(&command);
-
-    // Set up environment
-    exec_cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    );
-    exec_cmd.env("HOME", "/root");
-    exec_cmd.env("TERM", "xterm");
-
+    // Add -t flag for terminal if interactive
     if is_interactive {
         println!("Starting interactive session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
+        exec_cmd.arg("-t");
+    }
 
-        // Check if we're in a TTY
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    // Set environment variables
+    exec_cmd
+        .arg("--env")
+        .arg("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .arg("--env")
+        .arg("HOME=/root")
+        .arg("--env")
+        .arg("TERM=xterm");
 
-        if is_tty {
-            // Try using PTY for interactive session
-            let (cmd_name, args) = if is_root {
-                // Use nsenter for root
-                let mut nsenter_args = vec![
-                    "--target".to_string(),
-                    container_pid.to_string(),
-                    "--mount".to_string(),
-                    "--uts".to_string(),
-                    "--net".to_string(),
-                    "--pid".to_string(),
-                    "--root".to_string(),
-                    rootfs.to_string_lossy().to_string(),
-                    "--wd=/".to_string(),
-                ];
-                nsenter_args.extend(command.clone());
-                ("nsenter", nsenter_args)
-            } else {
-                // Use unshare for non-root - need to wrap with device setup
-                let inner_cmd = if !command.is_empty() {
-                    command.join(" ")
-                } else {
-                    "/bin/sh".to_string()
-                };
+    // Add container ID
+    exec_cmd.arg(&container_id);
 
-                let setup_script = format!(
-                    "mount -t devtmpfs -o mode=755 devtmpfs {}/dev 2>/dev/null || \
-                     mount -o remount,dev {}/dev 2>/dev/null || \
-                     mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {}/dev 2>/dev/null || \
-                     mount -o remount,dev {}/dev 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/null c 1 3 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/zero c 1 5 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/random c 1 8 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/urandom c 1 9 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/tty c 5 0 2>/dev/null || true; \
-                     mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
-                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
-                     ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
-                     exec chroot {} {}",
-                    rootfs.display(), // mount devtmpfs
-                    rootfs.display(), // remount dev
-                    rootfs.display(), // tmpfs fallback
-                    rootfs.display(), // remount dev after fallback
-                    rootfs.display(), // /dev/null
-                    rootfs.display(), // /dev/zero
-                    rootfs.display(), // /dev/random
-                    rootfs.display(), // /dev/urandom
-                    rootfs.display(), // /dev/tty
-                    rootfs.display(), // /dev/pts mkdir
-                    rootfs.display(), // /dev/shm mkdir
-                    rootfs.display(), // mount devpts
-                    rootfs.display(), // symlink ptmx
-                    rootfs.display(), // chroot path
-                    inner_cmd
-                );
-
-                let unshare_args = vec![
-                    "--user".to_string(),
-                    "--map-root-user".to_string(),
-                    "--mount".to_string(),
-                    "--pid".to_string(),
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    setup_script,
-                ];
-                ("unshare", unshare_args)
-            };
-
-            let exit_code = spawn_with_pty(cmd_name, &args).unwrap_or_else(|_| {
-                // Fallback to regular execution
-                let mut child = exec_cmd
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .expect("Failed to spawn unshare");
-
-                let status = child.wait().expect("Failed to wait for child");
-                status.code().unwrap_or(1)
-            });
-
-            if exit_code != 0 {
-                return Err(format!("Command exited with code {}", exit_code).into());
-            }
-        } else {
-            println!("Not running in a TTY, using regular command execution...");
-            exec_cmd.stdin(Stdio::inherit());
-            exec_cmd.stdout(Stdio::inherit());
-            exec_cmd.stderr(Stdio::inherit());
-
-            let mut child = exec_cmd.spawn()?;
-            let status = child.wait()?;
-            if !status.success() {
-                if let Some(code) = status.code() {
-                    return Err(format!("Command exited with code {}", code).into());
-                }
-            }
-        }
+    // Add command to execute
+    if command.is_empty() {
+        exec_cmd.arg("/bin/sh");
     } else {
-        // Non-interactive execution
-        exec_cmd.stdout(Stdio::inherit());
-        exec_cmd.stderr(Stdio::inherit());
+        exec_cmd.args(&command);
+    }
 
-        let mut child = exec_cmd.spawn()?;
-        let status = child.wait()?;
+    // Set stdio
+    exec_cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
-        if !status.success() {
-            if let Some(code) = status.code() {
-                return Err(format!("Command exited with code {}", code).into());
-            }
+    // Execute the command
+    let status = exec_cmd.status()?;
+
+    if !status.success() {
+        if let Some(code) = status.code() {
+            return Err(format!("Command exited with code {}", code).into());
         }
     }
 
@@ -1912,14 +1829,11 @@ async fn download_blob_with_progress(
 
 /// Set up essential directories and files in the container
 fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Ensure essential directories exist
     let essential_dirs = vec![
         "etc",
         "tmp",
         "var",
         "var/tmp",
-        "var/cache",
-        "var/cache/apt",
         "dev",
         "proc",
         "sys",
@@ -1928,42 +1842,38 @@ fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::err
     for dir in essential_dirs {
         let dir_path = rootfs.join(dir);
         if !dir_path.exists() {
-            println!("Creating directory: {}", dir);
             std::fs::create_dir_all(&dir_path)?;
         }
 
-        // Make tmp directories world-writable
         if dir.contains("tmp") {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&dir_path)?.permissions();
-            perms.set_mode(0o1777); // sticky bit + world writable
-            std::fs::set_permissions(&dir_path, perms)?;
+            if let Ok(metadata) = std::fs::metadata(&dir_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o1777);
+                let _ = std::fs::set_permissions(&dir_path, perms);
+            }
         }
     }
 
-    // Set up network files
     let etc_dir = rootfs.join("etc");
-
-    // Copy host's resolv.conf for DNS resolution
-    let host_resolv = Path::new("/etc/resolv.conf");
     let container_resolv = etc_dir.join("resolv.conf");
+    let container_hosts = etc_dir.join("hosts");
 
-    // Always overwrite resolv.conf to ensure DNS works
-    if host_resolv.exists() {
-        println!("Copying host resolv.conf to container");
-        std::fs::copy(host_resolv, &container_resolv)?;
-    } else {
-        println!("Creating default resolv.conf with Google DNS");
-        // Create a basic resolv.conf with common DNS servers
-        std::fs::write(
-            &container_resolv,
-            "# Generated by carrier\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n",
-        )?;
+    if !container_resolv.exists() {
+        let host_resolv = Path::new("/etc/resolv.conf");
+        if host_resolv.exists() {
+            let _ = std::fs::copy(host_resolv, &container_resolv);
+        } else {
+            let _ = std::fs::write(
+                &container_resolv,
+                "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+            );
+        }
     }
 
-    // Set up hosts file (always overwrite for consistency)
-    let container_hosts = etc_dir.join("hosts");
-    std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n")?;
+    if !container_hosts.exists() {
+        let _ = std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
+    }
 
     Ok(())
 }
@@ -2020,8 +1930,7 @@ async fn run_container_with_storage(
     command_override: Option<Vec<String>>,
     storage_driver: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::runtime::container::{Container, ContainerConfig};
-    use crate::runtime::network::{NetworkConfig, NetworkMode};
+    use crate::runtime::network::{NetworkConfig, NetworkManager};
 
     println!(
         "\nStarting container from image {}...",
@@ -2149,20 +2058,10 @@ async fn run_container_with_storage(
     let mut network_config = NetworkConfig::default();
     network_config.enable_network = !elevated; // Disable network for elevated containers (use host network)
 
-    let container_config = ContainerConfig {
-        id: container_id.clone(),
-        name: name.clone(),
-        image: parsed_image.to_string(),
-        rootfs: rootfs.clone(),
-        command,
-        env,
-        working_dir,
-        hostname: Some(format!("carrier-{}", &container_id[..8])),
-        user: None,
-        readonly_rootfs: false,
-        network_config,
-        ..Default::default()
-    };
+    // Container configuration - convert to what we need for OCI spec
+    let final_env = env;
+    let final_command = command;
+    let final_working_dir = working_dir;
 
     // Store container metadata
     let container_meta_path = storage.container_path(&container_id).join("metadata.json");
@@ -2178,7 +2077,7 @@ async fn run_container_with_storage(
         "image": parsed_image.to_string(),
         "created": chrono::Utc::now().to_rfc3339(),
         "rootfs": rootfs.to_string_lossy(),
-        "command": container_config.command,
+        "command": final_command,
         "status": "running",
         "storage_driver": storage_driver_str,
         "elevated": elevated
@@ -2234,7 +2133,7 @@ async fn run_container_with_storage(
     std::fs::create_dir_all(&bundle_dir)?;
 
     // Convert env to OCI format (KEY=VALUE strings)
-    let env_strings: Vec<String> = container_config.env.iter()
+    let env_strings: Vec<String> = final_env.iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
 
@@ -2244,7 +2143,7 @@ async fn run_container_with_storage(
         rootfs.clone(),
         command_to_run.clone(),
         env_strings,
-        container_config.working_dir.clone(),
+        final_working_dir.clone(),
         is_interactive,
     );
 
@@ -2257,10 +2156,15 @@ async fn run_container_with_storage(
     let config_path = bundle_dir.join("config.json");
     oci_spec.write_to_file(&config_path)?;
 
-    // Determine runc root directory (for state storage)
-    let runc_root = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
-    let runc_root_path = format!("{}/carrier/runc", runc_root);
+    // Determine runc root directory (for state storage) - use home directory to avoid tmpfs space issues
+    let runc_root = if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.local/share/carrier/runc", home)
+    } else {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+        format!("{}/carrier/runc", runtime_dir)
+    };
+    let runc_root_path = runc_root;
     std::fs::create_dir_all(&runc_root_path)?;
 
     if detach {
@@ -3333,31 +3237,66 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     "Unknown".to_string()
                                 };
 
-                                // Check if container is actually running if it claims to be
+                                // Check if container is actually running using runc state
                                 let actual_status = if status == "running"
                                     || status.starts_with("Up")
                                 {
-                                    // Check PID file and process
-                                    let pid_file = entry.path().join("pid");
-                                    if pid_file.exists() {
-                                        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                                            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                                                use nix::sys::signal::{kill, Signal};
-                                                use nix::unistd::Pid;
+                                    // Query runc for actual state
+                                    let runc_root_path = get_runc_root();
 
-                                                let process_pid = Pid::from_raw(pid);
-                                                if kill(process_pid, None).is_ok() {
-                                                    status // Process is actually running
+                                    let state_result = std::process::Command::new("runc")
+                                        .arg("--root").arg(&runc_root_path)
+                                        .arg("state")
+                                        .arg(&container_id)
+                                        .output();
+
+                                    if let Ok(output) = state_result {
+                                        if output.status.success() {
+                                            if let Ok(state_json) = String::from_utf8(output.stdout) {
+                                                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) {
+                                                    if let Some(runc_status) = state["status"].as_str() {
+                                                        match runc_status {
+                                                            "running" => status,
+                                                            "stopped" | "created" => {
+                                                                // Update metadata to reflect stopped state
+                                                                let mut metadata_mut = metadata.clone();
+                                                                metadata_mut["status"] = serde_json::json!("exited");
+                                                                let _ = std::fs::write(&metadata_path, metadata_mut.to_string());
+                                                                "exited"
+                                                            }
+                                                            _ => "exited"
+                                                        }
+                                                    } else {
+                                                        status
+                                                    }
                                                 } else {
-                                                    // Process is dead, update metadata
-                                                    let mut metadata_mut = metadata.clone();
-                                                    metadata_mut["status"] =
-                                                        serde_json::json!("exited");
-                                                    let _ = std::fs::write(
-                                                        &metadata_path,
-                                                        metadata_mut.to_string(),
-                                                    );
-                                                    let _ = std::fs::remove_file(&pid_file);
+                                                    status
+                                                }
+                                            } else {
+                                                status
+                                            }
+                                        } else {
+                                            // Container doesn't exist in runc, mark as exited
+                                            let mut metadata_mut = metadata.clone();
+                                            metadata_mut["status"] = serde_json::json!("exited");
+                                            let _ = std::fs::write(&metadata_path, metadata_mut.to_string());
+                                            "exited"
+                                        }
+                                    } else {
+                                        // Fallback: check PID file
+                                        let pid_file = entry.path().join("pid");
+                                        if pid_file.exists() {
+                                            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                                                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                                                    use nix::sys::signal::kill;
+                                                    use nix::unistd::Pid;
+
+                                                    if kill(Pid::from_raw(pid), None).is_ok() {
+                                                        status
+                                                    } else {
+                                                        "exited"
+                                                    }
+                                                } else {
                                                     "exited"
                                                 }
                                             } else {
@@ -3366,15 +3305,6 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                         } else {
                                             "exited"
                                         }
-                                    } else {
-                                        // No PID file, container is not running
-                                        let mut metadata_mut = metadata.clone();
-                                        metadata_mut["status"] = serde_json::json!("exited");
-                                        let _ = std::fs::write(
-                                            &metadata_path,
-                                            metadata_mut.to_string(),
-                                        );
-                                        "exited"
                                     }
                                 } else {
                                     status
@@ -3842,9 +3772,7 @@ pub async fn stop_container(
     println!("Stopping container {}...", short12(&full_container_id));
 
     // Use runc to stop the container properly
-    let runc_root = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
-    let runc_root_path = format!("{}/carrier/runc", runc_root);
+    let runc_root_path = get_runc_root();
 
     // Check if container exists in runc
     let state_result = Command::new("runc")
