@@ -138,15 +138,17 @@ NetworkConfig {
 
 ```rust
 CgroupConfig {
-    memory_limit: Option<u64>,      // Bytes
-    memory_swap_limit: Option<u64>, // Bytes
-    cpu_quota: Option<u64>,         // Microseconds
-    cpu_period: Option<u64>,        // Microseconds
-    cpu_weight: Option<u32>,        // 1-10000
-    pids_limit: Option<u64>,        // Max processes
-    io_weight: Option<u32>,         // 1-10000
+    memory_limit: Option<u64>,      // Bytes (None = unlimited)
+    memory_swap_limit: Option<u64>, // Bytes (None = unlimited)
+    cpu_quota: Option<u64>,         // Microseconds (None = unlimited)
+    cpu_period: Option<u64>,        // Microseconds (None = unlimited)
+    cpu_weight: Option<u32>,        // 1-10000 (None = default weight)
+    pids_limit: Option<u64>,        // Max processes (None = unlimited)
+    io_weight: Option<u32>,         // 1-10000 (None = default weight)
 }
 ```
+
+**Default Configuration**: By default, all resource limits are set to `None` (unlimited). This prevents memory allocation issues with fork operations in user namespaces. Resource limits can be configured when needed but are disabled by default for maximum compatibility.
 
 ## Usage
 
@@ -309,6 +311,12 @@ Planned improvements:
 **"Operation not permitted" errors**
 - Verify subuid/subgid configuration for your user
 - Ensure newuidmap/newgidmap have proper setuid permissions
+
+**"fork: cannot allocate memory"**
+- This typically occurs when memory cgroup limits are too restrictive
+- Default configuration now uses unlimited memory (no cgroups limits)
+- If you've set custom memory limits, increase them or remove them
+- Check system overcommit setting: `cat /proc/sys/vm/overcommit_memory`
 
 ## Technical Details
 

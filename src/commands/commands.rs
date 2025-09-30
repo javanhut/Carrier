@@ -2225,317 +2225,147 @@ async fn run_container_with_storage(
         println!("Starting container with command: {}", cmd_in_container);
     }
 
-    // Use different approach based on elevated flag
-    let mut cmd = if elevated {
-        println!("Running container with elevated privileges (rootless)...");
-        // For elevated mode, still use unshare but without user namespace mapping
-        // This gives access to host UIDs/GIDs while maintaining other isolation
-        let mut c = Command::new("/usr/bin/unshare");
+    // Use runc for container execution
+    use crate::runtime::oci_spec::OCISpec;
+    use std::process::Command;
 
-        let root_dir = rootfs.display().to_string();
-        let command_str = command_to_run.join(" ");
+    // Create bundle directory (runc requires bundle structure)
+    let bundle_dir = storage.container_path(&container_id);
+    std::fs::create_dir_all(&bundle_dir)?;
 
-        // Create a shell script that sets up the container environment properly
-        let setup_and_run = format!(
-            "mount -t proc proc {root}/proc 2>/dev/null || true; \
-             mount -t sysfs sysfs {root}/sys 2>/dev/null || true; \
-             mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || \
-             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || true; \
-              rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
-              rm -f {root}/dev/zero 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-              rm -f {root}/dev/random 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
-              rm -f {root}/dev/urandom 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-              rm -f {root}/dev/tty 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-              rm -f {root}/dev/console 2>/dev/null || true; \
-              mknod -m 0600 {root}/dev/console c 5 1 2>/dev/null || true; \
-             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
-             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
-             mount -t tmpfs -o mode=1777,size=65536k shm {root}/dev/shm 2>/dev/null || true; \
-             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
-             ln -sf /proc/self/fd {root}/dev/fd 2>/dev/null || true; \
-             ln -sf /proc/self/fd/0 {root}/dev/stdin 2>/dev/null || true; \
-             ln -sf /proc/self/fd/1 {root}/dev/stdout 2>/dev/null || true; \
-             ln -sf /proc/self/fd/2 {root}/dev/stderr 2>/dev/null || true; \
-             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-             export HOME=/root; \
-             export TERM=xterm; \
-             export HOSTNAME=carrier-{host}; \
-             chroot {root} {cmd}",
-            root = root_dir,
-            host = &container_id[..8],
-            cmd = command_str
-        );
+    // Convert env to OCI format (KEY=VALUE strings)
+    let env_strings: Vec<String> = container_config.env.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
 
-        c.arg("--mount")
-            .arg("--pid")
-            .arg("--fork") // Fork to properly handle PID namespace
-            .arg("--ipc") // Add IPC namespace isolation
-            .arg("--uts") // Add UTS namespace for hostname isolation
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(setup_and_run);
-        c
-    } else {
-        // For rootless mode, use user namespaces for better isolation
-        // We need to set up /dev properly before chroot for rootless containers too
-        let mut c = Command::new("/usr/bin/unshare");
+    // Generate OCI spec
+    let mut oci_spec = OCISpec::new_rootless(
+        &container_id,
+        rootfs.clone(),
+        command_to_run.clone(),
+        env_strings,
+        container_config.working_dir.clone(),
+        is_interactive,
+    );
 
-        let root_dir = rootfs.display().to_string();
-        let command_str = command_to_run.join(" ");
+    // Add network namespace if not elevated
+    if !elevated {
+        oci_spec.add_network_namespace();
+    }
 
-        // Create a shell script that sets up the container environment properly for rootless
-        let setup_and_run = format!(
-            "mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || \
-             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || true; \
-              rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
-              rm -f {root}/dev/zero 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-              rm -f {root}/dev/random 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
-              rm -f {root}/dev/urandom 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-              rm -f {root}/dev/tty 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
-             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
-             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
-             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-             export HOME=/root; \
-             export TERM=xterm; \
-             export HOSTNAME=carrier-{host}; \
-             exec chroot {root} {cmd}",
-            root = root_dir,
-            host = &container_id[..8],
-            cmd = command_str
-        );
+    // Write config.json to bundle directory
+    let config_path = bundle_dir.join("config.json");
+    oci_spec.write_to_file(&config_path)?;
 
-        c.arg("--user")
-            .arg("--map-root-user") // Map current user to root in container
-            .arg("--mount")
-            .arg("--pid")
-            .arg("--fork") // Fork to properly handle PID namespace
-            .arg("--net") // Create network namespace for rootless
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(setup_and_run);
-        c
-    };
-
-    // For elevated containers, environment is already set in the shell command
-    // For rootless, it was set above
+    // Determine runc root directory (for state storage)
+    let runc_root = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+    let runc_root_path = format!("{}/carrier/runc", runc_root);
+    std::fs::create_dir_all(&runc_root_path)?;
 
     if detach {
-        // For detached containers, pipe stdout/stderr and write timestamped lines to log file
-        let log_path = storage.container_path(&container_id).join("container.log");
+        // Detached mode: runc create + start
+        println!("Container {} started in detached mode", short12(&container_id));
+        
+        // Create the container
+        let create_status = Command::new("runc")
+            .arg("--root").arg(&runc_root_path)
+            .arg("create")
+            .arg("--bundle").arg(&bundle_dir)
+            .arg(&container_id)
+            .status()?;
 
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        // Save the PID to a file
-        let pid_file = storage.container_path(&container_id).join("pid");
-        std::fs::write(&pid_file, child.id().to_string())?;
-
-        let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
-
-        // Set up network for rootless containers
-        if !elevated {
-            setup_container_network_if_needed(
-                &storage.container_path(&container_id),
-                &rootfs,
-                container_pid,
-            )?;
+        if !create_status.success() {
+            return Err(format!("Failed to create container with runc").into());
         }
 
-        // Spawn logging threads
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let log_writer = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+        // Start the container
+        let start_status = Command::new("runc")
+            .arg("--root").arg(&runc_root_path)
+            .arg("start")
+            .arg(&container_id)
+            .status()?;
 
-        // stdout thread
-        if let Some(stdout) = child.stdout.take() {
-            let writer = log_writer.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Write};
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    let stamp = chrono::Utc::now().to_rfc3339();
-                    let mut w = writer.lock().unwrap();
-                    let _ = writeln!(w, "{} {}", stamp, line);
-                }
-            });
-        }
-        // stderr thread
-        if let Some(stderr) = child.stderr.take() {
-            let writer = log_writer.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Write};
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    let stamp = chrono::Utc::now().to_rfc3339();
-                    let mut w = writer.lock().unwrap();
-                    let _ = writeln!(w, "{} {}", stamp, line);
-                }
-            });
+        if !start_status.success() {
+            return Err(format!("Failed to start container with runc").into());
         }
 
-        println!("Container {} started in background", short12(&container_id));
-        println!("Logs are being written to: {}", log_path.display());
-        println!("To view logs: carrier logs {}", short12(&container_id));
-        println!("To stop: carrier stop {}", short12(&container_id));
+        // Get container PID from runc state
+        let state_output = Command::new("runc")
+            .arg("--root").arg(&runc_root_path)
+            .arg("state")
+            .arg(&container_id)
+            .output()?;
 
-        // Do not wait for the child; threads handle logging
-        return Ok(());
-    } else if is_interactive {
-        println!("\nStarting interactive container session...");
-        println!("Type 'exit' or press Ctrl+D to exit the container.\n");
+        if state_output.status.success() {
+            if let Ok(state_json) = String::from_utf8(state_output.stdout) {
+                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) {
+                    if let Some(pid) = state["pid"].as_i64() {
+                        let pid_file = bundle_dir.join("pid");
+                        std::fs::write(&pid_file, pid.to_string())?;
 
-        // Build argv for unshare + chroot + command
-        let mut args: Vec<String> = vec![
-            "--user".into(),
-            "--map-root-user".into(),
-            "--mount".into(),
-            "--pid".into(),
-        ];
-
-        // Add network namespace for rootless containers
-        if !elevated {
-            args.push("--net".into());
-        }
-
-        args.extend(vec!["chroot".into(), rootfs.display().to_string()]);
-        args.extend(command_to_run.clone());
-
-        let exit_code = spawn_with_pty_and_network(
-            "unshare",
-            &args,
-            Some(&storage.container_path(&container_id)),
-            Some(&rootfs),
-            !elevated, // needs_network
-            Some(&container_id),
-        )?;
-
-        // Remove PID file after process exits
-        let pid_file = storage.container_path(&container_id).join("pid");
-        let _ = std::fs::remove_file(&pid_file);
-
-        // Update container status
-        let metadata = serde_json::json!({
-            "id": container_id,
-            "image": parsed_image.to_string(),
-            "created": chrono::Utc::now().to_rfc3339(),
-            "rootfs": rootfs.to_string_lossy(),
-            "status": format!("exited ({})", exit_code)
-        });
-        std::fs::write(&container_meta_path, metadata.to_string())?;
-
-        if exit_code == 0 {
-            println!("\nContainer {} exited successfully", container_id);
-        } else {
-            println!(
-                "\nContainer {} exited with code {}",
-                container_id, exit_code
-            );
-        }
-    } else {
-        // For non-interactive containers, capture output
-        use std::process::Command;
-        match Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--pid",
-                "chroot",
-                &rootfs.to_string_lossy(),
-            ])
-            .args(&command_to_run)
-            .output()
-        {
-            Ok(output) => {
-                // Print output
-                if !output.stdout.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&output.stdout));
-                }
-                if !output.stderr.is_empty() {
-                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-                }
-
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                // Update container status
-                let metadata = serde_json::json!({
-                    "id": container_id,
-                    "image": parsed_image.to_string(),
-                    "created": chrono::Utc::now().to_rfc3339(),
-                    "rootfs": rootfs.to_string_lossy(),
-                    "status": format!("exited ({})", exit_code)
-                });
-                std::fs::write(&container_meta_path, metadata.to_string())?;
-
-                if exit_code == 0 {
-                    println!("\nContainer {} exited successfully", container_id);
-                } else {
-                    println!(
-                        "\nContainer {} exited with code {}",
-                        container_id, exit_code
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to execute container: {}", e);
-
-                // Fallback for systems without proper unshare support
-                if e.to_string().contains("Operation not permitted") {
-                    println!("\nFalling back to direct execution mode...");
-
-                    // Execute directly in the overlay filesystem
-                    let cmd_path = rootfs.join(cmd_in_container.trim_start_matches('/'));
-                    if cmd_path.exists() {
-                        let mut fallback = Command::new(&cmd_path);
-                        fallback
-                            .args(&command_to_run[1..])
-                            .current_dir(&rootfs)
-                            .env(
-                                "PATH",
-                                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                            );
-
-                        if is_interactive {
-                            fallback
-                                .stdin(Stdio::inherit())
-                                .stdout(Stdio::inherit())
-                                .stderr(Stdio::inherit());
-
-                            let mut child = fallback.spawn()?;
-                            let _ = child.wait();
-                        } else {
-                            if let Ok(output) = fallback.output() {
-                                print!("{}", String::from_utf8_lossy(&output.stdout));
-                                if !output.stderr.is_empty() {
-                                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-                                }
-                            }
+                        // Set up network for rootless containers
+                        if !elevated {
+                            setup_container_network_if_needed(
+                                &bundle_dir,
+                                &rootfs,
+                                nix::unistd::Pid::from_raw(pid as i32),
+                            )?;
                         }
                     }
                 }
             }
+        }
+
+        println!("To view logs: carrier logs {}", short12(&container_id));
+        println!("To stop: carrier stop {}", short12(&container_id));
+
+        return Ok(());
+    }
+
+    // Foreground mode: runc run (combines create + start)
+    if is_interactive {
+        println!("\nStarting interactive container session...");
+        println!("Type 'exit' or press Ctrl+D to exit the container.\n");
+    }
+
+    let runc_result = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("run")
+        .arg("--bundle").arg(&bundle_dir)
+        .arg(&container_id)
+        .stdin(if is_interactive { Stdio::inherit() } else { Stdio::null() })
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match runc_result {
+        Ok(status) => {
+            let exit_code = status.code().unwrap_or(-1);
+
+            // Update container status
+            let metadata = serde_json::json!({
+                "id": container_id,
+                "name": container_name,
+                "image": parsed_image.to_string(),
+                "created": chrono::Utc::now().to_rfc3339(),
+                "rootfs": rootfs.to_string_lossy(),
+                "command": command_to_run,
+                "status": "exited",
+                "exit_code": exit_code,
+                "storage_driver": storage_driver_str,
+                "elevated": elevated
+            });
+            std::fs::write(&container_meta_path, metadata.to_string())?;
+
+            if exit_code == 0 {
+                println!("\nContainer {} exited successfully", short12(&container_id));
+            } else {
+                println!("\nContainer {} exited with code {}", short12(&container_id), exit_code);
+            }
+        }
+        Err(e) => {
+            return Err(format!("Failed to run container with runc: {}", e).into());
         }
     }
 
@@ -4011,55 +3841,107 @@ pub async fn stop_container(
 
     println!("Stopping container {}...", short12(&full_container_id));
 
-    // Get the PID file if it exists
-    let pid_file = container_dir.join("pid");
-    if pid_file.exists() {
-        let pid_str = std::fs::read_to_string(&pid_file)?;
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
+    // Use runc to stop the container properly
+    let runc_root = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+    let runc_root_path = format!("{}/carrier/runc", runc_root);
 
-            let container_pid = Pid::from_raw(pid);
+    // Check if container exists in runc
+    let state_result = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("state")
+        .arg(&full_container_id)
+        .output();
 
-            // Try graceful shutdown with SIGTERM
-            if !force {
-                println!("Sending SIGTERM to process {}...", pid);
-                if let Err(e) = kill(container_pid, Signal::SIGTERM) {
-                    // Process might have already exited
-                    if e != nix::errno::Errno::ESRCH {
-                        eprintln!("Warning: Failed to send SIGTERM: {}", e);
-                    }
-                } else {
-                    // Wait for process to terminate gracefully
-                    let start = std::time::Instant::now();
-                    let timeout_duration = std::time::Duration::from_secs(timeout);
+    let container_in_runc = state_result.map(|out| out.status.success()).unwrap_or(false);
 
-                    while start.elapsed() < timeout_duration {
-                        // Check if process still exists
-                        if kill(container_pid, None).is_err() {
-                            // Process has exited
+    if container_in_runc {
+        // Use runc to stop the container
+        if !force {
+            println!("Sending SIGTERM via runc...");
+            let kill_status = Command::new("runc")
+                .arg("--root").arg(&runc_root_path)
+                .arg("kill")
+                .arg(&full_container_id)
+                .arg("TERM")
+                .status();
+
+            if kill_status.is_ok() {
+                // Wait for graceful shutdown
+                let start = std::time::Instant::now();
+                let timeout_duration = std::time::Duration::from_secs(timeout);
+
+                while start.elapsed() < timeout_duration {
+                    let state = Command::new("runc")
+                        .arg("--root").arg(&runc_root_path)
+                        .arg("state")
+                        .arg(&full_container_id)
+                        .output();
+
+                    if let Ok(out) = state {
+                        if !out.status.success() {
+                            // Container no longer exists
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if let Ok(json) = String::from_utf8(out.stdout) {
+                            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&json) {
+                                if state["status"].as_str() == Some("stopped") {
+                                    break;
+                                }
+                            }
+                        }
                     }
-
-                    // Check if we need to force kill
-                    if kill(container_pid, None).is_ok() {
-                        println!(
-                            "Container did not stop within {} seconds, forcing...",
-                            timeout
-                        );
-                        force_kill_container(container_pid)?;
-                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-            } else {
-                // Force kill immediately
-                force_kill_container(container_pid)?;
             }
         }
 
+        // Force kill if needed or requested
+        if force {
+            println!("Force killing container...");
+        } else {
+            println!("Sending SIGKILL via runc...");
+        }
+        
+        let _ = Command::new("runc")
+            .arg("--root").arg(&runc_root_path)
+            .arg("kill")
+            .arg(&full_container_id)
+            .arg("KILL")
+            .status();
+
+        // Delete the container from runc
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = Command::new("runc")
+            .arg("--root").arg(&runc_root_path)
+            .arg("delete")
+            .arg(&full_container_id)
+            .status();
+
         // Remove PID file
+        let pid_file = container_dir.join("pid");
         let _ = std::fs::remove_file(&pid_file);
+    } else {
+        // Container not in runc, try legacy PID-based stopping
+        let pid_file = container_dir.join("pid");
+        if pid_file.exists() {
+            let pid_str = std::fs::read_to_string(&pid_file)?;
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+
+                let container_pid = Pid::from_raw(pid);
+                println!("Using legacy PID-based stop for process {}...", pid);
+                
+                if !force {
+                    let _ = kill(container_pid, Signal::SIGTERM);
+                    std::thread::sleep(std::time::Duration::from_secs(timeout.min(5)));
+                }
+                
+                let _ = kill(container_pid, Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&pid_file);
+        }
     }
 
     // Clean up network processes (pasta or slirp4netns)

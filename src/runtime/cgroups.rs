@@ -24,12 +24,12 @@ pub struct CgroupConfig {
 impl Default for CgroupConfig {
     fn default() -> Self {
         Self {
-            memory_limit: Some(1024 * 1024 * 1024), // 1 GB default
-            memory_swap_limit: Some(1024 * 1024 * 1024), // 1 GB default
+            memory_limit: None,
+            memory_swap_limit: None,
             cpu_quota: None,
             cpu_period: None,
             cpu_weight: None,
-            pids_limit: Some(4096), // Allow up to 4096 processes
+            pids_limit: None,
             io_weight: None,
         }
     }

@@ -223,7 +223,8 @@ impl NamespaceManager {
         // Mount proc
         let proc_target = rootfs.join("proc");
         if !proc_target.exists() {
-            fs::create_dir_all(&proc_target)?;
+            fs::create_dir_all(&proc_target)
+                .map_err(|e| format!("Failed to create {}: {}", proc_target.display(), e))?;
         }
         mount(
             Some("proc"),
@@ -231,7 +232,7 @@ impl NamespaceManager {
             Some("proc"),
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
             None::<&str>,
-        )?;
+        ).map_err(|e| format!("Failed to mount proc at {}: {}", proc_target.display(), e))?;
 
         // Mount sys
         let sys_target = rootfs.join("sys");

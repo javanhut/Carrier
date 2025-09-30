@@ -135,12 +135,12 @@ impl ContainerProcess {
         // Setup container filesystem
         self.setup_container_fs()?;
 
+        // Setup mounts BEFORE chroot (they need to be on the external paths)
+        let ns_mgr = NamespaceManager::new(self.config.namespace_config.clone());
+        ns_mgr.setup_container_mounts(&self.config.rootfs)?;
+
         // Change to new root
         self.pivot_root()?;
-
-        // Setup mounts
-        let ns_mgr = NamespaceManager::new(self.config.namespace_config.clone());
-        ns_mgr.setup_container_mounts(&PathBuf::from("/"))?;
 
         // Apply security policies
         let sec_mgr = SecurityManager::new(self.config.security_config.clone());
@@ -191,12 +191,16 @@ impl ContainerProcess {
         use nix::mount::{mount, umount2, MntFlags, MsFlags};
         use std::fs;
 
-        // For rootless containers, we use chroot instead of pivot_root
-        // as pivot_root requires CAP_SYS_ADMIN in the user namespace
-        if !nix::unistd::Uid::effective().is_root() {
-            // Use chroot for rootless containers
-            nix::unistd::chroot(&self.config.rootfs)?;
-            chdir(Path::new("/"))?;
+        // In user namespace, we ARE root (uid 0), so we can use pivot_root
+        // But for simplicity and compatibility, we'll use chroot for rootless
+        let using_user_ns = self.config.namespace_config.use_user_ns;
+        
+        if using_user_ns {
+            // Use chroot for user namespace containers (simpler, more reliable)
+            nix::unistd::chroot(&self.config.rootfs)
+                .map_err(|e| format!("chroot failed: {}", e))?;
+            chdir(Path::new("/"))
+                .map_err(|e| format!("chdir after chroot failed: {}", e))?;
         } else {
             // Use pivot_root for root containers
             let new_root = &self.config.rootfs;
