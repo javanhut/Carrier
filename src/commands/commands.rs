@@ -1875,6 +1875,19 @@ fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::err
         let _ = std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
     }
 
+    let apt_conf_dir = etc_dir.join("apt").join("apt.conf.d");
+    if !apt_conf_dir.exists() {
+        let _ = std::fs::create_dir_all(&apt_conf_dir);
+    }
+    
+    let apt_sandbox_conf = apt_conf_dir.join("99-carrier-sandbox");
+    if !apt_sandbox_conf.exists() {
+        let _ = std::fs::write(
+            &apt_sandbox_conf,
+            "APT::Sandbox::User \"root\";\n"
+        );
+    }
+
     Ok(())
 }
 

@@ -77,6 +77,8 @@ pub struct Linux {
     pub readonly_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Resources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<Seccomp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,6 +125,149 @@ pub struct Cpu {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Pids {
     pub limit: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Seccomp {
+    #[serde(rename = "defaultAction")]
+    pub default_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architectures: Option<Vec<String>>,
+    pub syscalls: Vec<SeccompSyscall>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SeccompSyscall {
+    pub names: Vec<String>,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<SeccompArg>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "errnoRet")]
+    pub errno_ret: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SeccompArg {
+    pub index: u32,
+    pub value: u64,
+    pub op: String,
+}
+
+fn get_default_seccomp() -> Seccomp {
+    let blocked_syscalls = vec![
+        "acct", "add_key", "bpf", "clock_adjtime", "clock_settime", "clone3",
+        "delete_module", "finit_module", "get_kernel_syms", "get_mempolicy",
+        "init_module", "kcmp", "kexec_file_load", "kexec_load", "keyctl",
+        "lookup_dcookie", "mbind", "mount", "move_pages", "name_to_handle_at",
+        "nfsservctl", "open_by_handle_at", "perf_event_open", "personality",
+        "pivot_root", "process_vm_readv", "process_vm_writev", "ptrace",
+        "query_module", "quotactl", "reboot", "request_key", "set_mempolicy",
+        "setns", "settimeofday", "stime", "swapon", "swapoff", "sysfs",
+        "_sysctl", "umount", "umount2", "unshare", "uselib", "userfaultfd",
+        "ustat", "vm86", "vm86old",
+    ];
+
+    Seccomp {
+        default_action: "SCMP_ACT_ALLOW".to_string(),
+        architectures: Some(vec![
+            "SCMP_ARCH_X86_64".to_string(),
+            "SCMP_ARCH_X86".to_string(),
+            "SCMP_ARCH_X32".to_string(),
+            "SCMP_ARCH_AARCH64".to_string(),
+            "SCMP_ARCH_ARM".to_string(),
+        ]),
+        syscalls: vec![
+            SeccompSyscall {
+                names: blocked_syscalls.iter().map(|s| s.to_string()).collect(),
+                action: "SCMP_ACT_ERRNO".to_string(),
+                args: None,
+                errno_ret: Some(1),
+            },
+        ],
+    }
+}
+
+fn get_default_seccomp_old_allowlist() -> Seccomp {
+    let allowed_syscalls = vec![
+        "_llseek", "_newselect", "accept", "accept4", "access", "adjtimex", "alarm",
+        "arch_prctl", "bind", "brk", "capget", "capset", "chdir", "chmod", "chown",
+        "chown32", "chroot", "clock_adjtime", "clock_adjtime64", "clock_getres",
+        "clock_getres_time64", "clock_gettime", "clock_gettime64", "clock_nanosleep",
+        "clock_nanosleep_time64", "clone", "clone3", "close", "close_range", "connect",
+        "copy_file_range", "creat", "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
+        "epoll_ctl", "epoll_pwait", "epoll_pwait2", "epoll_wait", "eventfd", "eventfd2",
+        "execve", "execveat", "exit", "exit_group", "faccessat", "faccessat2", "fadvise64",
+        "fadvise64_64", "fallocate", "fanotify_init", "fanotify_mark", "fchdir", "fchmod",
+        "fchmodat", "fchmodat2", "fchown", "fchown32", "fchownat", "fcntl", "fcntl64",
+        "fdatasync", "fgetxattr", "flistxattr", "flock", "fork", "fremovexattr", "fsconfig",
+        "fsetxattr", "fsmount", "fsopen", "fspick", "fstat", "fstat64", "fstatat64",
+        "fstatfs", "fstatfs64", "fsync", "ftruncate", "ftruncate64", "futex", "futex_time64",
+        "get_mempolicy", "get_robust_list", "get_thread_area", "getcpu", "getcwd", "getdents",
+        "getdents64", "getegid", "getegid32", "geteuid", "geteuid32", "getgid", "getgid32",
+        "getgroups", "getgroups32", "getitimer", "getpeername", "getpgid", "getpgrp",
+        "getpid", "getppid", "getpriority", "getrandom", "getresgid", "getresgid32",
+        "getresuid", "getresuid32", "getrlimit", "getrusage", "getsid", "getsockname",
+        "getsockopt", "gettid", "gettimeofday", "getuid", "getuid32", "getxattr",
+        "inotify_add_watch", "inotify_init", "inotify_init1", "inotify_rm_watch",
+        "io_cancel", "io_destroy", "io_getevents", "io_setup", "io_submit", "ioctl",
+        "ioprio_get", "ioprio_set", "ipc", "keyctl", "kill", "lchown", "lchown32",
+        "lgetxattr", "link", "linkat", "listen", "listxattr", "llistxattr", "lremovexattr",
+        "lseek", "lsetxattr", "lstat", "lstat64", "madvise", "mbind", "membarrier",
+        "memfd_create", "mincore", "mkdir", "mkdirat", "mknod", "mknodat", "mlock",
+        "mlock2", "mlockall", "mmap", "mmap2", "mount", "mprotect", "mq_getsetattr",
+        "mq_notify", "mq_open", "mq_timedreceive", "mq_timedreceive_time64", "mq_timedsend",
+        "mq_timedsend_time64", "mq_unlink", "mremap", "msgctl", "msgget", "msgrcv",
+        "msgsnd", "msync", "munlock", "munlockall", "munmap", "nanosleep", "newfstatat",
+        "open", "openat", "openat2", "pause", "pipe", "pipe2", "pivot_root", "poll",
+        "ppoll", "ppoll_time64", "prctl", "pread64", "preadv", "preadv2", "prlimit64",
+        "pselect6", "pselect6_time64", "ptrace", "pwrite64", "pwritev", "pwritev2",
+        "read", "readahead", "readlink", "readlinkat", "readv", "recv", "recvfrom",
+        "recvmmsg", "recvmmsg_time64", "recvmsg", "remap_file_pages", "removexattr",
+        "rename", "renameat", "renameat2", "restart_syscall", "rmdir", "rseq",
+        "rt_sigaction", "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo",
+        "rt_sigreturn", "rt_sigsuspend", "rt_sigtimedwait", "rt_sigtimedwait_time64",
+        "rt_tgsigqueueinfo", "sched_get_priority_max", "sched_get_priority_min",
+        "sched_getaffinity", "sched_getattr", "sched_getparam", "sched_getscheduler",
+        "sched_rr_get_interval", "sched_rr_get_interval_time64", "sched_setaffinity",
+        "sched_setattr", "sched_setparam", "sched_setscheduler", "sched_yield",
+        "seccomp", "select", "semctl", "semget", "semop", "semtimedop", "semtimedop_time64",
+        "send", "sendfile", "sendfile64", "sendmmsg", "sendmsg", "sendto", "set_mempolicy",
+        "set_robust_list", "set_thread_area", "set_tid_address", "setfsgid", "setfsgid32",
+        "setfsuid", "setfsuid32", "setgid", "setgid32", "setgroups", "setgroups32",
+        "setitimer", "setns", "setpgid", "setpriority", "setregid", "setregid32",
+        "setresgid", "setresgid32", "setresuid", "setresuid32", "setreuid", "setreuid32",
+        "setrlimit", "setsid", "setsockopt", "settimeofday", "setuid", "setuid32",
+        "setxattr", "shmat", "shmctl", "shmdt", "shmget", "shutdown", "sigaltstack",
+        "signal", "signalfd", "signalfd4", "sigprocmask", "sigreturn", "socket",
+        "socketcall", "socketpair", "splice", "stat", "stat64", "statfs", "statfs64",
+        "statx", "symlink", "symlinkat", "sync", "sync_file_range", "syncfs", "sysinfo",
+        "syslog", "tee", "tgkill", "time", "timer_create", "timer_delete",
+        "timer_getoverrun", "timer_gettime", "timer_gettime64", "timer_settime",
+        "timer_settime64", "timerfd_create", "timerfd_gettime", "timerfd_gettime64",
+        "timerfd_settime", "timerfd_settime64", "times", "tkill", "truncate", "truncate64",
+        "ugetrlimit", "umask", "umount", "umount2", "uname", "unlink", "unlinkat",
+        "unshare", "utime", "utimensat", "utimensat_time64", "utimes", "vfork", "wait4",
+        "waitid", "waitpid", "write", "writev",
+    ];
+
+    Seccomp {
+        default_action: "SCMP_ACT_ERRNO".to_string(),
+        architectures: Some(vec![
+            "SCMP_ARCH_X86_64".to_string(),
+            "SCMP_ARCH_X86".to_string(),
+            "SCMP_ARCH_X32".to_string(),
+            "SCMP_ARCH_AARCH64".to_string(),
+            "SCMP_ARCH_ARM".to_string(),
+        ]),
+        syscalls: vec![
+            SeccompSyscall {
+                names: allowed_syscalls.iter().map(|s| s.to_string()).collect(),
+                action: "SCMP_ACT_ALLOW".to_string(),
+                args: None,
+                errno_ret: None,
+            },
+        ],
+    }
 }
 
 fn get_subid_range(username: &str, subid_file: &str) -> Result<(u32, u32), String> {
@@ -403,6 +548,7 @@ impl OCISpec {
                     "/proc/sysrq-trigger".to_string(),
                 ],
                 resources: None,
+                seccomp: Some(get_default_seccomp()),
             },
         }
     }
