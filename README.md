@@ -18,7 +18,6 @@ See [Rootless Documentation](docs/rootless.md) for setup and usage details.
 - **Clean Output** - Formatted tables for listing images and containers
 
 ### Technical Features
-- **Custom Runtime** - Built-in container runtime, no dependency on runc/crun
 - **Overlay Filesystem** - Efficient layer management with overlay/fuse-overlayfs
 - **Namespace Isolation** - Full Linux namespace support (PID, Network, Mount, UTS, IPC, User)
 - **Cgroups v2** - Resource limits and accounting
@@ -209,7 +208,6 @@ carrier/
 -  Direct execution model
 
 ### vs Podman
--  No external runtime dependency (runc/crun)
 -  Simpler architecture
 -  Faster container startup
 -  Integrated runtime
