@@ -23,7 +23,9 @@ fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Check if the expected runtime dir exists
     if runtime_dir.exists() {
         // Set the environment variable for this process and children
-        env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        unsafe {
+            env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        }
         println!("Auto-detected XDG_RUNTIME_DIR: {}", runtime_dir.display());
         Ok(runtime_dir)
     } else {
@@ -38,7 +40,9 @@ fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
         perms.set_mode(0o700);
         fs::set_permissions(&fallback, perms)?;
 
-        env::set_var("XDG_RUNTIME_DIR", &fallback);
+        unsafe {
+            env::set_var("XDG_RUNTIME_DIR", &fallback);
+        }
         println!("Using fallback XDG_RUNTIME_DIR: {}", fallback.display());
         Ok(fallback)
     }
@@ -159,6 +163,9 @@ impl ContainerStorage {
             eprintln!("overlay mount failed; using vfs fallback");
             eprintln!("Falling back to vfs (copy) backend. This is slower but should work.");
             self.build_vfs_root(&lower_dirs, &upper_dir, &merged_dir)?;
+            
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            
             self.last_driver = Some(StorageDriver::Vfs);
         } else {
             self.last_driver = Some(chosen);
@@ -340,14 +347,23 @@ impl ContainerStorage {
     }
 
     fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Read, Write};
+        
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             let ty = entry.file_type()?;
             let name = entry.file_name();
+            let name_str = name.to_string_lossy();
             let target = dst.join(&name);
             let path = entry.path();
 
             if ty.is_dir() {
+                // Skip special directories that will be mounted later
+                if dst.to_string_lossy().ends_with("merged") && 
+                   (name_str == "dev" || name_str == "proc" || name_str == "sys") {
+                    fs::create_dir_all(&target)?;
+                    continue;
+                }
                 fs::create_dir_all(&target)?;
                 self.copy_recursive(&path, &target)?;
                 continue;
@@ -376,21 +392,12 @@ impl ContainerStorage {
                         let _ = fs::remove_file(&target);
                     }
                     let dev = metadata.rdev();
-                    if let Err(e) = mknod(
+                    let _ = mknod(
                         &target,
                         SFlag::S_IFCHR,
                         perm,
                         makedev(major(dev), minor(dev)),
-                    ) {
-                        if e != Errno::EPERM {
-                            return Err(format!(
-                                "Failed to create char device {}: {}",
-                                target.display(),
-                                e
-                            )
-                            .into());
-                        }
-                    }
+                    );
                     continue;
                 }
 
@@ -399,21 +406,12 @@ impl ContainerStorage {
                         let _ = fs::remove_file(&target);
                     }
                     let dev = metadata.rdev();
-                    if let Err(e) = mknod(
+                    let _ = mknod(
                         &target,
                         SFlag::S_IFBLK,
                         perm,
                         makedev(major(dev), minor(dev)),
-                    ) {
-                        if e != Errno::EPERM {
-                            return Err(format!(
-                                "Failed to create block device {}: {}",
-                                target.display(),
-                                e
-                            )
-                            .into());
-                        }
-                    }
+                    );
                     continue;
                 }
 
@@ -421,33 +419,44 @@ impl ContainerStorage {
                     if target.exists() {
                         let _ = fs::remove_file(&target);
                     }
-                    if let Err(e) = mkfifo(&target, perm) {
-                        if e != Errno::EPERM {
-                            return Err(format!(
-                                "Failed to create FIFO {}: {}",
-                                target.display(),
-                                e
-                            )
-                            .into());
-                        }
-                    }
+                    let _ = mkfifo(&target, perm);
                     continue;
                 }
 
                 if ty.is_socket() {
-                    // Skip Unix sockets; they will be recreated by the application as needed
                     continue;
                 }
 
                 if ty.is_file() {
-                    let _ = fs::copy(&path, &target)?;
+                    if target.exists() {
+                        fs::remove_file(&target)?;
+                    }
+                    
+                    let mut src_file = fs::File::open(&path)?;
+                    let mut dst_file = fs::File::create(&target)?;
+                    let mut buffer = Vec::new();
+                    src_file.read_to_end(&mut buffer)?;
+                    dst_file.write_all(&buffer)?;
+                    dst_file.sync_all()?;
+                    drop(dst_file);
+                    
                     fs::set_permissions(&target, metadata.permissions())?;
                     continue;
                 }
             }
 
             if ty.is_file() {
-                let _ = fs::copy(&path, &target)?;
+                if target.exists() {
+                    fs::remove_file(&target)?;
+                }
+                
+                let mut src_file = fs::File::open(&path)?;
+                let mut dst_file = fs::File::create(&target)?;
+                let mut buffer = Vec::new();
+                src_file.read_to_end(&mut buffer)?;
+                dst_file.write_all(&buffer)?;
+                dst_file.sync_all()?;
+                drop(dst_file);
             }
         }
         Ok(())

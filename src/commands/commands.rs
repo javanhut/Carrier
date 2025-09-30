@@ -2028,6 +2028,9 @@ async fn run_container_with_storage(
         parsed_image.to_string()
     );
 
+    // Set up cgroup resource limits for carrier containers
+    let _ = setup_carrier_cgroup_limits();
+
     // Generate container ID or use custom name
     let container_id = match &name {
         Some(custom_name) => custom_name.clone(),
@@ -2205,11 +2208,15 @@ async fn run_container_with_storage(
     }
 
     // Detect if this should be an interactive container (not applicable in detached mode)
+    // Only use interactive mode if it's a plain shell without -c flag
+    let has_command_flag = command_to_run.contains(&"-c".to_string());
+    let is_shell_only = (command_to_run[0].contains("bash") || command_to_run[0].contains("sh")) 
+        && command_to_run.len() == 1;
     let is_interactive = !detach
-        && (command_to_run[0].contains("bash")
-            || command_to_run[0].contains("sh")
+        && (is_shell_only
             || command_to_run.contains(&"-it".to_string())
-            || command_to_run.contains(&"-i".to_string()));
+            || command_to_run.contains(&"-i".to_string()))
+        && !has_command_flag;
 
     // Build the command path
     let cmd_in_container = &command_to_run[0];
@@ -2223,7 +2230,7 @@ async fn run_container_with_storage(
         println!("Running container with elevated privileges (rootless)...");
         // For elevated mode, still use unshare but without user namespace mapping
         // This gives access to host UIDs/GIDs while maintaining other isolation
-        let mut c = Command::new("unshare");
+        let mut c = Command::new("/usr/bin/unshare");
 
         let root_dir = rootfs.display().to_string();
         let command_str = command_to_run.join(" ");
@@ -2237,7 +2244,7 @@ async fn run_container_with_storage(
              mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
              mount -o remount,dev {root}/dev 2>/dev/null || true; \
               rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; 
+              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
               rm -f {root}/dev/zero 2>/dev/null || true; \
               mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
               rm -f {root}/dev/random 2>/dev/null || true; \
@@ -2279,7 +2286,7 @@ async fn run_container_with_storage(
     } else {
         // For rootless mode, use user namespaces for better isolation
         // We need to set up /dev properly before chroot for rootless containers too
-        let mut c = Command::new("unshare");
+        let mut c = Command::new("/usr/bin/unshare");
 
         let root_dir = rootfs.display().to_string();
         let command_str = command_to_run.join(" ");
@@ -2343,9 +2350,10 @@ async fn run_container_with_storage(
         let pid_file = storage.container_path(&container_id).join("pid");
         std::fs::write(&pid_file, child.id().to_string())?;
 
+        let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+
         // Set up network for rootless containers
         if !elevated {
-            let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
             setup_container_network_if_needed(
                 &storage.container_path(&container_id),
                 &rootfs,
@@ -2420,6 +2428,7 @@ async fn run_container_with_storage(
             Some(&storage.container_path(&container_id)),
             Some(&rootfs),
             !elevated, // needs_network
+            Some(&container_id),
         )?;
 
         // Remove PID file after process exits
@@ -2605,6 +2614,48 @@ fn setup_container_network_if_needed(
     Ok(())
 }
 
+/// Set up cgroup resource limits for carrier globally and move current process into it
+fn setup_carrier_cgroup_limits() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    // Get user's delegated cgroup path
+    let uid = nix::unistd::getuid().as_raw();
+    let carrier_cgroup = format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service/carrier.slice",
+        uid, uid
+    );
+
+    let carrier_path = std::path::Path::new(&carrier_cgroup);
+    if !carrier_path.exists() {
+        // Create carrier.slice if it doesn't exist
+        let _ = fs::create_dir_all(carrier_path);
+    }
+
+    // Set generous per-container limits on the carrier.slice itself
+    // These will be inherited by all containers
+
+    // Memory: 8GB per carrier.slice (shared by all containers)
+    let memory_max = carrier_path.join("memory.max");
+    if memory_max.exists() {
+        let _ = fs::write(&memory_max, (8u64 * 1024 * 1024 * 1024).to_string());
+    }
+
+    // PIDs: 32768 total PIDs for all containers (generous limit)
+    let pids_max = carrier_path.join("pids.max");
+    if pids_max.exists() {
+        let _ = fs::write(&pids_max, "32768");
+    }
+
+    // Move current process (and all future children) into carrier.slice
+    let cgroup_procs = carrier_path.join("cgroup.procs");
+    if cgroup_procs.exists() {
+        let pid = std::process::id();
+        let _ = fs::write(&cgroup_procs, pid.to_string());
+    }
+
+    Ok(())
+}
+
 // Spawn a Command under a pseudo-terminal with TTY semantics, window resizing, and raw mode
 /// Detect a compatible terminal type for maximum portability
 fn detect_compatible_term() -> &'static str {
@@ -2636,6 +2687,7 @@ fn spawn_with_pty_and_network(
     container_dir: Option<&Path>,
     rootfs: Option<&Path>,
     needs_network: bool,
+    container_id: Option<&str>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use std::process::Stdio;
 
@@ -2667,8 +2719,28 @@ fn spawn_with_pty_and_network(
         let _ = child.wait();
     }
 
-    // Now run the actual PTY session
-    spawn_with_pty(program, args)
+    // Now run the actual PTY session, with fallback to non-PTY if it fails
+    match spawn_with_pty(program, args) {
+        Ok(code) => Ok(code),
+        Err(e) if e.to_string().contains("PTY not available") || e.to_string().contains("Permission denied") => {
+            eprintln!("Warning: PTY not available, running without terminal support");
+            if e.to_string().contains("Permission denied") {
+                eprintln!("PTY permission denied. Fix /dev/pts/ptmx permissions:");
+                eprintln!("  sudo chmod 666 /dev/pts/ptmx");
+            } else {
+                eprintln!("For interactive shells, ensure /dev/ptmx exists:");
+                eprintln!("  sudo ln -s /dev/pts/ptmx /dev/ptmx");
+            }
+            eprintln!();
+            
+            // Fallback to regular spawn without PTY
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            let status = cmd.status()?;
+            Ok(status.code().unwrap_or(1))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -2727,6 +2799,14 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
         pixel_width: 0,
         pixel_height: 0,
     };
+    
+    // Ensure /dev/ptmx exists - create symlink if needed
+    if !std::path::Path::new("/dev/ptmx").exists() && std::path::Path::new("/dev/pts/ptmx").exists() {
+        eprintln!("Warning: /dev/ptmx not found. PTY functionality requires /dev/ptmx");
+        eprintln!("Run: sudo ln -s /dev/pts/ptmx /dev/ptmx");
+        return Err("PTY not available: /dev/ptmx missing".into());
+    }
+    
     let pair = pty_system.openpty(size)?;
 
     // Build command

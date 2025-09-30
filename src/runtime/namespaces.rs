@@ -250,6 +250,13 @@ impl NamespaceManager {
         let dev_target = rootfs.join("dev");
         if !dev_target.exists() {
             fs::create_dir_all(&dev_target)?;
+        } else {
+            // Clear any existing /dev contents from VFS copy
+            for entry in fs::read_dir(&dev_target).unwrap_or_else(|_| fs::read_dir("/").unwrap()) {
+                if let Ok(entry) = entry {
+                    let _ = fs::remove_file(entry.path()).or_else(|_| fs::remove_dir_all(entry.path()));
+                }
+            }
         }
 
         // Try to mount devtmpfs first
@@ -424,10 +431,22 @@ impl NamespaceManager {
         }
 
         // Symlink standard streams
-        symlink("/proc/self/fd", &dev_path.join("fd"))?;
-        symlink("/proc/self/fd/0", &dev_path.join("stdin"))?;
-        symlink("/proc/self/fd/1", &dev_path.join("stdout"))?;
-        symlink("/proc/self/fd/2", &dev_path.join("stderr"))?;
+        let fd_link = dev_path.join("fd");
+        if !fd_link.exists() {
+            let _ = symlink("/proc/self/fd", &fd_link);
+        }
+        let stdin_link = dev_path.join("stdin");
+        if !stdin_link.exists() {
+            let _ = symlink("/proc/self/fd/0", &stdin_link);
+        }
+        let stdout_link = dev_path.join("stdout");
+        if !stdout_link.exists() {
+            let _ = symlink("/proc/self/fd/1", &stdout_link);
+        }
+        let stderr_link = dev_path.join("stderr");
+        if !stderr_link.exists() {
+            let _ = symlink("/proc/self/fd/2", &stderr_link);
+        }
 
         Ok(())
     }

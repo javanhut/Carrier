@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Cgroup v2 resource limits configuration
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CgroupConfig {
     /// Memory limit in bytes
     pub memory_limit: Option<u64>,
@@ -19,6 +19,20 @@ pub struct CgroupConfig {
     pub pids_limit: Option<u64>,
     /// IO weight (1-10000, default 100)
     pub io_weight: Option<u32>,
+}
+
+impl Default for CgroupConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: Some(1024 * 1024 * 1024), // 1 GB default
+            memory_swap_limit: Some(1024 * 1024 * 1024), // 1 GB default
+            cpu_quota: None,
+            cpu_period: None,
+            cpu_weight: None,
+            pids_limit: Some(4096), // Allow up to 4096 processes
+            io_weight: None,
+        }
+    }
 }
 
 pub struct CgroupManager {
@@ -102,10 +116,8 @@ impl CgroupManager {
             fs::create_dir_all(&self.cgroup_path)?;
         }
 
-        // Enable controllers if we have permission
-        if !self.is_rootless {
-            self.enable_controllers()?;
-        }
+        // Enable controllers in parent cgroup
+        self.enable_controllers()?;
 
         // Apply resource limits
         self.apply_limits()?;
@@ -118,9 +130,25 @@ impl CgroupManager {
         if let Some(parent) = self.cgroup_path.parent() {
             let subtree_control = parent.join("cgroup.subtree_control");
             if subtree_control.exists() {
-                // Try to enable controllers we need
-                let controllers = "+memory +cpu +pids +io";
-                let _ = fs::write(subtree_control, controllers);
+                // Check which controllers are available in the parent
+                let controllers_file = parent.join("cgroup.controllers");
+                if controllers_file.exists() {
+                    let available = fs::read_to_string(controllers_file)?;
+                    let controllers: Vec<&str> = available.split_whitespace().collect();
+
+                    // Enable controllers that are both available and needed
+                    let mut to_enable = Vec::new();
+                    for controller in &["memory", "cpu", "pids", "io"] {
+                        if controllers.contains(controller) {
+                            to_enable.push(format!("+{}", controller));
+                        }
+                    }
+
+                    if !to_enable.is_empty() {
+                        let enable_str = to_enable.join(" ");
+                        fs::write(subtree_control, enable_str)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -132,7 +160,8 @@ impl CgroupManager {
         if let Some(limit) = self.config.memory_limit {
             let memory_max = self.cgroup_path.join("memory.max");
             if memory_max.exists() {
-                fs::write(memory_max, limit.to_string())?;
+                fs::write(&memory_max, limit.to_string())
+                    .map_err(|e| format!("Failed to set memory.max: {}", e))?;
             }
         }
 
@@ -140,7 +169,8 @@ impl CgroupManager {
         if let Some(limit) = self.config.memory_swap_limit {
             let swap_max = self.cgroup_path.join("memory.swap.max");
             if swap_max.exists() {
-                fs::write(swap_max, limit.to_string())?;
+                fs::write(&swap_max, limit.to_string())
+                    .map_err(|e| format!("Failed to set memory.swap.max: {}", e))?;
             }
         }
 
@@ -149,7 +179,8 @@ impl CgroupManager {
             let period = self.config.cpu_period.unwrap_or(100000);
             let cpu_max = self.cgroup_path.join("cpu.max");
             if cpu_max.exists() {
-                fs::write(cpu_max, format!("{} {}", quota, period))?;
+                fs::write(&cpu_max, format!("{} {}", quota, period))
+                    .map_err(|e| format!("Failed to set cpu.max: {}", e))?;
             }
         }
 
@@ -157,7 +188,8 @@ impl CgroupManager {
         if let Some(weight) = self.config.cpu_weight {
             let cpu_weight = self.cgroup_path.join("cpu.weight");
             if cpu_weight.exists() {
-                fs::write(cpu_weight, weight.to_string())?;
+                fs::write(&cpu_weight, weight.to_string())
+                    .map_err(|e| format!("Failed to set cpu.weight: {}", e))?;
             }
         }
 
@@ -165,7 +197,8 @@ impl CgroupManager {
         if let Some(limit) = self.config.pids_limit {
             let pids_max = self.cgroup_path.join("pids.max");
             if pids_max.exists() {
-                fs::write(pids_max, limit.to_string())?;
+                fs::write(&pids_max, limit.to_string())
+                    .map_err(|e| format!("Failed to set pids.max: {}", e))?;
             }
         }
 
@@ -173,7 +206,8 @@ impl CgroupManager {
         if let Some(weight) = self.config.io_weight {
             let io_weight = self.cgroup_path.join("io.weight");
             if io_weight.exists() {
-                fs::write(io_weight, format!("default {}", weight))?;
+                fs::write(&io_weight, format!("default {}", weight))
+                    .map_err(|e| format!("Failed to set io.weight: {}", e))?;
             }
         }
 
@@ -183,8 +217,10 @@ impl CgroupManager {
     /// Add a process to the cgroup
     pub fn add_process(&self, pid: u32) -> Result<(), Box<dyn std::error::Error>> {
         let cgroup_procs = self.cgroup_path.join("cgroup.procs");
-        let mut file = fs::OpenOptions::new().write(true).open(cgroup_procs)?;
-        writeln!(file, "{}", pid)?;
+        let mut file = fs::OpenOptions::new().write(true).open(&cgroup_procs)
+            .map_err(|e| format!("Failed to open cgroup.procs at {:?}: {}", cgroup_procs, e))?;
+        writeln!(file, "{}", pid)
+            .map_err(|e| format!("Failed to write PID {} to cgroup.procs: {}", pid, e))?;
         Ok(())
     }
 
