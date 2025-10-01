@@ -196,6 +196,10 @@ impl ContainerStorage {
         work: &Path,
         merged: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Note: We don't use uidmapping/gidmapping in fuse-overlayfs because:
+        // 1. It prevents the host from writing to the merged filesystem
+        // 2. The user namespace mapping in the OCI spec handles UID/GID translation
+        // 3. This is how Podman does it - fuse-overlayfs without uidmapping + user namespace
         let output = Command::new("fuse-overlayfs")
             .arg("-o")
             .arg(format!(
@@ -346,7 +350,7 @@ impl ContainerStorage {
         merged: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::process::Command;
-        
+
         if merged.exists() && fs::read_dir(merged)?.next().is_some() {
             return Ok(());
         }
@@ -358,15 +362,45 @@ impl ContainerStorage {
 
         for lower in lower_dirs.iter() {
             let src = Path::new(lower);
-            
+
             let output = Command::new("cp")
                 .arg("-a")
                 .arg(format!("{}/*", src.display()))
                 .arg(merged)
                 .output();
-                
+
             if output.is_err() || !output.as_ref().unwrap().status.success() {
                 self.copy_recursive(src, merged)?;
+            }
+        }
+
+        self.fix_ownership_for_rootless(merged)?;
+        Ok(())
+    }
+
+    fn fix_ownership_for_rootless(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        use nix::unistd::{chown, Uid, Gid};
+        use std::os::unix::fs::PermissionsExt;
+
+        let current_uid = nix::unistd::getuid();
+        let current_gid = nix::unistd::getgid();
+
+        self.chown_recursive(rootfs, current_uid, current_gid)?;
+        Ok(())
+    }
+
+    fn chown_recursive(&self, path: &Path, uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> Result<(), Box<dyn std::error::Error>> {
+        use nix::unistd::chown;
+        let _ = chown(path, Some(uid), Some(gid));
+
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if !entry_path.is_symlink() {
+                        self.chown_recursive(&entry_path, uid, gid)?;
+                    }
+                }
             }
         }
         Ok(())
