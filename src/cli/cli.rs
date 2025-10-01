@@ -82,7 +82,7 @@ pub enum Commands {
     AuthVerify,
 
     /// Remove an image or container
-    #[command(alias = "rm")]
+    #[command(alias = "rm", aliases = ["rmi"])]
     Remove {
         /// Image or container ID to remove (optional if using --all-containers)
         image: Option<String>,
@@ -94,6 +94,10 @@ pub enum Commands {
         /// Remove all stopped containers
         #[arg(short = 'c', long = "all-containers")]
         all_containers: bool,
+
+        /// Interactive mode - prompt before removing
+        #[arg(short, long)]
+        interactive: bool,
     },
 
     /// List images and containers

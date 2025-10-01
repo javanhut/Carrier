@@ -163,7 +163,7 @@ cleanup() {
     # Remove images (best-effort)
     if [ "$HAVE_PODMAN" = "true" ]; then podman rmi $TEST_IMAGE &>/dev/null || true; fi
     if [ "$HAVE_DOCKER" = "true" ]; then $DOCKER_CMD rmi $TEST_IMAGE &>/dev/null || true; fi
-    if [ "$HAVE_CARRIER" = "true" ]; then $CARRIER rmi $TEST_IMAGE &>/dev/null || true; fi
+    if [ "$HAVE_CARRIER" = "true" ]; then $CARRIER rmi $TEST_IMAGE --force &>/dev/null || true; fi
 }
 
 # Initial cleanup
@@ -183,7 +183,7 @@ for i in $(seq 1 $PULL_ITERS); do
     # Clean images before each test
     podman rmi $TEST_IMAGE &>/dev/null || true
     $DOCKER_CMD rmi $TEST_IMAGE &>/dev/null || true
-    $CARRIER rmi $TEST_IMAGE &>/dev/null || true
+    $CARRIER rmi $TEST_IMAGE --force &>/dev/null || true
     
     # Test Podman
     if [ "$HAVE_PODMAN" = "true" ]; then
@@ -495,7 +495,7 @@ echo -e "${BOLD}                    Benchmark Complete!${NC}"
 echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════${NC}"
 
 # Save results
-RESULTS_FILE="benchmark_results_$(date +%Y%m%d_%H%M%S).txt"
+RESULTS_FILE="benchmarking/benchmark_results_$(date +%Y%m%d_%H%M%S).txt"
 {
     echo "Benchmark Results - $(date)"
     echo "=========================="

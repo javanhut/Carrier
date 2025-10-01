@@ -87,11 +87,12 @@ async fn main() {
             image,
             force,
             all_containers,
+            interactive,
         } => {
             if all_containers {
                 remove_all_stopped_containers(force).await;
             } else if let Some(img) = image {
-                remove_item(img, force).await;
+                remove_item(img, force, interactive).await;
             } else {
                 eprintln!("Error: Either specify an image/container ID or use --all-containers");
                 std::process::exit(1);

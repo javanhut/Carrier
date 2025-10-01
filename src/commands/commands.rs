@@ -1,6 +1,7 @@
 use crate::cli::RegistryImage;
 use crate::runtime::network::{NetworkConfig, NetworkManager};
 use crate::storage::{extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout, StorageDriver};
+use std::io::{self, Write};
 
 fn get_runc_root() -> String {
     if let Ok(home) = std::env::var("HOME") {
@@ -18,7 +19,6 @@ use lazy_static::lazy_static;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -3640,8 +3640,23 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
     }
 }
 
+/// Ask user for confirmation when in interactive mode
+fn confirm_removal(item_type: &str, name: &str) -> bool {
+    print!("Remove {} '{}'? (y/N): ", item_type, name);
+    io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => {
+            let input = input.trim().to_lowercase();
+            input == "y" || input == "yes"
+        }
+        Err(_) => false,
+    }
+}
+
 // Remove command implementation
-pub async fn remove_item(item: String, force: bool) {
+pub async fn remove_item(item: String, force: bool, interactive: bool) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
         Ok(s) => s,
@@ -3680,6 +3695,14 @@ pub async fn remove_item(item: String, force: bool) {
             }
         }
 
+        // Interactive confirmation for container removal
+        if interactive {
+            if !confirm_removal("container", &container_id) {
+                println!("Container removal cancelled.");
+                return;
+            }
+        }
+
         // Unmount overlay if it's mounted
         let merged_dir = container_path.join("merged");
         if merged_dir.exists() {
@@ -3706,6 +3729,14 @@ pub async fn remove_item(item: String, force: bool) {
     // Not a container, try as an image
     // First try to find by image ID (digest)
     if let Ok(Some(image_info)) = find_image_by_id(&storage, &item) {
+        // Interactive confirmation for image removal
+        if interactive {
+            let image_name = format!("{}:{}", image_info.0, image_info.1);
+            if !confirm_removal("image", &image_name) {
+                println!("Image removal cancelled.");
+                return;
+            }
+        }
         remove_image(&storage, &image_info.0, &image_info.1, &image_info.2, force);
         return;
     }
@@ -3719,6 +3750,15 @@ pub async fn remove_item(item: String, force: bool) {
             if !metadata_path.exists() {
                 eprintln!("Image {} not found", item);
                 return;
+            }
+
+            // Interactive confirmation for image removal
+            if interactive {
+                let image_name = format!("{}:{}", parsed_image.image, parsed_image.tag);
+                if !confirm_removal("image", &image_name) {
+                    println!("Image removal cancelled.");
+                    return;
+                }
             }
 
             // Read the actual manifest to get layer info
