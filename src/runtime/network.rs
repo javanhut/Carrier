@@ -51,22 +51,50 @@ pub enum NetworkMode {
 impl Default for NetworkConfig {
     fn default() -> Self {
         // Detect available network backend
-        let network_mode = if Path::new("/usr/bin/pasta").exists() {
-            NetworkMode::Pasta
-        } else if Path::new("/usr/bin/slirp4netns").exists() {
+        // Prefer slirp4netns for better DNS support in rootless mode
+        let network_mode = if Path::new("/usr/bin/slirp4netns").exists() {
             NetworkMode::Slirp4netns
+        } else if Path::new("/usr/bin/pasta").exists() {
+            NetworkMode::Pasta
         } else {
             NetworkMode::None
         };
 
+        // Try to read host's DNS servers from /etc/resolv.conf
+        let dns_servers = Self::read_host_dns_servers()
+            .unwrap_or_else(|_| vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()]);
+
         Self {
             enable_network: true,
             port_mappings: vec![],
-            dns_servers: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
+            dns_servers,
             hostname: "carrier-container".to_string(),
             domainname: "local".to_string(),
             network_mode,
         }
+    }
+}
+
+impl NetworkConfig {
+    /// Read DNS servers from host's /etc/resolv.conf
+    fn read_host_dns_servers() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let resolv_content = fs::read_to_string("/etc/resolv.conf")?;
+        let mut dns_servers = Vec::new();
+
+        for line in resolv_content.lines() {
+            let line = line.trim();
+            if line.starts_with("nameserver") {
+                if let Some(dns) = line.split_whitespace().nth(1) {
+                    dns_servers.push(dns.to_string());
+                }
+            }
+        }
+
+        if dns_servers.is_empty() {
+            return Err("No nameservers found in /etc/resolv.conf".into());
+        }
+
+        Ok(dns_servers)
     }
 }
 
@@ -125,7 +153,9 @@ impl NetworkManager {
         let mut cmd = Command::new("pasta");
 
         // Basic options
-        cmd.arg("--config-net") // Configure network in namespace
+        // Use --config-net to automatically configure networking in the namespace
+        // This copies host IP configuration and sets up routing/forwarding
+        cmd.arg("--config-net")
             .arg("--netns")
             .arg(format!("/proc/{}/ns/net", container_pid.as_raw()));
 
@@ -148,13 +178,13 @@ impl NetworkManager {
         let pasta = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())  // Show errors for debugging
             .spawn()?;
 
         self.network_process = Some(pasta);
 
         // Wait a moment for pasta to initialize
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(500));
 
         Ok(())
     }
@@ -210,29 +240,59 @@ impl NetworkManager {
 
     /// Setup DNS resolution in container
     pub fn setup_dns(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        // Create /etc/resolv.conf
-        let resolv_conf = rootfs.join("etc/resolv.conf");
-
         // Ensure /etc exists
         let etc_dir = rootfs.join("etc");
         if !etc_dir.exists() {
             fs::create_dir_all(&etc_dir)?;
         }
 
-        // Write DNS configuration
-        let mut content = String::new();
+        // Setup /etc/resolv.conf
+        let resolv_conf = rootfs.join("etc/resolv.conf");
 
-        // Add search domain
-        if !self.config.domainname.is_empty() {
-            content.push_str(&format!("search {}\n", self.config.domainname));
+        match self.config.network_mode {
+            NetworkMode::Pasta => {
+                // For pasta mode, copy host's /etc/resolv.conf directly
+                // Pasta shares the host network, so host DNS servers should be accessible
+                if let Ok(host_resolv) = fs::read_to_string("/etc/resolv.conf") {
+                    fs::write(&resolv_conf, host_resolv)?;
+                } else {
+                    // Fallback to configured DNS servers
+                    let mut content = String::new();
+                    if !self.config.domainname.is_empty() {
+                        content.push_str(&format!("search {}\n", self.config.domainname));
+                    }
+                    for dns in &self.config.dns_servers {
+                        content.push_str(&format!("nameserver {}\n", dns));
+                    }
+                    fs::write(&resolv_conf, content)?;
+                }
+            }
+            NetworkMode::Slirp4netns => {
+                // slirp4netns provides a built-in DNS server at 10.0.2.3
+                let mut content = String::new();
+                if !self.config.domainname.is_empty() {
+                    content.push_str(&format!("search {}\n", self.config.domainname));
+                }
+                content.push_str("nameserver 10.0.2.3\n");
+                fs::write(&resolv_conf, content)?;
+            }
+            _ => {
+                // For other network modes, write DNS configuration
+                let mut content = String::new();
+
+                // Add search domain
+                if !self.config.domainname.is_empty() {
+                    content.push_str(&format!("search {}\n", self.config.domainname));
+                }
+
+                // Add nameservers
+                for dns in &self.config.dns_servers {
+                    content.push_str(&format!("nameserver {}\n", dns));
+                }
+
+                fs::write(&resolv_conf, content)?;
+            }
         }
-
-        // Add nameservers
-        for dns in &self.config.dns_servers {
-            content.push_str(&format!("nameserver {}\n", dns));
-        }
-
-        fs::write(&resolv_conf, content)?;
 
         // Create /etc/hosts
         let hosts_file = rootfs.join("etc/hosts");

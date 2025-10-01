@@ -2240,50 +2240,164 @@ async fn run_container_with_storage(
         return Ok(());
     }
 
-    // Foreground mode: runc run (combines create + start)
+    // Foreground mode: use runc create + network setup + exec
+    // This ensures network is properly configured before the container runs
     if is_interactive {
         println!("\nStarting interactive container session...");
         println!("Type 'exit' or press Ctrl+D to exit the container.\n");
     }
 
-    let runc_result = Command::new("runc")
+    // Modify OCI spec to use a pause-like init process
+    // We'll use `sleep infinity` as init, then exec the real command
+    let config_path = bundle_dir.join("config.json");
+    let mut oci_spec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+
+    // Save the original command to exec later
+    let original_command = command_to_run.clone();
+
+    // Replace process args with a long-running process for init
+    oci_spec["process"]["args"] = serde_json::json!(["/bin/sh", "-c", "trap 'exit 0' TERM; sleep infinity & wait $!"]);
+
+    // Disable terminal for the init process (we'll use it for exec)
+    oci_spec["process"]["terminal"] = serde_json::json!(false);
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&oci_spec)?)?;
+
+    // Create the container with the pause process
+    let create_status = Command::new("runc")
         .arg("--root").arg(&runc_root_path)
-        .arg("run")
+        .arg("create")
         .arg("--bundle").arg(&bundle_dir)
         .arg(&container_id)
-        .stdin(if is_interactive { Stdio::inherit() } else { Stdio::null() })
-        .stdout(Stdio::inherit())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .status();
+        .status()?;
 
-    match runc_result {
-        Ok(status) => {
-            let exit_code = status.code().unwrap_or(-1);
+    if !create_status.success() {
+        return Err(format!("Failed to create container with runc").into());
+    }
 
-            // Update container status
-            let metadata = serde_json::json!({
-                "id": container_id,
-                "name": container_name,
-                "image": parsed_image.to_string(),
-                "created": chrono::Utc::now().to_rfc3339(),
-                "rootfs": rootfs.to_string_lossy(),
-                "command": command_to_run,
-                "status": "exited",
-                "exit_code": exit_code,
-                "storage_driver": storage_driver_str,
-                "elevated": elevated
-            });
-            std::fs::write(&container_meta_path, metadata.to_string())?;
+    // Get container PID from runc state
+    let state_output = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("state")
+        .arg(&container_id)
+        .output()?;
 
-            if exit_code == 0 {
-                println!("\nContainer {} exited successfully", short12(&container_id));
-            } else {
-                println!("\nContainer {} exited with code {}", short12(&container_id), exit_code);
+    if state_output.status.success() {
+        if let Ok(state_json) = String::from_utf8(state_output.stdout) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) {
+                if let Some(pid) = state["pid"].as_i64() {
+                    let pid_file = bundle_dir.join("pid");
+                    std::fs::write(&pid_file, pid.to_string())?;
+
+                    // Set up network for rootless containers
+                    if !elevated {
+                        setup_container_network_if_needed(
+                            &bundle_dir,
+                            &rootfs,
+                            nix::unistd::Pid::from_raw(pid as i32),
+                        )?;
+                    }
+                }
             }
         }
+    }
+
+    // Start the container (starts the pause process)
+    let start_status = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("start")
+        .arg(&container_id)
+        .status()?;
+
+    if !start_status.success() {
+        return Err(format!("Failed to start container with runc").into());
+    }
+
+    // Now exec the actual command with inherited stdio
+    let mut exec_cmd = Command::new("runc");
+    exec_cmd
+        .arg("--root").arg(&runc_root_path)
+        .arg("exec");
+
+    // Only allocate TTY if stdin is actually a terminal
+    use std::io::IsTerminal;
+    if is_interactive && std::io::stdin().is_terminal() {
+        exec_cmd.arg("-t");  // Allocate pseudo-TTY
+    }
+
+    exec_cmd.arg(&container_id);
+
+    // Add the command arguments
+    for arg in &original_command {
+        exec_cmd.arg(arg);
+    }
+
+    // Set stdio
+    exec_cmd
+        .stdin(if is_interactive { Stdio::inherit() } else { Stdio::null() })
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let exec_result = exec_cmd.status();
+
+    // Get exit code from exec
+    let exit_code = match exec_result {
+        Ok(status) => status.code().unwrap_or(-1),
         Err(e) => {
-            return Err(format!("Failed to run container with runc: {}", e).into());
+            let _ = Command::new("runc")
+                .arg("--root").arg(&runc_root_path)
+                .arg("kill")
+                .arg(&container_id)
+                .arg("SIGKILL")
+                .status();
+            let _ = Command::new("runc")
+                .arg("--root").arg(&runc_root_path)
+                .arg("delete")
+                .arg(&container_id)
+                .status();
+            return Err(format!("Failed to exec in container: {}", e).into());
         }
+    };
+
+    // Kill and delete the container
+    let _ = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("kill")
+        .arg(&container_id)
+        .arg("SIGTERM")
+        .status();
+
+    // Give it a moment to clean up
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let _ = Command::new("runc")
+        .arg("--root").arg(&runc_root_path)
+        .arg("delete")
+        .arg(&container_id)
+        .status();
+
+    // Update container status
+    let metadata = serde_json::json!({
+        "id": container_id,
+        "name": container_name,
+        "image": parsed_image.to_string(),
+        "created": chrono::Utc::now().to_rfc3339(),
+        "rootfs": rootfs.to_string_lossy(),
+        "command": original_command,
+        "status": "exited",
+        "exit_code": exit_code,
+        "storage_driver": storage_driver_str,
+        "elevated": elevated
+    });
+    std::fs::write(&container_meta_path, metadata.to_string())?;
+
+    if exit_code == 0 {
+        println!("\nContainer {} exited successfully", short12(&container_id));
+    } else {
+        println!("\nContainer {} exited with code {}", short12(&container_id), exit_code);
     }
 
     Ok(())
