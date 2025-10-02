@@ -350,39 +350,17 @@ impl ContainerStorage {
             }
         }
 
-        self.fix_ownership_for_rootless(merged)?;
+        // Note: We deliberately do NOT call fix_ownership_for_rootless here.
+        // The files should keep their original ownership from the image layers.
+        // With proper user namespace UID/GID mappings configured in the OCI config,
+        // the kernel will handle the mapping correctly:
+        // - Files owned by the current user on the host appear as root in the container
+        // - Files owned by subuid range appear as other users in the container
+        // This allows package managers to properly chown/chgrp files during installation.
+
         Ok(())
     }
 
-    fn fix_ownership_for_rootless(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let current_uid = nix::unistd::getuid();
-        let current_gid = nix::unistd::getgid();
-
-        self.chown_recursive(rootfs, current_uid, current_gid)?;
-        Ok(())
-    }
-
-    fn chown_recursive(
-        &self,
-        path: &Path,
-        uid: nix::unistd::Uid,
-        gid: nix::unistd::Gid,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use nix::unistd::chown;
-        let _ = chown(path, Some(uid), Some(gid));
-
-        if path.is_dir() {
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if !entry_path.is_symlink() {
-                        self.chown_recursive(&entry_path, uid, gid)?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 
     fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::copy;
