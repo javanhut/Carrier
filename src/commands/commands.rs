@@ -2621,20 +2621,53 @@ fn setup_container_network_if_needed(
     // Set up basic DNS configuration for container
     setup_dns_config(rootfs)?;
 
-    // Network namespacing is handled by runc based on OCI spec configuration
-
-    // Store network manager info for cleanup later
+    // Start slirp4netns to provide userspace networking
+    // Try slirp4netns first, then fall back to pasta if available
     let network_pid_file = container_dir.join("network.pid");
-    if let Ok(output) = Command::new("pgrep")
-        .args(&["-f", &format!("(pasta|slirp4netns).*{}", pid_raw)])
+
+    // Check if slirp4netns is available
+    let slirp_available = Command::new("which")
+        .arg("slirp4netns")
         .output()
-    {
-        if output.status.success() {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_pid) = pids.lines().next() {
-                std::fs::write(&network_pid_file, first_pid)?;
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if slirp_available {
+        println!("Starting slirp4netns for network connectivity...");
+
+        // Start slirp4netns in the background
+        let slirp_child = Command::new("slirp4netns")
+            .arg("--configure")
+            .arg("--mtu=65520")
+            .arg("--disable-host-loopback")
+            .arg(pid_raw.to_string())
+            .arg("tap0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        match slirp_child {
+            Ok(child) => {
+                // Store the slirp4netns PID for cleanup
+                let slirp_pid = child.id();
+                std::fs::write(&network_pid_file, slirp_pid.to_string())?;
+                println!("slirp4netns started with PID {}", slirp_pid);
+
+                // Give slirp4netns a moment to set up
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to start slirp4netns: {}", e);
+                eprintln!("Container will have limited network connectivity");
             }
         }
+    } else {
+        eprintln!("Warning: slirp4netns not found. Install it for network connectivity:");
+        eprintln!("  sudo apt install slirp4netns  # Debian/Ubuntu");
+        eprintln!("  sudo dnf install slirp4netns  # Fedora");
+        eprintln!("  sudo pacman -S slirp4netns    # Arch");
+        eprintln!("Container will have limited network connectivity");
     }
 
     println!("Network setup complete");
