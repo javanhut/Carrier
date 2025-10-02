@@ -136,12 +136,18 @@ impl ContainerStorage {
         let mut mounted = false;
         let mut actual_driver = chosen.clone();
 
+        // Priority order: fuse-overlayfs -> native overlay -> vfs
         if matches!(chosen, StorageDriver::OverlayFuse) {
             match self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
-                Ok(_) => mounted = true,
+                Ok(_) => {
+                    mounted = true;
+                    println!("Using fuse-overlayfs storage driver");
+                }
                 Err(e) => {
                     eprintln!("fuse-overlayfs mount failed: {}", e);
-                    if matches!(self.forced_driver, Some(StorageDriver::OverlayNative)) {
+                    // Try native overlay as fallback if not forced to use fuse
+                    if !matches!(self.forced_driver, Some(StorageDriver::OverlayFuse)) {
+                        eprintln!("Attempting native overlay as fallback...");
                         if let Ok(_) = self.mount_native_overlayfs(
                             &lower_dirs_str,
                             &upper_dir,
@@ -150,35 +156,45 @@ impl ContainerStorage {
                         ) {
                             mounted = true;
                             actual_driver = StorageDriver::OverlayNative;
+                            println!("Using native overlay storage driver");
                         }
                     }
                 }
             }
         } else if matches!(chosen, StorageDriver::OverlayNative) {
             match self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
-                Ok(_) => mounted = true,
+                Ok(_) => {
+                    mounted = true;
+                    println!("Using native overlay storage driver");
+                }
                 Err(e) => {
                     eprintln!("native overlay mount failed: {}", e);
-                    if let Ok(_) = self.mount_fuse_overlayfs(
-                        &lower_dirs_str,
-                        &upper_dir,
-                        &work_dir,
-                        &merged_dir,
-                    ) {
-                        mounted = true;
-                        actual_driver = StorageDriver::OverlayFuse;
+                    // Try fuse-overlayfs as fallback if not forced to use native
+                    if !matches!(self.forced_driver, Some(StorageDriver::OverlayNative)) {
+                        eprintln!("Attempting fuse-overlayfs as fallback...");
+                        if let Ok(_) = self.mount_fuse_overlayfs(
+                            &lower_dirs_str,
+                            &upper_dir,
+                            &work_dir,
+                            &merged_dir,
+                        ) {
+                            mounted = true;
+                            actual_driver = StorageDriver::OverlayFuse;
+                            println!("Using fuse-overlayfs storage driver");
+                        }
                     }
                 }
             }
         }
 
-        if !mounted && !matches!(chosen, StorageDriver::Vfs) {
-            eprintln!("All overlay mount attempts failed; using vfs fallback");
+        // Final fallback to VFS if nothing else worked
+        if !mounted {
+            if !matches!(chosen, StorageDriver::Vfs) {
+                eprintln!("All overlay mount attempts failed; using VFS fallback");
+            }
             self.build_vfs_root_optimized(&lower_dirs, &merged_dir)?;
             actual_driver = StorageDriver::Vfs;
-        } else if !mounted {
-            self.build_vfs_root_optimized(&lower_dirs, &merged_dir)?;
-            actual_driver = StorageDriver::Vfs;
+            println!("Using VFS storage driver");
         }
 
         self.last_driver = Some(actual_driver);
@@ -478,6 +494,71 @@ impl ContainerStorage {
     }
 }
 
+/// Check if a command exists in the system
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Attempt to install fuse3 and fuse-overlayfs packages
+fn try_install_fuse3() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Attempting to install fuse3 and fuse-overlayfs...");
+
+    // Detect package manager and install
+    if Path::new("/usr/bin/apt-get").exists() || Path::new("/usr/bin/apt").exists() {
+        // Debian/Ubuntu
+        let status = Command::new("sudo")
+            .args(&["-n", "apt-get", "update", "-qq"])
+            .status();
+
+        if status.is_ok() && status.unwrap().success() {
+            let install = Command::new("sudo")
+                .args(&["-n", "apt-get", "install", "-y", "fuse3", "fuse-overlayfs"])
+                .status();
+
+            if install.is_ok() && install.unwrap().success() {
+                println!("Successfully installed fuse3 and fuse-overlayfs");
+                return Ok(());
+            }
+        }
+    } else if Path::new("/usr/bin/dnf").exists() {
+        // Fedora/RHEL
+        let install = Command::new("sudo")
+            .args(&["-n", "dnf", "install", "-y", "fuse3", "fuse-overlayfs"])
+            .status();
+
+        if install.is_ok() && install.unwrap().success() {
+            println!("Successfully installed fuse3 and fuse-overlayfs");
+            return Ok(());
+        }
+    } else if Path::new("/usr/bin/pacman").exists() {
+        // Arch Linux
+        let install = Command::new("sudo")
+            .args(&["-n", "pacman", "-S", "--noconfirm", "fuse3", "fuse-overlayfs"])
+            .status();
+
+        if install.is_ok() && install.unwrap().success() {
+            println!("Successfully installed fuse3 and fuse-overlayfs");
+            return Ok(());
+        }
+    } else if Path::new("/usr/bin/zypper").exists() {
+        // openSUSE
+        let install = Command::new("sudo")
+            .args(&["-n", "zypper", "install", "-y", "fuse3", "fuse-overlayfs"])
+            .status();
+
+        if install.is_ok() && install.unwrap().success() {
+            println!("Successfully installed fuse3 and fuse-overlayfs");
+            return Ok(());
+        }
+    }
+
+    Err("Unable to install fuse3 automatically. Please install manually.".into())
+}
+
 // Preflight rootless environment checks with actionable hints
 pub fn preflight_rootless_checks() {
     // XDG_RUNTIME_DIR with auto-detection
@@ -491,21 +572,57 @@ pub fn preflight_rootless_checks() {
         Err(e) => eprintln!("Warning: Could not determine runtime directory: {}", e),
     }
 
-    // fusermount3 SUID
+    // Check for fuse-overlayfs first
+    if !command_exists("fuse-overlayfs") {
+        println!("fuse-overlayfs not found, attempting to install...");
+        if let Err(e) = try_install_fuse3() {
+            eprintln!("Warning: {}", e);
+            eprintln!("Will fall back to VFS storage driver if needed.");
+        }
+    }
+
+    // fusermount3 SUID check
     if let Ok(meta) = fs::metadata("/usr/bin/fusermount3") {
         use std::os::unix::fs::MetadataExt;
         let mode = meta.mode();
         if mode & 0o4000 == 0 {
             eprintln!(
-                "Warning: fusermount3 is not setuid. Rootless FUSE may fail. Try: sudo chmod u+s /usr/bin/fusermount3"
+                "Warning: fusermount3 is not setuid. Rootless FUSE may fail."
             );
+            eprintln!("Attempting to set setuid bit...");
+
+            let status = Command::new("sudo")
+                .args(&["-n", "chmod", "u+s", "/usr/bin/fusermount3"])
+                .status();
+
+            if status.is_ok() && status.unwrap().success() {
+                println!("Successfully set setuid bit on fusermount3");
+            } else {
+                eprintln!("Try manually: sudo chmod u+s /usr/bin/fusermount3");
+                eprintln!("Will fall back to VFS storage driver if needed.");
+            }
         }
-    } else {
-        eprintln!("Warning: fusermount3 not found. Install fuse3 package.");
+    } else if !command_exists("fusermount3") && !command_exists("fuse-overlayfs") {
+        eprintln!("Warning: fusermount3 not found.");
+        if let Err(e) = try_install_fuse3() {
+            eprintln!("Warning: {}", e);
+            eprintln!("Will fall back to VFS storage driver.");
+        }
     }
 
     // /dev/fuse present
     if !Path::new("/dev/fuse").exists() {
-        eprintln!("Warning: /dev/fuse not present. Load FUSE module: sudo modprobe fuse");
+        eprintln!("Warning: /dev/fuse not present. Attempting to load FUSE module...");
+
+        let status = Command::new("sudo")
+            .args(&["-n", "modprobe", "fuse"])
+            .status();
+
+        if status.is_ok() && status.unwrap().success() {
+            println!("Successfully loaded FUSE module");
+        } else {
+            eprintln!("Try manually: sudo modprobe fuse");
+            eprintln!("Will fall back to VFS storage driver if needed.");
+        }
     }
 }

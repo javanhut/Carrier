@@ -1955,7 +1955,7 @@ async fn run_container_with_storage(
     // Preflight checks for rootless operation
     crate::storage::preflight_rootless_checks();
     // Allow forcing storage driver via CLI
-    let mut container_storage = if let Some(drv) = storage_driver {
+    let mut container_storage = if let Some(ref drv) = storage_driver {
         ContainerStorage::new_with_driver(Some(drv))?
     } else {
         ContainerStorage::new()?
@@ -2416,6 +2416,68 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
+/// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid
+fn read_subid_mappings(file_path: &str, username: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let content = fs::read_to_string(file_path)?;
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 && parts[0] == username {
+            let start: u32 = parts[1].parse()?;
+            let count: u32 = parts[2].parse()?;
+            return Ok((start, count));
+        }
+    }
+
+    Err(format!("No mapping found for user {} in {}", username, file_path).into())
+}
+
+/// Get UID/GID mappings for rootless containers
+fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    use std::env;
+
+    // Get username for looking up subuid/subgid
+    let username = env::var("USER").unwrap_or_else(|_| {
+        // Fallback: try to get username from /etc/passwd
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| uid.to_string())
+    });
+
+    // Try to read subuid/subgid mappings
+    let uid_mappings = if let Ok((subuid_start, subuid_count)) = read_subid_mappings("/etc/subuid", &username) {
+        // Map container UID 0 to current user, then map 1-N to subuid range
+        vec![
+            serde_json::json!({"containerID": 0, "hostID": uid, "size": 1}),
+            serde_json::json!({"containerID": 1, "hostID": subuid_start, "size": subuid_count}),
+        ]
+    } else {
+        // Fallback: just map container root to current user
+        eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
+        eprintln!("Consider adding an entry to /etc/subuid: {}:100000:65536", username);
+        vec![serde_json::json!({"containerID": 0, "hostID": uid, "size": 1})]
+    };
+
+    let gid_mappings = if let Ok((subgid_start, subgid_count)) = read_subid_mappings("/etc/subgid", &username) {
+        // Map container GID 0 to current group, then map 1-N to subgid range
+        vec![
+            serde_json::json!({"containerID": 0, "hostID": gid, "size": 1}),
+            serde_json::json!({"containerID": 1, "hostID": subgid_start, "size": subgid_count}),
+        ]
+    } else {
+        // Fallback: just map container root to current group
+        eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
+        eprintln!("Consider adding an entry to /etc/subgid: {}:100000:65536", username);
+        vec![serde_json::json!({"containerID": 0, "hostID": gid, "size": 1})]
+    };
+
+    (uid_mappings, gid_mappings)
+}
+
 fn generate_oci_config(
     config_path: &Path,
     container_id: &str,
@@ -2427,6 +2489,9 @@ fn generate_oci_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
+
+    // Get proper UID/GID mappings from subuid/subgid
+    let (uid_mappings, gid_mappings) = get_id_mappings(uid, gid);
 
     let mut namespaces = vec![
         serde_json::json!({"type": "pid"}),
@@ -2444,7 +2509,7 @@ fn generate_oci_config(
         "ociVersion": "1.0.0",
         "process": {
             "terminal": true,
-            "user": {"uid": uid, "gid": gid},
+            "user": {"uid": 0, "gid": 0},
             "args": command,
             "env": env,
             "cwd": working_dir,
@@ -2480,7 +2545,7 @@ fn generate_oci_config(
                 "destination": "/dev/pts",
                 "type": "devpts",
                 "source": "devpts",
-                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]
+                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]
             },
             {
                 "destination": "/dev/shm",
@@ -2503,8 +2568,8 @@ fn generate_oci_config(
         ],
         "linux": {
             "namespaces": namespaces,
-            "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
-            "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}]
+            "uidMappings": uid_mappings,
+            "gidMappings": gid_mappings
         }
     });
 

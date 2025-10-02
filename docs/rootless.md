@@ -180,7 +180,7 @@ If overlay mounting fails:
 
 2. Force VFS driver if needed:
    ```bash
-   carrier run --storage-driver vfs alpine:latest
+   carrier --storage-driver vfs run alpine:latest
    ```
 
 ### Container Not Starting

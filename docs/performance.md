@@ -30,7 +30,7 @@ Carrier supports three storage drivers with different performance characteristic
 **Requirements**: `fuse-overlayfs` package installed
 
 ```bash
-carrier run --storage-driver overlay-fuse alpine:latest
+carrier --storage-driver overlay-fuse run alpine:latest
 ```
 
 **Pros**:
@@ -49,7 +49,7 @@ carrier run --storage-driver overlay-fuse alpine:latest
 **Requirements**: Kernel 5.11+ with unprivileged overlay support
 
 ```bash
-carrier run --storage-driver overlay-native alpine:latest
+carrier --storage-driver overlay-native run alpine:latest
 ```
 
 **Pros**:
@@ -68,7 +68,7 @@ carrier run --storage-driver overlay-native alpine:latest
 **Requirements**: None
 
 ```bash
-carrier run --storage-driver vfs alpine:latest
+carrier --storage-driver vfs run alpine:latest
 ```
 
 **Pros**:
@@ -184,7 +184,7 @@ native overlay mount failed: EPERM: Operation not permitted
 
 **Solution**: Use fuse-overlayfs (default) or force VFS:
 ```bash
-carrier run --storage-driver overlay-fuse alpine:latest
+carrier --storage-driver overlay-fuse run alpine:latest
 ```
 
 ### Issue: Slow image pulls

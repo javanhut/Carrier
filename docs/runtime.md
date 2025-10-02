@@ -2,7 +2,7 @@
 
 ## Overview
 
-Carrier features a custom, lightweight, secure container runtime designed specifically for rootless operation. Unlike traditional container runtimes that depend on external tools like runc or crun, Carrier's runtime is fully integrated and optimized for performance and security.
+Carrier uses **runc** as its OCI-compliant container runtime for managing container execution and permissions. The runtime is designed specifically for rootless operation with comprehensive security features and automatic dependency management.
 
 ## Key Features
 
@@ -242,19 +242,30 @@ carrier rm abc123
 carrier rm -c
 ```
 
-## Advantages Over Traditional Runtimes
+## Runtime Components
 
-### vs Podman/runc
-- **No External Dependencies**: No runc/crun binary required
-- **Tighter Integration**: Direct integration with Carrier's storage
-- **Faster Startup**: No OCI spec generation/parsing overhead
-- **Simpler Architecture**: No daemon, no complex state management
+### runc Integration
+Carrier uses **runc** for container lifecycle management:
+- **Container Creation**: OCI-compliant container initialization via `runc create`
+- **Container Execution**: Process execution with `runc exec`
+- **State Management**: Container state tracking via `runc state`
+- **Security**: Full namespace isolation and capability management
+- **Permissions**: User namespace mapping for rootless operation
+
+### Storage Driver Integration
+The runtime works seamlessly with multiple storage drivers:
+- **FUSE-OverlayFS**: Default choice with automatic installation
+- **Native Overlay**: Fallback for kernel-supported overlay
+- **VFS**: Final fallback ensuring compatibility everywhere
+
+## Advantages Over Traditional Setups
 
 ### vs Docker
 - **Fully Rootless**: No root daemon required
 - **No Daemon**: Direct execution without background service
 - **Lighter Weight**: Minimal resource overhead
 - **Better Security**: Rootless by default with strong isolation
+- **Automatic Setup**: Dependencies installed and configured automatically
 
 ## Requirements
 
@@ -262,8 +273,11 @@ carrier rm -c
 - Linux kernel 4.18+ (5.14+ recommended)
 - User namespaces enabled
 - Cgroups v2 mounted at `/sys/fs/cgroup`
+- `runc` installed (automatically checked)
 - `newuidmap` and `newgidmap` installed (uidmap package)
 - `slirp4netns` for networking
+- `fuse-overlayfs` (automatically installed if possible)
+- `fuse3` packages (automatically installed if possible)
 
 ### Kernel Configuration
 Required kernel features:

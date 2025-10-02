@@ -23,8 +23,9 @@ carrier sh <container-id>
 carrier stop <container-id>
 carrier rm -c  # Remove all stopped containers
 
-# Force specific storage driver for best performance
-carrier run --storage-driver overlay-fuse alpine
+# Force specific storage driver (global flag, before subcommand)
+carrier --storage-driver overlay-fuse run alpine
+carrier --storage-driver vfs run debian
 ```
 
 ## Commands
@@ -62,13 +63,17 @@ Run a container from a local or remote image.
 
 **Usage:**
 ```bash
-carrier run [OPTIONS] <image|image-id> [COMMAND...]
+carrier [GLOBAL-OPTIONS] run [OPTIONS] <image|image-id> [COMMAND...]
 ```
 
-**Options:**
+**Global Options:**
+- `--storage-driver <DRIVER>`: Force storage driver: overlay-fuse, overlay-native, or vfs
+
+**Run Options:**
 - `-d, --detach`: Run container in detached mode (background)
 - `--name <NAME>`: Assign a custom name to the container
 - `--elevated`: Run with elevated privileges (no user namespace, may require sudo)
+- `--platform <PLATFORM>`: Target platform (e.g., linux/amd64, linux/arm64)
 
 **Examples:**
 ```bash
@@ -95,6 +100,11 @@ carrier run --name my-web-server nginx
 sudo carrier run --elevated ubuntu
 sudo carrier run -d --elevated --name ubuntu-dev ubuntu sleep infinity
 carrier run --name dev-db -d postgres:latest
+
+# Force specific storage driver (global flag)
+carrier --storage-driver overlay-fuse run alpine
+carrier --storage-driver vfs run debian
+carrier --storage-driver overlay-native run ubuntu:22.04
 
 # Run with custom command (future feature)
 carrier run alpine echo "Hello World"
