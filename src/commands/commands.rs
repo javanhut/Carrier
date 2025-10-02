@@ -1967,7 +1967,7 @@ async fn run_container_with_storage(
         crate::storage::StorageDriver::Vfs => "vfs",
     };
 
-    println!("Container filesystem ready at: {}", rootfs.display());
+    // Filesystem ready (silent for performance)
 
     // Set up essential directories and files
     setup_container_essential_files(&rootfs)?;
@@ -2058,9 +2058,8 @@ async fn run_container_with_storage(
     let final_command = command;
     let final_working_dir = working_dir;
 
-    // Store container metadata
+    // Parallel setup: metadata + directories
     let container_meta_path = storage.container_path(&container_id).join("metadata.json");
-    // Generate container name - use custom name if provided, otherwise generate default name
     let container_name = match &name {
         Some(custom_name) => custom_name.clone(),
         None => format!("car_{}", &container_id[..6]),
@@ -2078,10 +2077,40 @@ async fn run_container_with_storage(
         "elevated": elevated
     });
 
-    if let Some(parent) = container_meta_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&container_meta_path, metadata.to_string())?;
+    // Spawn parallel tasks for metadata and directory creation
+    let metadata_str = metadata.to_string();
+    let meta_path = container_meta_path.clone();
+    let bundle_dir = storage.container_path(&container_id);
+    let bundle_dir_clone = bundle_dir.clone();
+
+    let runc_root_path = if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.local/share/carrier/runc", home)
+    } else {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+        format!("{}/carrier/runc", runtime_dir)
+    };
+    let runc_root_clone = runc_root_path.clone();
+
+    // Parallel execution
+    let meta_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&meta_path, metadata_str).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    let dirs_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        std::fs::create_dir_all(&bundle_dir_clone).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&runc_root_clone).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    // Wait for both to complete
+    let (meta_result, dirs_result) = tokio::join!(meta_task, dirs_task);
+    meta_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    dirs_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     // Execute in container environment with proper isolation
     if detach {
@@ -2090,9 +2119,11 @@ async fn run_container_with_storage(
             short12(&container_id)
         );
     } else {
-        println!("\nRunning container {}...", container_id);
+        if !detach {
+            println!("\nRunning container {}...", container_id);
+        }
     }
-    println!("Command: {:?}", &command_to_run);
+    // Command prepared (silent for performance)
 
     use std::process::Stdio;
 
@@ -2113,18 +2144,10 @@ async fn run_container_with_storage(
         && !has_command_flag;
 
     // Build the command path
-    let cmd_in_container = &command_to_run[0];
-
-    if !detach {
-        println!("Starting container with command: {}", cmd_in_container);
-    }
+    let _cmd_in_container = &command_to_run[0];
 
     // Use runc for container execution
     use std::process::Command;
-
-    // Create bundle directory (runc requires bundle structure)
-    let bundle_dir = storage.container_path(&container_id);
-    std::fs::create_dir_all(&bundle_dir)?;
 
     // Convert env to OCI format (KEY=VALUE strings)
     let env_strings: Vec<String> = final_env
@@ -2132,28 +2155,24 @@ async fn run_container_with_storage(
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
 
-    // Generate OCI spec using our custom function
+    // Generate OCI spec in parallel (already have bundle_dir from above)
     let config_path = bundle_dir.join("config.json");
-    generate_oci_config(
-        &config_path,
-        &container_id,
-        rootfs.clone(),
-        command_to_run.clone(),
-        env_strings,
-        final_working_dir.clone(),
-        !elevated, // add network namespace if not elevated
-    )?;
+    let container_id_clone = container_id.clone();
+    let rootfs_clone = rootfs.clone();
+    let cmd_clone = command_to_run.clone();
+    let wd_clone = final_working_dir.clone();
 
-    // Determine runc root directory (for state storage) - use home directory to avoid tmpfs space issues
-    let runc_root = if let Ok(home) = std::env::var("HOME") {
-        format!("{}/.local/share/carrier/runc", home)
-    } else {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
-        format!("{}/carrier/runc", runtime_dir)
-    };
-    let runc_root_path = runc_root;
-    std::fs::create_dir_all(&runc_root_path)?;
+    tokio::task::spawn_blocking(move || {
+        generate_oci_config(
+            &config_path,
+            &container_id_clone,
+            rootfs_clone,
+            cmd_clone,
+            env_strings,
+            wd_clone,
+            !elevated,
+        ).map_err(|e| e.to_string())
+    }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     if detach {
         // Detached mode: runc create + start
@@ -2416,7 +2435,11 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
-/// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid
+/// Cache for subuid/subgid mappings to avoid repeated file I/O
+use std::sync::OnceLock;
+static SUBID_CACHE: OnceLock<(Option<(u32, u32)>, Option<(u32, u32)>)> = OnceLock::new();
+
+/// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid (with caching)
 fn read_subid_mappings(file_path: &str, username: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
     use std::fs;
 
@@ -2434,44 +2457,54 @@ fn read_subid_mappings(file_path: &str, username: &str) -> Result<(u32, u32), Bo
     Err(format!("No mapping found for user {} in {}", username, file_path).into())
 }
 
-/// Get UID/GID mappings for rootless containers
+/// Get UID/GID mappings for rootless containers (with caching)
 fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
     use std::env;
 
-    // Get username for looking up subuid/subgid
-    let username = env::var("USER").unwrap_or_else(|_| {
-        // Fallback: try to get username from /etc/passwd
-        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-            .ok()
-            .flatten()
-            .map(|u| u.name)
-            .unwrap_or_else(|| uid.to_string())
+    // Initialize cache if needed
+    let (cached_subuid, cached_subgid) = SUBID_CACHE.get_or_init(|| {
+        // Get username for looking up subuid/subgid
+        let username = env::var("USER").unwrap_or_else(|_| {
+            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_else(|| uid.to_string())
+        });
+
+        let subuid = read_subid_mappings("/etc/subuid", &username).ok();
+        let subgid = read_subid_mappings("/etc/subgid", &username).ok();
+
+        // Only print warnings once when cache is initialized
+        if subuid.is_none() {
+            eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
+            eprintln!("Consider adding an entry to /etc/subuid: {}:100000:65536", username);
+        }
+        if subgid.is_none() {
+            eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
+            eprintln!("Consider adding an entry to /etc/subgid: {}:100000:65536", username);
+        }
+
+        (subuid, subgid)
     });
 
-    // Try to read subuid/subgid mappings
-    let uid_mappings = if let Ok((subuid_start, subuid_count)) = read_subid_mappings("/etc/subuid", &username) {
-        // Map container UID 0 to current user, then map 1-N to subuid range
+    // Build UID mappings from cache
+    let uid_mappings = if let Some((subuid_start, subuid_count)) = cached_subuid {
         vec![
             serde_json::json!({"containerID": 0, "hostID": uid, "size": 1}),
             serde_json::json!({"containerID": 1, "hostID": subuid_start, "size": subuid_count}),
         ]
     } else {
-        // Fallback: just map container root to current user
-        eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
-        eprintln!("Consider adding an entry to /etc/subuid: {}:100000:65536", username);
         vec![serde_json::json!({"containerID": 0, "hostID": uid, "size": 1})]
     };
 
-    let gid_mappings = if let Ok((subgid_start, subgid_count)) = read_subid_mappings("/etc/subgid", &username) {
-        // Map container GID 0 to current group, then map 1-N to subgid range
+    // Build GID mappings from cache
+    let gid_mappings = if let Some((subgid_start, subgid_count)) = cached_subgid {
         vec![
             serde_json::json!({"containerID": 0, "hostID": gid, "size": 1}),
             serde_json::json!({"containerID": 1, "hostID": subgid_start, "size": subgid_count}),
         ]
     } else {
-        // Fallback: just map container root to current group
-        eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
-        eprintln!("Consider adding an entry to /etc/subgid: {}:100000:65536", username);
         vec![serde_json::json!({"containerID": 0, "hostID": gid, "size": 1})]
     };
 
@@ -2577,18 +2610,6 @@ fn generate_oci_config(
     Ok(())
 }
 
-/// Set up basic DNS configuration for container
-fn setup_dns_config(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let etc_dir = rootfs.join("etc");
-    std::fs::create_dir_all(&etc_dir)?;
-
-    // Create resolv.conf with basic DNS settings
-    let resolv_conf = etc_dir.join("resolv.conf");
-    std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
-
-    println!("DNS configuration set up at {}", resolv_conf.display());
-    Ok(())
-}
 
 /// Set up network for an existing container if not already configured
 fn setup_container_network_if_needed(
@@ -2599,27 +2620,22 @@ fn setup_container_network_if_needed(
     // Check if network is already set up by looking for network helper processes
     let pid_raw = container_pid.as_raw();
 
-    // Check for existing pasta or slirp4netns processes for this container
-    let check_pasta = Command::new("pgrep")
-        .args(&["-f", &format!("pasta.*{}", pid_raw)])
-        .output();
-
-    let check_slirp = Command::new("pgrep")
-        .args(&["-f", &format!("slirp4netns.*{}", pid_raw)])
-        .output();
-
-    let network_exists = (check_pasta.is_ok() && check_pasta.unwrap().status.success())
-        || (check_slirp.is_ok() && check_slirp.unwrap().status.success());
+    // Single pgrep call to check for both pasta and slirp4netns
+    let network_exists = Command::new("pgrep")
+        .args(&["-f", &format!("(pasta|slirp4netns).*{}", pid_raw)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
     if network_exists {
-        println!("Network already configured for container");
         return Ok(());
     }
 
-    println!("Setting up network for container...");
-
-    // Set up basic DNS configuration for container
-    setup_dns_config(rootfs)?;
+    // Set up basic DNS configuration for container (inline for speed)
+    let etc_dir = rootfs.join("etc");
+    std::fs::create_dir_all(&etc_dir)?;
+    let resolv_conf = etc_dir.join("resolv.conf");
+    std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
 
     // Start slirp4netns to provide userspace networking
     // Try slirp4netns first, then fall back to pasta if available
@@ -2633,9 +2649,7 @@ fn setup_container_network_if_needed(
         .unwrap_or(false);
 
     if slirp_available {
-        println!("Starting slirp4netns for network connectivity...");
-
-        // Start slirp4netns in the background
+        // Start slirp4netns in the background (async, no wait)
         let slirp_child = Command::new("slirp4netns")
             .arg("--configure")
             .arg("--mtu=65520")
@@ -2651,26 +2665,15 @@ fn setup_container_network_if_needed(
             Ok(child) => {
                 // Store the slirp4netns PID for cleanup
                 let slirp_pid = child.id();
-                std::fs::write(&network_pid_file, slirp_pid.to_string())?;
-                println!("slirp4netns started with PID {}", slirp_pid);
-
-                // Give slirp4netns a moment to set up
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
+                // Note: Removed sleep - slirp4netns will configure asynchronously
+                // The container process can start immediately
             }
-            Err(e) => {
-                eprintln!("Warning: Failed to start slirp4netns: {}", e);
-                eprintln!("Container will have limited network connectivity");
+            Err(_) => {
+                // Silent failure - network will be limited but container can still run
             }
         }
-    } else {
-        eprintln!("Warning: slirp4netns not found. Install it for network connectivity:");
-        eprintln!("  sudo apt install slirp4netns  # Debian/Ubuntu");
-        eprintln!("  sudo dnf install slirp4netns  # Fedora");
-        eprintln!("  sudo pacman -S slirp4netns    # Arch");
-        eprintln!("Container will have limited network connectivity");
     }
-
-    println!("Network setup complete");
 
     Ok(())
 }
