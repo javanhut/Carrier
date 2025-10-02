@@ -1,6 +1,5 @@
-use nix::errno::Errno;
-use nix::mount::{mount, umount, MsFlags};
-use nix::sys::stat::{major, makedev, minor, mknod, Mode, SFlag};
+use nix::mount::{MsFlags, mount};
+use nix::sys::stat::{Mode, SFlag, major, makedev, minor, mknod};
 use nix::unistd::mkfifo;
 use std::env;
 use std::fs;
@@ -136,14 +135,19 @@ impl ContainerStorage {
 
         let mut mounted = false;
         let mut actual_driver = chosen.clone();
-        
+
         if matches!(chosen, StorageDriver::OverlayFuse) {
             match self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
                 Ok(_) => mounted = true,
                 Err(e) => {
                     eprintln!("fuse-overlayfs mount failed: {}", e);
                     if matches!(self.forced_driver, Some(StorageDriver::OverlayNative)) {
-                        if let Ok(_) = self.mount_native_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                        if let Ok(_) = self.mount_native_overlayfs(
+                            &lower_dirs_str,
+                            &upper_dir,
+                            &work_dir,
+                            &merged_dir,
+                        ) {
                             mounted = true;
                             actual_driver = StorageDriver::OverlayNative;
                         }
@@ -155,7 +159,12 @@ impl ContainerStorage {
                 Ok(_) => mounted = true,
                 Err(e) => {
                     eprintln!("native overlay mount failed: {}", e);
-                    if let Ok(_) = self.mount_fuse_overlayfs(&lower_dirs_str, &upper_dir, &work_dir, &merged_dir) {
+                    if let Ok(_) = self.mount_fuse_overlayfs(
+                        &lower_dirs_str,
+                        &upper_dir,
+                        &work_dir,
+                        &merged_dir,
+                    ) {
                         mounted = true;
                         actual_driver = StorageDriver::OverlayFuse;
                     }
@@ -180,7 +189,7 @@ impl ContainerStorage {
         if !path.exists() {
             return false;
         }
-        
+
         if let Ok(entries) = fs::read_dir(path) {
             if entries.count() > 0 {
                 return true;
@@ -246,25 +255,6 @@ impl ContainerStorage {
         Ok(())
     }
 
-    pub fn unmount_container(&self, container_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let merged_dir = self
-            .runtime_dir
-            .join("containers")
-            .join(container_id)
-            .join("merged");
-
-        if self.use_fuse_overlayfs {
-            Command::new("fusermount")
-                .arg("-u")
-                .arg(&merged_dir)
-                .status()?;
-        } else {
-            umount(&merged_dir)?;
-        }
-
-        Ok(())
-    }
-
     pub fn last_driver(&self) -> StorageDriver {
         self.last_driver
             .clone()
@@ -313,36 +303,6 @@ fn parse_kernel_version(release: &str) -> Option<(u32, u32, u32)> {
     None
 }
 
-// Example usage for complete rootless container creation
-pub fn create_rootless_container(
-    _image_name: &str,
-    container_id: &str,
-    layer_paths: Vec<PathBuf>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut storage = ContainerStorage::new()?;
-
-    // Create container filesystem
-    let rootfs = storage.create_container_filesystem(container_id, layer_paths)?;
-
-    println!("Container filesystem ready at: {}", rootfs.display());
-
-    Ok(rootfs)
-}
-
-// Helper to check fuse-overlayfs availability
-pub fn ensure_fuse_overlayfs() -> Result<(), Box<dyn std::error::Error>> {
-    match Command::new("fuse-overlayfs").arg("--version").output() {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            eprintln!("fuse-overlayfs not found. Install it for better rootless support:");
-            eprintln!("  Ubuntu/Debian: sudo apt install fuse-overlayfs");
-            eprintln!("  Fedora: sudo dnf install fuse-overlayfs");
-            eprintln!("  Arch: sudo pacman -S fuse-overlayfs");
-            Err("fuse-overlayfs required for rootless containers".into())
-        }
-    }
-}
-
 impl ContainerStorage {
     fn build_vfs_root_optimized(
         &self,
@@ -379,9 +339,6 @@ impl ContainerStorage {
     }
 
     fn fix_ownership_for_rootless(&self, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        use nix::unistd::{chown, Uid, Gid};
-        use std::os::unix::fs::PermissionsExt;
-
         let current_uid = nix::unistd::getuid();
         let current_gid = nix::unistd::getgid();
 
@@ -389,7 +346,12 @@ impl ContainerStorage {
         Ok(())
     }
 
-    fn chown_recursive(&self, path: &Path, uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> Result<(), Box<dyn std::error::Error>> {
+    fn chown_recursive(
+        &self,
+        path: &Path,
+        uid: nix::unistd::Uid,
+        gid: nix::unistd::Gid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use nix::unistd::chown;
         let _ = chown(path, Some(uid), Some(gid));
 
@@ -408,7 +370,7 @@ impl ContainerStorage {
 
     fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::copy;
-        
+
         for entry in fs::read_dir(src)? {
             let entry = entry?;
             let ty = entry.file_type()?;
@@ -418,8 +380,9 @@ impl ContainerStorage {
             let path = entry.path();
 
             if ty.is_dir() {
-                if dst.to_string_lossy().ends_with("merged") && 
-                   (name_str == "dev" || name_str == "proc" || name_str == "sys") {
+                if dst.to_string_lossy().ends_with("merged")
+                    && (name_str == "dev" || name_str == "proc" || name_str == "sys")
+                {
                     fs::create_dir_all(&target)?;
                     continue;
                 }
@@ -490,12 +453,12 @@ impl ContainerStorage {
                     if target.exists() {
                         fs::remove_file(&target)?;
                     }
-                    
+
                     let mut src_file = fs::File::open(&path)?;
                     let mut dst_file = fs::File::create(&target)?;
                     copy(&mut src_file, &mut dst_file)?;
                     drop(dst_file);
-                    
+
                     fs::set_permissions(&target, metadata.permissions())?;
                     continue;
                 }
@@ -505,7 +468,7 @@ impl ContainerStorage {
                 if target.exists() {
                     fs::remove_file(&target)?;
                 }
-                
+
                 let mut src_file = fs::File::open(&path)?;
                 let mut dst_file = fs::File::create(&target)?;
                 copy(&mut src_file, &mut dst_file)?;
@@ -533,7 +496,9 @@ pub fn preflight_rootless_checks() {
         use std::os::unix::fs::MetadataExt;
         let mode = meta.mode();
         if mode & 0o4000 == 0 {
-            eprintln!("Warning: fusermount3 is not setuid. Rootless FUSE may fail. Try: sudo chmod u+s /usr/bin/fusermount3");
+            eprintln!(
+                "Warning: fusermount3 is not setuid. Rootless FUSE may fail. Try: sudo chmod u+s /usr/bin/fusermount3"
+            );
         }
     } else {
         eprintln!("Warning: fusermount3 not found. Install fuse3 package.");
