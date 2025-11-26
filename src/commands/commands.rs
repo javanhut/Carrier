@@ -1,8 +1,17 @@
 use crate::cli::RegistryImage;
-use crate::runtime::network::{NetworkConfig, NetworkManager};
-use crate::storage::{
-    extract_layer_rootless, generate_container_id, ContainerStorage, StorageLayout,
-};
+use crate::storage::StorageLayout;
+use crate::storage::{ContainerStorage, extract_layer_rootless, generate_container_id};
+use std::io::{self, Write};
+
+fn get_runc_root() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.local/share/carrier/runc", home)
+    } else {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+        format!("{}/carrier/runc", runtime_dir)
+    }
+}
 
 use base64::prelude::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -10,7 +19,6 @@ use lazy_static::lazy_static;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -73,7 +81,7 @@ struct ManifestV2 {
     layers: Vec<Descriptor>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
@@ -115,8 +123,12 @@ pub async fn run_image(
     detach: bool,
     name: Option<String>,
     elevated: bool,
+    volumes: Vec<String>,
+    ports: Vec<String>,
+    env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
+    verbose: bool,
 ) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -147,7 +159,9 @@ pub async fn run_image(
 
     // First check if this is an image ID for a local image
     if let Ok(Some((image, tag, manifest_content))) = find_image_by_id(&storage, &image_name) {
-        println!("Found local image: {}:{}", image, tag);
+        if verbose {
+            println!("Found local image: {}:{}", image, tag);
+        }
 
         // Parse the manifest
         let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
@@ -179,7 +193,9 @@ pub async fn run_image(
             tag: tag.clone(),
         };
 
-        println!("Running container from local image {}:{}...", image, tag);
+        if verbose {
+            println!("Running container from local image {}:{}...", image, tag);
+        }
 
         // Run the container with the local image
         if let Err(e) = run_container_with_storage(
@@ -191,7 +207,11 @@ pub async fn run_image(
             name.clone(),
             elevated,
             None,
+            &volumes,
+            &ports,
+            &env_vars,
             storage_driver.as_deref(),
+            verbose,
         )
         .await
         {
@@ -212,10 +232,12 @@ pub async fn run_image(
     // Check if we have this image locally already
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
     if metadata_path.exists() {
-        println!(
-            "Image {}:{} found locally",
-            parsed_image.image, parsed_image.tag
-        );
+        if verbose {
+            println!(
+                "Image {}:{} found locally",
+                parsed_image.image, parsed_image.tag
+            );
+        }
 
         // Load the manifest from local storage
         let manifest_content = match std::fs::read_to_string(&metadata_path) {
@@ -239,7 +261,9 @@ pub async fn run_image(
         for layer in &manifest.layers {
             let layer_path = storage.image_layer_path(&layer.digest);
             if !layer_path.exists() {
-                println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                if verbose {
+                    println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                }
                 break; // Will fall through to pull
             }
             layer_paths.push(layer_path);
@@ -247,7 +271,9 @@ pub async fn run_image(
 
         // If all layers exist, run directly
         if layer_paths.len() == manifest.layers.len() {
-            println!("Running container from local image...");
+            if verbose {
+                println!("Running container from local image...");
+            }
             if let Err(e) = run_container_with_storage(
                 &parsed_image,
                 &manifest,
@@ -257,7 +283,11 @@ pub async fn run_image(
                 name.clone(),
                 elevated,
                 None,
+                &volumes,
+                &ports,
+                &env_vars,
                 storage_driver.as_deref(),
+                verbose,
             )
             .await
             {
@@ -269,15 +299,19 @@ pub async fn run_image(
 
     // Image not found locally or incomplete, pull it
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
-    println!("Registry: {}", registry);
-    println!("Image: {}", parsed_image.image);
-    println!("Tag: {}", parsed_image.tag);
+    if verbose {
+        println!("Registry: {}", registry);
+        println!("Image: {}", parsed_image.image);
+        println!("Tag: {}", parsed_image.tag);
+    }
 
     // Get auth token (try authenticated first, fall back to anonymous)
     let image_path = normalize_image_path(&parsed_image.image);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
-            println!("Successfully obtained auth token");
+            if verbose {
+                println!("Successfully obtained auth token");
+            }
             t
         }
         Err(e) => {
@@ -289,7 +323,9 @@ pub async fn run_image(
     // Get manifest
     let manifest_json = match get_manifest_content(&parsed_image, &token).await {
         Ok(m) => {
-            println!("Successfully downloaded manifest");
+            if verbose {
+                println!("Successfully downloaded manifest");
+            }
             m
         }
         Err(e) => {
@@ -300,7 +336,7 @@ pub async fn run_image(
 
     // Parse manifest - handle both manifest list and single manifest
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
             .await
         {
             Ok(m) => m,
@@ -311,15 +347,27 @@ pub async fn run_image(
         };
 
     // Save the actual manifest (not the manifest list) as metadata
+    // Calculate and cache total image size for faster listing
+    let cached_size: u64 = {
+        let config_size = manifest.config.size as u64;
+        let layers_size: u64 = manifest.layers.iter().map(|l| l.size as u64).sum();
+        config_size + layers_size
+    };
+
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
-    let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
+    // Add cached_size to manifest JSON for faster listing
+    let mut manifest_json_obj = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
+        map.insert("cached_size".to_string(), serde_json::json!(cached_size));
+    }
+    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
         eprintln!("Warning: Failed to save manifest metadata: {}", e);
     }
 
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -327,8 +375,10 @@ pub async fn run_image(
             }
         };
 
-    println!("\nImage {} pulled successfully!", image_name);
-    println!("Ready to run container...");
+    if verbose {
+        println!("\nImage {} pulled successfully!", image_name);
+        println!("Ready to run container...");
+    }
 
     // Run the container with proper storage
     if let Err(e) = run_container_with_storage(
@@ -340,7 +390,11 @@ pub async fn run_image(
         name,
         elevated,
         None,
+        &volumes,
+        &ports,
+        &env_vars,
         storage_driver.as_deref(),
+        verbose,
     )
     .await
     {
@@ -354,8 +408,12 @@ pub async fn run_image_with_command(
     name: Option<String>,
     elevated: bool,
     command: Vec<String>,
+    volumes: Vec<String>,
+    ports: Vec<String>,
+    env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
+    verbose: bool,
 ) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -368,7 +426,9 @@ pub async fn run_image_with_command(
 
     // First check if this is an image ID for a local image
     if let Ok(Some((image, tag, manifest_content))) = find_image_by_id(&storage, &image_name) {
-        println!("Found local image: {}:{}", image, tag);
+        if verbose {
+            println!("Found local image: {}:{}", image, tag);
+        }
 
         let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
             Ok(m) => m,
@@ -399,10 +459,12 @@ pub async fn run_image_with_command(
             tag: tag.clone(),
         };
 
-        println!(
-            "Running container from local image {}:{} with override...",
-            image, tag
-        );
+        if verbose {
+            println!(
+                "Running container from local image {}:{} with override...",
+                image, tag
+            );
+        }
 
         if let Err(e) = run_container_with_storage(
             &parsed_image,
@@ -413,7 +475,11 @@ pub async fn run_image_with_command(
             name.clone(),
             elevated,
             Some(command.clone()),
+            &volumes,
+            &ports,
+            &env_vars,
             storage_driver.as_deref(),
+            verbose,
         )
         .await
         {
@@ -434,10 +500,12 @@ pub async fn run_image_with_command(
     // Check if we have this image locally already
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
     if metadata_path.exists() {
-        println!(
-            "Image {}:{} found locally",
-            parsed_image.image, parsed_image.tag
-        );
+        if verbose {
+            println!(
+                "Image {}:{} found locally",
+                parsed_image.image, parsed_image.tag
+            );
+        }
 
         // Load the manifest from local storage
         let manifest_content = match std::fs::read_to_string(&metadata_path) {
@@ -461,7 +529,9 @@ pub async fn run_image_with_command(
         for layer in &manifest.layers {
             let layer_path = storage.image_layer_path(&layer.digest);
             if !layer_path.exists() {
-                println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                if verbose {
+                    println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                }
                 break; // Will fall through to pull
             }
             layer_paths.push(layer_path);
@@ -469,7 +539,9 @@ pub async fn run_image_with_command(
 
         // If all layers exist, run directly
         if layer_paths.len() == manifest.layers.len() {
-            println!("Running container from local image with override...");
+            if verbose {
+                println!("Running container from local image with override...");
+            }
             if let Err(e) = run_container_with_storage(
                 &parsed_image,
                 &manifest,
@@ -479,7 +551,11 @@ pub async fn run_image_with_command(
                 name.clone(),
                 elevated,
                 Some(command.clone()),
+                &volumes,
+                &ports,
+                &env_vars,
                 storage_driver.as_deref(),
+                verbose,
             )
             .await
             {
@@ -491,15 +567,19 @@ pub async fn run_image_with_command(
 
     // Image not found locally or incomplete, pull it
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
-    println!("Registry: {}", registry);
-    println!("Image: {}", parsed_image.image);
-    println!("Tag: {}", parsed_image.tag);
+    if verbose {
+        println!("Registry: {}", registry);
+        println!("Image: {}", parsed_image.image);
+        println!("Tag: {}", parsed_image.tag);
+    }
 
     // Get auth token (try authenticated first, fall back to anonymous)
     let image_path = normalize_image_path(&parsed_image.image);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
-            println!("Successfully obtained auth token");
+            if verbose {
+                println!("Successfully obtained auth token");
+            }
             t
         }
         Err(e) => {
@@ -511,7 +591,9 @@ pub async fn run_image_with_command(
     // Get manifest
     let manifest_json = match get_manifest_content(&parsed_image, &token).await {
         Ok(m) => {
-            println!("Successfully downloaded manifest");
+            if verbose {
+                println!("Successfully downloaded manifest");
+            }
             m
         }
         Err(e) => {
@@ -522,7 +604,7 @@ pub async fn run_image_with_command(
 
     // Parse manifest - handle both manifest list and single manifest
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
             .await
         {
             Ok(m) => m,
@@ -539,7 +621,7 @@ pub async fn run_image_with_command(
 
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -547,8 +629,10 @@ pub async fn run_image_with_command(
             }
         };
 
-    println!("\nImage {} pulled successfully!", image_name);
-    println!("Ready to run container with override...");
+    if verbose {
+        println!("\nImage {} pulled successfully!", image_name);
+        println!("Ready to run container with override...");
+    }
 
     // Run the container with proper storage and command override
     if let Err(e) = run_container_with_storage(
@@ -560,7 +644,11 @@ pub async fn run_image_with_command(
         name,
         elevated,
         Some(command),
+        &volumes,
+        &ports,
+        &env_vars,
         storage_driver.as_deref(),
+        verbose,
     )
     .await
     {
@@ -570,7 +658,7 @@ pub async fn run_image_with_command(
 
 /// Execute a command in an elevated container without user namespace mapping
 async fn exec_elevated_container(
-    container_dir: &Path,
+    _container_dir: &Path,
     rootfs: &Path,
     container_pid: i32,
     command: Vec<String>,
@@ -579,109 +667,57 @@ async fn exec_elevated_container(
     use std::process::{Command, Stdio};
 
     println!(
-        "Executing in elevated container (PID {}) with sudo",
+        "Executing in elevated container (PID {}) rootless",
         container_pid
     );
 
-    ensure_host_dev_null_ready()?;
-
-    // Use nsenter to properly enter the container's namespaces first
-    let mut exec_cmd = Command::new("sudo");
-
-    // Enter all the container's namespaces
+    // For entering an already running container, we should use nsenter to join its namespaces
+    let mut exec_cmd = Command::new("nsenter");
     exec_cmd
-        .arg("nsenter")
-        .arg("-t")
+        .arg("--target")
         .arg(container_pid.to_string())
-        .arg("-m") // Mount namespace - CRITICAL for /dev access
-        .arg("-u") // UTS namespace
-        .arg("-i") // IPC namespace
-        .arg("-n") // Network namespace
-        .arg("-p") // PID namespace
-        .arg("-r") // Set root directory to container's root
-        .arg("-w"); // Set working directory to container's cwd
+        .arg("--mount")
+        .arg("--uts")
+        .arg("--net")
+        .arg("--pid")
+        .arg("--root")
+        .arg(rootfs) // Set the root filesystem
+        .arg("--wd=/"); // Set working directory to /
 
-    // For interactive sessions, we need to ensure /dev is properly set up
-    // But we check and fix it from INSIDE the namespace
-    if is_interactive {
-        // Create a script that checks and fixes /dev if needed, then runs the command
-        let cmd_str = command.join(" ");
-        let check_and_exec = format!(
-            "#!/bin/sh\n\
-             # Check if /dev/null is properly set up\n\
-             if [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then\n\
-                 echo 'Fixing /dev filesystem...'\n\
-                 mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-                 mount -o remount,dev /dev 2>/dev/null || \
-                 mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-                 mount -o remount,dev /dev 2>/dev/null || true\n\
-                 # Create device nodes with proper permissions\n\
-                 mknod -m 0666 /dev/null c 1 3\n\
-                 mknod -m 0666 /dev/zero c 1 5\n\
-                 mknod -m 0666 /dev/random c 1 8\n\
-                 mknod -m 0666 /dev/urandom c 1 9\n\
-                 mknod -m 0666 /dev/tty c 5 0\n\
-                 mknod -m 0600 /dev/console c 5 1\n\
-                 # Create pts directory if needed\n\
-                 mkdir -p /dev/pts /dev/shm\n\
-                 # Mount devpts if not already mounted\n\
-                 if ! mountpoint -q /dev/pts; then\n\
-                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts\n\
-                 fi\n\
-                 # Create ptmx symlink\n\
-                 [ ! -e /dev/ptmx ] && ln -sf /dev/pts/ptmx /dev/ptmx\n\
-                 # Mount shm if not already mounted\n\
-                 if ! mountpoint -q /dev/shm; then\n\
-                     mount -t tmpfs -o mode=1777,size=65536k shm /dev/shm\n\
-                 fi\n\
-             fi\n\
-             # Set up environment\n\
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-             export HOME=/root\n\
-             export TERM=xterm\n\
-             # Execute the actual command\n\
-             exec {}",
-            cmd_str
-        );
+    // Add the command to run
+    exec_cmd.args(&command);
 
-        exec_cmd.arg("/bin/sh").arg("-c").arg(check_and_exec);
-    } else {
-        // For non-interactive, just run the command directly
-        exec_cmd.args(&command);
-    }
+    // Set up environment
+    exec_cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+    exec_cmd.env("HOME", "/root");
+    exec_cmd.env("TERM", "xterm");
 
     if is_interactive {
-        println!("Starting interactive session with elevated privileges...");
+        println!("Starting interactive session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
 
         // Check if we're in a TTY
         let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
 
         if is_tty {
-            // Build the complete nsenter command arguments
-            let nsenter_args = vec![
-                "nsenter".to_string(),
-                "-t".to_string(),
+            // For elevated containers, use nsenter directly (no user namespace mapping)
+            let mut nsenter_args = vec![
+                "--target".to_string(),
                 container_pid.to_string(),
-                "-m".to_string(), // Mount namespace
-                "-u".to_string(), // UTS namespace
-                "-i".to_string(), // IPC namespace
-                "-n".to_string(), // Network namespace
-                "-p".to_string(), // PID namespace
-                "-r".to_string(), // Root directory
-                "-w".to_string(), // Working directory
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                // The check_and_exec script we built above
-                exec_cmd
-                    .get_args()
-                    .last()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
+                "--mount".to_string(),
+                "--uts".to_string(),
+                "--net".to_string(),
+                "--pid".to_string(),
+                "--root".to_string(),
+                rootfs.to_string_lossy().to_string(),
+                "--wd=/".to_string(),
             ];
+            nsenter_args.extend(command.clone());
 
-            let exit_code = spawn_with_pty("sudo", &nsenter_args).unwrap_or_else(|_| {
+            let exit_code = spawn_with_pty("nsenter", &nsenter_args).unwrap_or_else(|_| {
                 // Fallback to regular execution
                 let mut child = exec_cmd
                     .stdin(Stdio::inherit())
@@ -732,161 +768,70 @@ async fn exec_elevated_container(
 /// Execute a command in a rootless container by directly entering its rootfs
 async fn exec_rootless_container(
     container_dir: &Path,
-    rootfs: &Path,
-    container_pid: i32,
+    _rootfs: &Path,
+    _container_pid: i32,
     command: Vec<String>,
     is_interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
 
-    println!("Executing in rootless container (PID {})", container_pid);
+    // Get container ID from directory name
+    let container_id = container_dir
+        .file_name()
+        .ok_or("Invalid container directory")?
+        .to_string_lossy()
+        .to_string();
 
-    // For entering an already running container, we should use nsenter to join its namespaces
-    // Check if we're running as root (e.g., with sudo)
-    let is_root = nix::unistd::Uid::effective().is_root();
-
-    // For entering an already running container, we should use nsenter to join its namespaces
-    // Check if we're running as root (e.g., with sudo)
-    let mut exec_cmd = Command::new("nsenter");
-    exec_cmd
-        .arg("--target")
-        .arg(container_pid.to_string())
-        .arg("--mount")
-        .arg("--uts")
-        .arg("--net")
-        .arg("--pid")
-        .arg("--root")
-        .arg(rootfs) // Set the root filesystem
-        .arg("--wd=/"); // Set working directory to /
-
-    // Add the command to run
-    exec_cmd.args(&command);
-
-    // Set up environment
-    exec_cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    println!(
+        "Executing in container {} using runc exec",
+        short12(&container_id)
     );
-    exec_cmd.env("HOME", "/root");
-    exec_cmd.env("TERM", "xterm");
 
+    // Determine runc root directory
+    let runc_root_path = get_runc_root();
+
+    // Build runc exec command
+    let mut exec_cmd = Command::new("runc");
+    exec_cmd.arg("--root").arg(&runc_root_path).arg("exec");
+
+    // Add -t flag for terminal if interactive
     if is_interactive {
         println!("Starting interactive session...");
         println!("Type 'exit' or press Ctrl+D to exit.\n");
+        exec_cmd.arg("-t");
+    }
 
-        // Check if we're in a TTY
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    // Set environment variables
+    exec_cmd
+        .arg("--env")
+        .arg("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .arg("--env")
+        .arg("HOME=/root")
+        .arg("--env")
+        .arg("TERM=xterm");
 
-        if is_tty {
-            // Try using PTY for interactive session
-            let (cmd_name, args) = if is_root {
-                // Use nsenter for root
-                let mut nsenter_args = vec![
-                    "--target".to_string(),
-                    container_pid.to_string(),
-                    "--mount".to_string(),
-                    "--uts".to_string(),
-                    "--net".to_string(),
-                    "--pid".to_string(),
-                    "--root".to_string(),
-                    rootfs.to_string_lossy().to_string(),
-                    "--wd=/".to_string(),
-                ];
-                nsenter_args.extend(command.clone());
-                ("nsenter", nsenter_args)
-            } else {
-                // Use unshare for non-root - need to wrap with device setup
-                let inner_cmd = if !command.is_empty() {
-                    command.join(" ")
-                } else {
-                    "/bin/sh".to_string()
-                };
+    // Add container ID
+    exec_cmd.arg(&container_id);
 
-                let setup_script = format!(
-                    "mount -t devtmpfs -o mode=755 devtmpfs {}/dev 2>/dev/null || \
-                     mount -o remount,dev {}/dev 2>/dev/null || \
-                     mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {}/dev 2>/dev/null || \
-                     mount -o remount,dev {}/dev 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/null c 1 3 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/zero c 1 5 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/random c 1 8 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/urandom c 1 9 2>/dev/null || true; \
-                     mknod -m 0666 {}/dev/tty c 5 0 2>/dev/null || true; \
-                     mkdir -p {}/dev/pts {}/dev/shm 2>/dev/null || true; \
-                     mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {}/dev/pts 2>/dev/null || true; \
-                     ln -sf /dev/pts/ptmx {}/dev/ptmx 2>/dev/null || true; \
-                     exec chroot {} {}",
-                    rootfs.display(), // mount devtmpfs
-                    rootfs.display(), // remount dev
-                    rootfs.display(), // tmpfs fallback
-                    rootfs.display(), // remount dev after fallback
-                    rootfs.display(), // /dev/null
-                    rootfs.display(), // /dev/zero
-                    rootfs.display(), // /dev/random
-                    rootfs.display(), // /dev/urandom
-                    rootfs.display(), // /dev/tty
-                    rootfs.display(), // /dev/pts mkdir
-                    rootfs.display(), // /dev/shm mkdir
-                    rootfs.display(), // mount devpts
-                    rootfs.display(), // symlink ptmx
-                    rootfs.display(), // chroot path
-                    inner_cmd
-                );
-
-                let unshare_args = vec![
-                    "--user".to_string(),
-                    "--map-root-user".to_string(),
-                    "--mount".to_string(),
-                    "--pid".to_string(),
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    setup_script,
-                ];
-                ("unshare", unshare_args)
-            };
-
-            let exit_code = spawn_with_pty(cmd_name, &args).unwrap_or_else(|_| {
-                // Fallback to regular execution
-                let mut child = exec_cmd
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .expect("Failed to spawn unshare");
-
-                let status = child.wait().expect("Failed to wait for child");
-                status.code().unwrap_or(1)
-            });
-
-            if exit_code != 0 {
-                return Err(format!("Command exited with code {}", exit_code).into());
-            }
-        } else {
-            println!("Not running in a TTY, using regular command execution...");
-            exec_cmd.stdin(Stdio::inherit());
-            exec_cmd.stdout(Stdio::inherit());
-            exec_cmd.stderr(Stdio::inherit());
-
-            let mut child = exec_cmd.spawn()?;
-            let status = child.wait()?;
-            if !status.success() {
-                if let Some(code) = status.code() {
-                    return Err(format!("Command exited with code {}", code).into());
-                }
-            }
-        }
+    // Add command to execute
+    if command.is_empty() {
+        exec_cmd.arg("/bin/sh");
     } else {
-        // Non-interactive execution
-        exec_cmd.stdout(Stdio::inherit());
-        exec_cmd.stderr(Stdio::inherit());
+        exec_cmd.args(&command);
+    }
 
-        let mut child = exec_cmd.spawn()?;
-        let status = child.wait()?;
+    // Set stdio
+    exec_cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
-        if !status.success() {
-            if let Some(code) = status.code() {
-                return Err(format!("Command exited with code {}", code).into());
-            }
+    // Execute the command
+    let status = exec_cmd.status()?;
+
+    if !status.success() {
+        if let Some(code) = status.code() {
+            return Err(format!("Command exited with code {}", code).into());
         }
     }
 
@@ -957,7 +902,7 @@ pub async fn exec_in_container(
     let container_pid = pid_str.trim().parse::<i32>()?;
 
     // Check if the process is still running
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
     let pid = Pid::from_raw(container_pid);
@@ -1004,25 +949,8 @@ pub async fn exec_in_container(
     // Check if the container was started with elevated privileges
     let elevated = metadata["elevated"].as_bool().unwrap_or(false);
 
-    // Check if we're running as root or regular user
-    let is_root = nix::unistd::Uid::effective().is_root();
-
-    // Handle based on how the container was created
-    if !elevated {
-        // Container was created as rootless, use rootless exec regardless of current privileges
-        return exec_rootless_container(
-            &container_dir,
-            &rootfs,
-            container_pid,
-            cmd_to_run,
-            is_interactive,
-        )
-        .await;
-    }
-
-    // For elevated/root containers, check if we need special handling
-    if !is_root && elevated {
-        // Running as non-root but container needs elevated privileges
+    if elevated {
+        // For elevated containers, use elevated exec (rootless but without user namespace mapping)
         return exec_elevated_container(
             &container_dir,
             &rootfs,
@@ -1033,235 +961,15 @@ pub async fn exec_in_container(
         .await;
     }
 
-    // For root containers running with root privileges, use nsenter
-    let mut nsenter_args: Vec<String> = vec![
-        "--target".into(),
-        container_pid.to_string(),
-        "--mount".into(),
-        "--uts".into(),
-        "--ipc".into(),
-        "--net".into(),
-        "--pid".into(),
-        format!("--root={}", rootfs.to_string_lossy()),
-        "--".into(),
-    ];
-
-    // Wrap the command to ensure we're in a valid directory and fix /dev if needed
-    let wrapped_cmd = if cmd_to_run.is_empty() {
-        vec!["sh".to_string(), "-c".to_string(),
-            "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
-               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || \
-               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || true; \
-               rm -f /dev/null 2>/dev/null || true; \
-               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
-               rm -f /dev/zero 2>/dev/null || true; \
-               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
-               rm -f /dev/random 2>/dev/null || true; \
-               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
-               rm -f /dev/urandom 2>/dev/null || true; \
-               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
-               rm -f /dev/tty 2>/dev/null || true; \
-               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
-               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
-               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
-               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
-            fi; \
-             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
-               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
-               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-             fi; \
-             exec /bin/sh".to_string()]
-    } else {
-        let cmd_str = cmd_to_run.join(" ");
-        vec!["sh".to_string(), "-c".to_string(), format!(
-            "cd / 2>/dev/null || true; \
-             if [ ! -e /dev/null ] || [ ! -c /dev/null ] || ! : > /dev/null 2>/dev/null; then \
-               mount -t devtmpfs -o mode=755 devtmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || \
-               mount -t tmpfs -o mode=755,size=65536k,dev tmpfs /dev 2>/dev/null || \
-               mount -o remount,dev /dev 2>/dev/null || true; \
-               rm -f /dev/null 2>/dev/null || true; \
-               mknod -m 666 /dev/null c 1 3 2>/dev/null || true; \
-               rm -f /dev/zero 2>/dev/null || true; \
-               mknod -m 666 /dev/zero c 1 5 2>/dev/null || true; \
-               rm -f /dev/random 2>/dev/null || true; \
-               mknod -m 666 /dev/random c 1 8 2>/dev/null || true; \
-               rm -f /dev/urandom 2>/dev/null || true; \
-               mknod -m 666 /dev/urandom c 1 9 2>/dev/null || true; \
-               rm -f /dev/tty 2>/dev/null || true; \
-               mknod -m 666 /dev/tty c 5 0 2>/dev/null || true; \
-               mkdir -p /dev/pts /dev/shm 2>/dev/null || true; \
-               mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts /dev/pts 2>/dev/null || true; \
-               ln -sf /dev/pts/ptmx /dev/ptmx 2>/dev/null || true; \
-            fi; \
-             if [ ! -x /usr/bin/gpgv ] && [ ! -f /etc/apt/apt.conf.d/99-allow-unauthenticated ]; then \
-               mkdir -p /etc/apt/apt.conf.d 2>/dev/null || true; \
-               echo 'Acquire::AllowInsecureRepositories \"true\";' > /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'Acquire::AllowDowngradeToInsecureRepositories \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-               echo 'APT::Get::AllowUnauthenticated \"true\";' >> /etc/apt/apt.conf.d/99-allow-unauthenticated; \
-             fi; \
-             exec {}", cmd_str)]
-    };
-
-    nsenter_args.extend(wrapped_cmd);
-
-    if is_interactive {
-        println!("Starting interactive shell session...");
-        println!("Type 'exit' or press Ctrl+D to exit.\n");
-
-        // Check if we're running in a TTY
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-
-        if is_tty {
-            // Try nsenter first, then fallback to sudo if permission denied
-            match spawn_with_pty("nsenter", &nsenter_args) {
-                Ok(exit_code) => {
-                    if exit_code != 0 {
-                        return Err(format!("Command exited with code {}", exit_code).into());
-                    }
-                    return Ok(());
-                }
-                Err(e) if e.to_string().contains("Operation not permitted") => {
-                    println!("Permission denied with nsenter, trying with sudo...");
-                    let mut sudo_args = vec!["nsenter".to_string()];
-                    sudo_args.extend(nsenter_args);
-
-                    let exit_code = spawn_with_pty("sudo", &sudo_args)
-                        .map_err(|e| format!("Failed to start PTY session with sudo: {}", e))?;
-                    if exit_code != 0 {
-                        return Err(format!("Command exited with code {}", exit_code).into());
-                    }
-                    return Ok(());
-                }
-                Err(e) => return Err(format!("Failed to start PTY session: {}", e).into()),
-            }
-        } else {
-            // Not in a TTY, fall back to regular command execution
-            println!("Not running in a TTY, using regular command execution...");
-            use std::process::{Command, Stdio};
-
-            // Try nsenter first
-            let mut exec_cmd = Command::new("nsenter");
-            exec_cmd.args(&nsenter_args);
-            exec_cmd
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .stdin(Stdio::inherit());
-
-            match exec_cmd.spawn() {
-                Ok(mut child) => {
-                    let status = child.wait()?;
-                    if !status.success() {
-                        if let Some(code) = status.code() {
-                            return Err(format!("Command exited with code {}", code).into());
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(e) if e.to_string().contains("Operation not permitted") => {
-                    println!("Permission denied with nsenter, trying with sudo...");
-
-                    let mut sudo_args = vec!["nsenter".to_string()];
-                    sudo_args.extend(nsenter_args);
-
-                    let mut sudo_cmd = Command::new("sudo");
-                    sudo_cmd.args(&sudo_args);
-                    sudo_cmd
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .stdin(Stdio::inherit());
-
-                    let mut child = sudo_cmd.spawn().map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::NotFound {
-                            "sudo command not found. Please run as root or install sudo."
-                                .to_string()
-                        } else {
-                            format!("Failed to execute command with sudo: {}", e)
-                        }
-                    })?;
-
-                    let status = child.wait()?;
-                    if !status.success() {
-                        if let Some(code) = status.code() {
-                            return Err(format!("Command exited with code {}", code).into());
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Err(
-                            "nsenter command not found. Please install util-linux package.".into(),
-                        );
-                    } else {
-                        return Err(format!("Failed to execute command: {}", e).into());
-                    }
-                }
-            }
-        }
-    } else {
-        // For non-interactive commands, just inherit stdout/stderr
-        use std::process::{Command, Stdio};
-
-        // Try nsenter first
-        let mut exec_cmd = Command::new("nsenter");
-        exec_cmd.args(&nsenter_args);
-        exec_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-
-        match exec_cmd.spawn() {
-            Ok(mut child) => {
-                // Wait for the command to complete
-                let status = child.wait()?;
-                if !status.success() {
-                    if let Some(code) = status.code() {
-                        return Err(format!("Command exited with code {}", code).into());
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) if e.to_string().contains("Operation not permitted") => {
-                println!("Permission denied with nsenter, trying with sudo...");
-
-                // Try with sudo
-                let mut sudo_args = vec!["nsenter".to_string()];
-                sudo_args.extend(nsenter_args);
-
-                let mut sudo_cmd = Command::new("sudo");
-                sudo_cmd.args(&sudo_args);
-                sudo_cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-
-                let mut child = sudo_cmd.spawn().map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        "sudo command not found. Please run as root or install sudo.".to_string()
-                    } else {
-                        format!("Failed to execute command with sudo: {}", e)
-                    }
-                })?;
-
-                let status = child.wait()?;
-                if !status.success() {
-                    if let Some(code) = status.code() {
-                        return Err(format!("Command exited with code {}", code).into());
-                    }
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err(
-                        "nsenter command not found. Please install util-linux package.".into(),
-                    );
-                } else {
-                    return Err(format!("Failed to execute command: {}", e).into());
-                }
-            }
-        }
-    }
+    // Default: rootless container execution
+    exec_rootless_container(
+        &container_dir,
+        &rootfs,
+        container_pid,
+        cmd_to_run,
+        is_interactive,
+    )
+    .await
 }
 
 pub async fn show_container_logs(
@@ -1292,7 +1000,9 @@ pub async fn show_container_logs(
             "No logs available for container {}",
             short12(&full_container_id)
         );
-        println!("Container may not have been run in detached mode or may not have produced any output yet.");
+        println!(
+            "Container may not have been run in detached mode or may not have produced any output yet."
+        );
         return Ok(());
     }
 
@@ -1446,11 +1156,11 @@ fn show_container_details(
     // Status
     let status = metadata["status"].as_str().unwrap_or("unknown");
     let status_display = if status == "running" || status.starts_with("Up") {
-        format!("🟢 {}", status)
+        format!("[RUNNING] {}", status)
     } else if status.starts_with("exited") || status.starts_with("Exited") {
-        format!("🔴 {}", status)
+        format!("[EXITED] {}", status)
     } else {
-        format!("⚫ {}", status)
+        format!("[UNKNOWN] {}", status)
     };
     println!("║ Status:    {:<54} ║", status_display);
     // Storage driver indicator
@@ -1563,7 +1273,7 @@ fn show_container_details(
         if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
                 // Check if process is actually running
-                use nix::sys::signal::{kill, Signal};
+                use nix::sys::signal::kill;
                 use nix::unistd::Pid;
 
                 let process_pid = Pid::from_raw(pid);
@@ -1622,7 +1332,7 @@ fn show_container_details(
             println!("║ ENVIRONMENT VARIABLES (first 5)                                  ║");
             println!("╠═══════════════════════════════════════════════════════════════════╣");
 
-            for (i, var) in env.iter().take(5).enumerate() {
+            for (_i, var) in env.iter().take(5).enumerate() {
                 if let Some(env_str) = var.as_str() {
                     let display = if env_str.len() > 65 {
                         format!("{}...", &env_str[..62])
@@ -1890,8 +1600,9 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     };
 
     // Parse manifest - handle both manifest list and single manifest
+    // Pull always shows verbose output since user explicitly requested pull
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), true)
             .await
         {
             Ok(m) => m,
@@ -1902,14 +1613,26 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         };
 
     // Save the actual manifest (not the manifest list) as metadata
+    // Calculate and cache total image size for faster listing
+    let cached_size: u64 = {
+        let config_size = manifest.config.size as u64;
+        let layers_size: u64 = manifest.layers.iter().map(|l| l.size as u64).sum();
+        config_size + layers_size
+    };
+
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
-    let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
+    // Add cached_size to manifest JSON for faster listing
+    let mut manifest_json_obj = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
+        map.insert("cached_size".to_string(), serde_json::json!(cached_size));
+    }
+    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
         eprintln!("Warning: Failed to save manifest metadata: {}", e);
     }
 
-    // Download layers with progress using storage
-    if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+    // Download layers with progress using storage - always verbose for explicit pull
+    if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage, true).await {
         eprintln!("Failed to download layers: {}", e);
         return;
     }
@@ -1954,10 +1677,13 @@ async fn parse_and_get_manifest(
     parsed_image: &RegistryImage,
     token: &str,
     platform: Option<&str>,
+    verbose: bool,
 ) -> Result<ManifestV2, Box<dyn std::error::Error>> {
     // First try to parse as manifest list
     if let Ok(manifest_list) = serde_json::from_str::<ManifestList>(manifest_json) {
-        println!("Detected manifest list, selecting appropriate platform...");
+        if verbose {
+            println!("Detected manifest list, selecting appropriate platform...");
+        }
 
         // Determine desired platform
         let (want_os, want_arch) = platform
@@ -1973,10 +1699,12 @@ async fn parse_and_get_manifest(
             .or_else(|| manifest_list.manifests.first())
             .ok_or("No suitable manifest found in manifest list")?;
 
-        println!(
-            "Selected platform: {}/{}",
-            selected_manifest.platform.os, selected_manifest.platform.architecture
-        );
+        if verbose {
+            println!(
+                "Selected platform: {}/{}",
+                selected_manifest.platform.os, selected_manifest.platform.architecture
+            );
+        }
 
         // Fetch the specific manifest
         let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
@@ -2012,6 +1740,7 @@ async fn download_layers_with_storage(
     parsed_image: &RegistryImage,
     token: &str,
     storage: &StorageLayout,
+    verbose: bool,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
     let registry_url = REGISTRYMAP
@@ -2027,7 +1756,9 @@ async fn download_layers_with_storage(
 
     // Download config first
     if !storage.blob_exists(&manifest.config.digest) {
-        println!("\nDownloading config: {}", &manifest.config.digest[..12]);
+        if verbose {
+            println!("\nDownloading config: {}", &manifest.config.digest[..12]);
+        }
         let config_url = format!(
             "{}{}/blobs/{}",
             registry_url, image_path, manifest.config.digest
@@ -2041,70 +1772,205 @@ async fn download_layers_with_storage(
             manifest.config.size as u64,
             &multi_progress,
             "config",
+            verbose,
         )
         .await?;
 
         storage.save_blob(&manifest.config.digest, &blob_data)?;
     } else {
-        println!("Config already cached: {}", &manifest.config.digest[..12]);
+        if verbose {
+            println!("Config already cached: {}", &manifest.config.digest[..12]);
+        }
     }
 
-    // Download each layer
-    println!("Processing {} layers", manifest.layers.len());
+    // Download each layer - parallel downloads for layers that need fetching
+    if verbose {
+        println!("Processing {} layers", manifest.layers.len());
+    }
+
+    // First, identify which layers need downloading
+    let mut layers_to_download = Vec::new();
+    let mut cached_layers = Vec::new();
 
     for (index, layer) in manifest.layers.iter().enumerate() {
         let layer_dir = storage.image_layer_path(&layer.digest);
 
-        // Check if layer is already extracted
         if storage.layer_exists(&layer.digest) {
-            println!(
-                "Layer {}/{} already cached: {}",
-                index + 1,
-                manifest.layers.len(),
-                &layer.digest[..12]
-            );
-            layer_paths.push(layer_dir);
-            continue;
+            if verbose {
+                println!(
+                    "Layer {}/{} already cached: {}",
+                    index + 1,
+                    manifest.layers.len(),
+                    &layer.digest[..12]
+                );
+            }
+            cached_layers.push((index, layer.digest.clone(), layer_dir, None));
+        } else if storage.blob_exists(&layer.digest) {
+            if verbose {
+                println!(
+                    "Layer blob {}/{} already cached",
+                    index + 1,
+                    manifest.layers.len()
+                );
+            }
+            let blob_path = storage.blob_cache_path(&layer.digest);
+            cached_layers.push((index, layer.digest.clone(), layer_dir, Some(blob_path)));
+        } else {
+            layers_to_download.push((index, layer.clone()));
+        }
+    }
+
+    // Download layers in parallel (max 4 concurrent)
+    if !layers_to_download.is_empty() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let semaphore = Arc::new(Semaphore::new(4)); // Max 4 concurrent downloads
+        let total_layers = manifest.layers.len();
+        let registry_url = registry_url.to_string();
+        let image_path = image_path.clone();
+        let token = token.to_string();
+        let storage_base = storage.base.clone();
+
+        let mut download_handles = Vec::new();
+
+        for (index, layer) in layers_to_download {
+            let sem = semaphore.clone();
+            let client = client.clone();
+            let mp = multi_progress.clone();
+            let registry_url = registry_url.clone();
+            let image_path = image_path.clone();
+            let token = token.clone();
+            let storage_base = storage_base.clone();
+            let layer_digest = layer.digest.clone();
+            let layer_size = layer.size as u64;
+            let verbose_flag = verbose;
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer_digest);
+
+                let blob_data = match download_blob_with_progress(
+                    &client,
+                    &blob_url,
+                    &token,
+                    &layer_digest,
+                    layer_size,
+                    &mp,
+                    &format!("layer {}/{}", index + 1, total_layers),
+                    verbose_flag,
+                )
+                .await
+                {
+                    Ok(data) => data,
+                    Err(e) => return Err(format!("Download failed: {}", e)),
+                };
+
+                // Save blob to cache - match StorageLayout::blob_cache_path format
+                let clean_digest = layer_digest.replace(":", "_");
+                let blob_cache = storage_base.join("cache/blobs").join(format!("{}.tar.gz", &clean_digest));
+                if let Some(parent) = blob_cache.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Err(format!("Failed to create blob dir: {}", e));
+                    }
+                }
+                if let Err(e) = std::fs::write(&blob_cache, &blob_data) {
+                    return Err(format!("Failed to write blob: {}", e));
+                }
+
+                Ok::<(usize, String, PathBuf), String>((index, layer_digest, blob_cache))
+            });
+
+            download_handles.push(handle);
         }
 
-        // Download blob if not cached
-        let blob_path = if !storage.blob_exists(&layer.digest) {
-            let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer.digest);
+        // Wait for all downloads to complete
+        let mut downloaded_layers = Vec::new();
+        for handle in download_handles {
+            match handle.await {
+                Ok(Ok((index, digest, blob_path))) => {
+                    let layer_dir = storage.image_layer_path(&digest);
+                    downloaded_layers.push((index, digest, layer_dir, Some(blob_path)));
+                }
+                Ok(Err(e)) => {
+                    return Err(format!("Layer download failed: {}", e).into());
+                }
+                Err(e) => {
+                    return Err(format!("Task join failed: {}", e).into());
+                }
+            }
+        }
 
-            let blob_data = download_blob_with_progress(
-                &client,
-                &blob_url,
-                token,
-                &layer.digest,
-                layer.size as u64,
-                &multi_progress,
-                &format!("layer {}/{}", index + 1, manifest.layers.len()),
-            )
-            .await?;
+        // Merge cached and downloaded layers
+        cached_layers.extend(downloaded_layers);
+    }
 
-            storage.save_blob(&layer.digest, &blob_data)?
-        } else {
-            println!(
-                "Layer blob {}/{} already cached",
-                index + 1,
-                manifest.layers.len()
-            );
-            storage.blob_cache_path(&layer.digest)
-        };
+    // Sort by original index to maintain layer order
+    cached_layers.sort_by_key(|(idx, _, _, _)| *idx);
 
-        // Extract layer to storage
-        println!(
-            "Extracting layer {}/{}...",
-            index + 1,
-            manifest.layers.len()
-        );
-        std::fs::create_dir_all(&layer_dir)?;
-        extract_layer_rootless(&blob_path, &layer_dir)?;
+    // Extract layers that need extraction - parallel extraction using spawn_blocking
+    let layers_needing_extraction: Vec<_> = cached_layers
+        .iter()
+        .filter(|(_, _, _, blob_path_opt)| blob_path_opt.is_some())
+        .cloned()
+        .collect();
 
+    if !layers_needing_extraction.is_empty() {
+        let total_layers = manifest.layers.len();
+        if verbose {
+            println!("Extracting {} layers in parallel...", layers_needing_extraction.len());
+        }
+
+        let mut extraction_handles = Vec::new();
+
+        for (index, _digest, layer_dir, blob_path_opt) in layers_needing_extraction {
+            let blob_path = blob_path_opt.unwrap();
+            let layer_dir = layer_dir.clone();
+
+            let handle = tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::create_dir_all(&layer_dir) {
+                    return Err(format!("Failed to create layer dir: {}", e));
+                }
+                if let Err(e) = extract_layer_rootless(&blob_path, &layer_dir) {
+                    return Err(format!("Failed to extract layer: {}", e));
+                }
+                Ok::<(usize, PathBuf), String>((index, layer_dir))
+            });
+
+            extraction_handles.push((index, handle));
+        }
+
+        // Wait for all extractions and report progress
+        for (index, handle) in extraction_handles {
+            match handle.await {
+                Ok(Ok((idx, _))) => {
+                    if verbose {
+                        println!(
+                            "Extracted layer {}/{}",
+                            idx + 1,
+                            total_layers
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(format!("Failed to extract layer {}: {}", index + 1, e).into());
+                }
+                Err(e) => {
+                    return Err(format!("Extraction task failed: {}", e).into());
+                }
+            }
+        }
+    }
+
+    // Build final layer_paths in order
+    for (_index, _digest, layer_dir, _blob_path_opt) in cached_layers {
         layer_paths.push(layer_dir);
     }
 
-    println!("All layers processed successfully!");
+    if verbose {
+        println!("All layers processed successfully!");
+    }
     Ok(layer_paths)
 }
 
@@ -2116,20 +1982,26 @@ async fn download_blob_with_progress(
     expected_size: u64,
     multi_progress: &MultiProgress,
     label: &str,
+    verbose: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut attempt = 0;
     let max_attempts = 3;
     loop {
-        // Create progress bar for this attempt
-        let pb = multi_progress.add(ProgressBar::new(expected_size));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )?
-                .progress_chars("#>-"),
-        );
-        pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
+        // Create progress bar for this attempt (only if verbose)
+        let pb = if verbose {
+            let pb = multi_progress.add(ProgressBar::new(expected_size));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                    )?
+                    .progress_chars("#>-"),
+            );
+            pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
+            Some(pb)
+        } else {
+            None
+        };
 
         // Make request
         let response = client
@@ -2139,7 +2011,9 @@ async fn download_blob_with_progress(
             .await?;
 
         if !response.status().is_success() {
-            pb.finish_with_message(format!("✗ {} {}", label, &digest[..12]));
+            if let Some(ref pb) = pb {
+                pb.finish_with_message(format!("[FAILED] {} {}", label, &digest[..12]));
+            }
             attempt += 1;
             if attempt >= max_attempts {
                 return Err(format!("Failed to download blob: {}", response.status()).into());
@@ -2150,8 +2024,10 @@ async fn download_blob_with_progress(
 
         // Get content length if available
         let content_length = response.content_length().unwrap_or(expected_size);
-        if content_length != expected_size && content_length > 0 {
-            pb.set_length(content_length);
+        if let Some(ref pb) = pb {
+            if content_length != expected_size && content_length > 0 {
+                pb.set_length(content_length);
+            }
         }
 
         // Download with progress
@@ -2162,7 +2038,9 @@ async fn download_blob_with_progress(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             downloaded.extend_from_slice(&chunk);
-            pb.inc(chunk.len() as u64);
+            if let Some(ref pb) = pb {
+                pb.inc(chunk.len() as u64);
+            }
         }
 
         // Verify digest if provided as sha256
@@ -2173,7 +2051,9 @@ async fn download_blob_with_progress(
             let actual = hasher.finalize();
             let actual_hex = hex::encode(actual);
             if actual_hex != hex_expected {
-                pb.finish_with_message(format!("✗ digest mismatch for {}", &digest[..12]));
+                if let Some(ref pb) = pb {
+                    pb.finish_with_message(format!("[FAILED] digest mismatch for {}", &digest[..12]));
+                }
                 attempt += 1;
                 if attempt >= max_attempts {
                     return Err("Downloaded blob digest verification failed".into());
@@ -2183,65 +2063,65 @@ async fn download_blob_with_progress(
             }
         }
 
-        pb.finish_with_message(format!("✓ {} {}", label, &digest[..12]));
+        if let Some(ref pb) = pb {
+            pb.finish_with_message(format!("[OK] {} {}", label, &digest[..12]));
+        }
         return Ok(downloaded);
     }
 }
 
 /// Set up essential directories and files in the container
 fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Ensure essential directories exist
-    let essential_dirs = vec![
-        "etc",
-        "tmp",
-        "var",
-        "var/tmp",
-        "var/cache",
-        "var/cache/apt",
-        "dev",
-        "proc",
-        "sys",
-    ];
+    // Note: These operations may fail in rootless mode when the rootfs is
+    // a mounted overlay with user namespace mappings. We ignore errors since
+    // these directories typically already exist from the image layers.
+    let essential_dirs = vec!["etc", "tmp", "var", "var/tmp", "dev", "proc", "sys"];
 
     for dir in essential_dirs {
         let dir_path = rootfs.join(dir);
         if !dir_path.exists() {
-            println!("Creating directory: {}", dir);
-            std::fs::create_dir_all(&dir_path)?;
+            let _ = std::fs::create_dir_all(&dir_path);
         }
 
-        // Make tmp directories world-writable
         if dir.contains("tmp") {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&dir_path)?.permissions();
-            perms.set_mode(0o1777); // sticky bit + world writable
-            std::fs::set_permissions(&dir_path, perms)?;
+            if let Ok(metadata) = std::fs::metadata(&dir_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o1777);
+                let _ = std::fs::set_permissions(&dir_path, perms);
+            }
         }
     }
 
-    // Set up network files
     let etc_dir = rootfs.join("etc");
-
-    // Copy host's resolv.conf for DNS resolution
-    let host_resolv = Path::new("/etc/resolv.conf");
     let container_resolv = etc_dir.join("resolv.conf");
+    let container_hosts = etc_dir.join("hosts");
 
-    // Always overwrite resolv.conf to ensure DNS works
-    if host_resolv.exists() {
-        println!("Copying host resolv.conf to container");
-        std::fs::copy(host_resolv, &container_resolv)?;
-    } else {
-        println!("Creating default resolv.conf with Google DNS");
-        // Create a basic resolv.conf with common DNS servers
-        std::fs::write(
-            &container_resolv,
-            "# Generated by carrier\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n",
-        )?;
+    if !container_resolv.exists() {
+        let host_resolv = Path::new("/etc/resolv.conf");
+        if host_resolv.exists() {
+            let _ = std::fs::copy(host_resolv, &container_resolv);
+        } else {
+            let _ = std::fs::write(
+                &container_resolv,
+                "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+            );
+        }
     }
 
-    // Set up hosts file (always overwrite for consistency)
-    let container_hosts = etc_dir.join("hosts");
-    std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n")?;
+    if !container_hosts.exists() {
+        let _ = std::fs::write(&container_hosts, "127.0.0.1\tlocalhost\n::1\tlocalhost\n");
+    }
+
+    let apt_conf_dir = etc_dir.join("apt").join("apt.conf.d");
+    if !apt_conf_dir.exists() {
+        let _ = std::fs::create_dir_all(&apt_conf_dir);
+    }
+
+    let apt_sandbox_conf = apt_conf_dir.join("99-carrier-sandbox");
+    if !apt_sandbox_conf.exists() {
+        let _ = std::fs::write(&apt_sandbox_conf, "APT::Sandbox::User \"root\";\n");
+    }
 
     Ok(())
 }
@@ -2252,7 +2132,7 @@ fn ensure_host_dev_null_ready() -> Result<(), Box<dyn std::error::Error>> {
 
     let metadata = std::fs::metadata("/dev/null").map_err(|err| {
         format!(
-            "Host /dev/null is not accessible: {}. Elevated containers require a working /dev/null.\nFix with:\n  sudo rm -f /dev/null\n  sudo mknod -m 666 /dev/null c 1 3\n  sudo chown root:root /dev/null",
+            "Host /dev/null is not accessible: {}. Containers require a working /dev/null.\nThis is typically a system configuration issue.",
             err
         )
     })?;
@@ -2296,25 +2176,35 @@ async fn run_container_with_storage(
     name: Option<String>,
     elevated: bool,
     command_override: Option<Vec<String>>,
+    volumes: &[String],
+    ports: &[String],
+    extra_env: &[String],
     storage_driver: Option<&str>,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::runtime::container::{Container, ContainerConfig};
-    use crate::runtime::network::{NetworkConfig, NetworkMode};
+    if verbose {
+        println!(
+            "\nStarting container from image {}...",
+            parsed_image.to_string()
+        );
+    }
 
-    println!(
-        "\nStarting container from image {}...",
-        parsed_image.to_string()
-    );
+    // Set up cgroup resource limits for carrier containers
+    let _ = setup_carrier_cgroup_limits();
 
     // Generate container ID or use custom name
     let container_id = match &name {
         Some(custom_name) => custom_name.clone(),
         None => generate_container_id(),
     };
-    println!("Container ID: {}", container_id);
+    if verbose {
+        println!("Container ID: {}", container_id);
+    }
 
     // Create container with overlay filesystem
-    println!("Setting up container filesystem with overlay...");
+    if verbose {
+        println!("Setting up container filesystem with overlay...");
+    }
 
     // Elevated containers need a healthy host /dev/null to create device nodes inside the namespace
     if elevated {
@@ -2324,7 +2214,7 @@ async fn run_container_with_storage(
     // Preflight checks for rootless operation
     crate::storage::preflight_rootless_checks();
     // Allow forcing storage driver via CLI
-    let mut container_storage = if let Some(drv) = storage_driver {
+    let mut container_storage = if let Some(ref drv) = storage_driver {
         ContainerStorage::new_with_driver(Some(drv))?
     } else {
         ContainerStorage::new()?
@@ -2336,7 +2226,7 @@ async fn run_container_with_storage(
         crate::storage::StorageDriver::Vfs => "vfs",
     };
 
-    println!("Container filesystem ready at: {}", rootfs.display());
+    // Filesystem ready (silent for performance)
 
     // Set up essential directories and files
     setup_container_essential_files(&rootfs)?;
@@ -2402,8 +2292,24 @@ async fn run_container_with_storage(
                     || command[0] == "sh"
                     || command[0] == "bash")))
     {
-        println!("No persistent command specified for detached container, using 'sleep infinity'");
+        if verbose {
+            println!("No persistent command specified for detached container, using 'sleep infinity'");
+        }
         command = vec!["sleep".to_string(), "infinity".to_string()];
+    }
+
+    // Add extra environment variables from command line
+    for env_str in extra_env {
+        if let Some(eq_pos) = env_str.find('=') {
+            let key = env_str[..eq_pos].to_string();
+            let value = env_str[eq_pos + 1..].to_string();
+            // Override existing or add new
+            if let Some(pos) = env.iter().position(|(k, _)| k == &key) {
+                env[pos] = (key, value);
+            } else {
+                env.push((key, value));
+            }
+        }
     }
 
     // Add default environment if not present
@@ -2420,28 +2326,15 @@ async fn run_container_with_storage(
     // Clone command for later use
     let command_to_run = command.clone();
 
-    // Configure container with proper network settings
-    let mut network_config = NetworkConfig::default();
-    network_config.enable_network = !elevated; // Disable network for elevated containers (use host network)
+    // Network configuration handled by runc based on OCI spec namespace settings
 
-    let container_config = ContainerConfig {
-        id: container_id.clone(),
-        name: name.clone(),
-        image: parsed_image.to_string(),
-        rootfs: rootfs.clone(),
-        command,
-        env,
-        working_dir,
-        hostname: Some(format!("carrier-{}", &container_id[..8])),
-        user: None,
-        readonly_rootfs: false,
-        network_config,
-        ..Default::default()
-    };
+    // Container configuration - convert to what we need for OCI spec
+    let final_env = env;
+    let final_command = command;
+    let final_working_dir = working_dir;
 
-    // Store container metadata
+    // Parallel setup: metadata + directories
     let container_meta_path = storage.container_path(&container_id).join("metadata.json");
-    // Generate container name - use custom name if provided, otherwise generate default name
     let container_name = match &name {
         Some(custom_name) => custom_name.clone(),
         None => format!("car_{}", &container_id[..6]),
@@ -2453,363 +2346,405 @@ async fn run_container_with_storage(
         "image": parsed_image.to_string(),
         "created": chrono::Utc::now().to_rfc3339(),
         "rootfs": rootfs.to_string_lossy(),
-        "command": container_config.command,
+        "command": final_command,
         "status": "running",
         "storage_driver": storage_driver_str,
         "elevated": elevated
     });
 
-    if let Some(parent) = container_meta_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&container_meta_path, metadata.to_string())?;
+    // Spawn parallel tasks for metadata and directory creation
+    let metadata_str = metadata.to_string();
+    let meta_path = container_meta_path.clone();
+    let bundle_dir = storage.container_path(&container_id);
+    let bundle_dir_clone = bundle_dir.clone();
+
+    let runc_root_path = if let Ok(home) = std::env::var("HOME") {
+        format!("{}/.local/share/carrier/runc", home)
+    } else {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", nix::unistd::getuid().as_raw()));
+        format!("{}/carrier/runc", runtime_dir)
+    };
+    let runc_root_clone = runc_root_path.clone();
+
+    // Parallel execution
+    let meta_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&meta_path, metadata_str).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    let dirs_task = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        std::fs::create_dir_all(&bundle_dir_clone).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&runc_root_clone).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+
+    // Wait for both to complete
+    let (meta_result, dirs_result) = tokio::join!(meta_task, dirs_task);
+    meta_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    dirs_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     // Execute in container environment with proper isolation
-    if detach {
-        println!(
-            "\nRunning container {} in detached mode...",
-            short12(&container_id)
-        );
-    } else {
-        println!("\nRunning container {}...", container_id);
+    if verbose {
+        if detach {
+            println!(
+                "\nRunning container {} in detached mode...",
+                short12(&container_id)
+            );
+        } else {
+            println!("\nRunning container {}...", container_id);
+        }
     }
-    println!("Command: {:?}", &command_to_run);
+    // Command prepared (silent for performance)
 
     use std::process::Stdio;
 
     if command_to_run.is_empty() || command_to_run[0].is_empty() {
-        println!("No command specified in image");
+        if verbose {
+            println!("No command specified in image");
+        }
         return Ok(());
     }
 
     // Detect if this should be an interactive container (not applicable in detached mode)
+    // Only use interactive mode if it's a plain shell without -c flag
+    let has_command_flag = command_to_run.contains(&"-c".to_string());
+    let is_shell_only = (command_to_run[0].contains("bash") || command_to_run[0].contains("sh"))
+        && command_to_run.len() == 1;
     let is_interactive = !detach
-        && (command_to_run[0].contains("bash")
-            || command_to_run[0].contains("sh")
+        && (is_shell_only
             || command_to_run.contains(&"-it".to_string())
-            || command_to_run.contains(&"-i".to_string()));
+            || command_to_run.contains(&"-i".to_string()))
+        && !has_command_flag;
 
     // Build the command path
-    let cmd_in_container = &command_to_run[0];
+    let _cmd_in_container = &command_to_run[0];
 
-    if !detach {
-        println!("Starting container with command: {}", cmd_in_container);
-    }
+    // Use runc for container execution
+    use std::process::Command;
 
-    // Use different approach based on elevated flag
-    let mut cmd = if elevated {
-        println!("Running container with elevated privileges (using sudo)...");
-        // For elevated mode, use sudo to run unshare without user namespace
-        // We need to set up /dev properly before chroot
-        let mut c = Command::new("sudo");
+    // Convert env to OCI format (KEY=VALUE strings)
+    let env_strings: Vec<String> = final_env
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
 
-        let root_dir = rootfs.display().to_string();
-        let command_str = command_to_run.join(" ");
+    // Generate OCI spec in parallel (already have bundle_dir from above)
+    let config_path = bundle_dir.join("config.json");
+    let container_id_clone = container_id.clone();
+    let rootfs_clone = rootfs.clone();
+    let cmd_clone = command_to_run.clone();
+    let wd_clone = final_working_dir.clone();
+    let volumes_clone: Vec<String> = volumes.to_vec();
 
-        // Create a shell script that sets up the container environment properly
-        let setup_and_run = format!(
-            "mount -t proc proc {root}/proc 2>/dev/null || true; \
-             mount -t sysfs sysfs {root}/sys 2>/dev/null || true; \
-             mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || \
-             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || true; \
-              rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
-              chown 0:0 {root}/dev/null 2>/dev/null || true; \
-              rm -f {root}/dev/zero 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-              chown 0:0 {root}/dev/zero 2>/dev/null || true; \
-              rm -f {root}/dev/random 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
-              chown 0:0 {root}/dev/random 2>/dev/null || true; \
-              rm -f {root}/dev/urandom 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-              chown 0:0 {root}/dev/urandom 2>/dev/null || true; \
-              rm -f {root}/dev/tty 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-              chown 0:0 {root}/dev/tty 2>/dev/null || true; \
-              rm -f {root}/dev/console 2>/dev/null || true; \
-              mknod -m 0600 {root}/dev/console c 5 1 2>/dev/null || true; \
-              chown 0:0 {root}/dev/console 2>/dev/null || true; \
-             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
-             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
-             mount -t tmpfs -o mode=1777,size=65536k shm {root}/dev/shm 2>/dev/null || true; \
-             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
-             ln -sf /proc/self/fd {root}/dev/fd 2>/dev/null || true; \
-             ln -sf /proc/self/fd/0 {root}/dev/stdin 2>/dev/null || true; \
-             ln -sf /proc/self/fd/1 {root}/dev/stdout 2>/dev/null || true; \
-             ln -sf /proc/self/fd/2 {root}/dev/stderr 2>/dev/null || true; \
-             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-             export HOME=/root; \
-             export TERM=xterm; \
-             export HOSTNAME=carrier-{host}; \
-             chroot {root} {cmd}",
-            root = root_dir,
-            host = &container_id[..8],
-            cmd = command_str
-        );
-
-        c.arg("unshare")
-            .arg("--mount")
-            .arg("--pid")
-            .arg("--fork") // Fork to properly handle PID namespace
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(setup_and_run);
-        c
-    } else {
-        // For rootless mode, use user namespaces for better isolation
-        // We need to set up /dev properly before chroot for rootless containers too
-        let mut c = Command::new("unshare");
-
-        let root_dir = rootfs.display().to_string();
-        let command_str = command_to_run.join(" ");
-
-        // Create a shell script that sets up the container environment properly for rootless
-        let setup_and_run = format!(
-            "mount -t devtmpfs -o mode=755 devtmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || \
-             mount -t tmpfs -o mode=755,size=65536k,dev tmpfs {root}/dev 2>/dev/null || \
-             mount -o remount,dev {root}/dev 2>/dev/null || true; \
-              rm -f {root}/dev/null 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/null c 1 3 2>/dev/null || true; \
-              rm -f {root}/dev/zero 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/zero c 1 5 2>/dev/null || true; \
-              rm -f {root}/dev/random 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/random c 1 8 2>/dev/null || true; \
-              rm -f {root}/dev/urandom 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/urandom c 1 9 2>/dev/null || true; \
-              rm -f {root}/dev/tty 2>/dev/null || true; \
-              mknod -m 0666 {root}/dev/tty c 5 0 2>/dev/null || true; \
-             mkdir -p {root}/dev/pts {root}/dev/shm 2>/dev/null || true; \
-             mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts {root}/dev/pts 2>/dev/null || true; \
-             ln -sf /dev/pts/ptmx {root}/dev/ptmx 2>/dev/null || true; \
-             cp /etc/resolv.conf {root}/etc/resolv.conf 2>/dev/null || true; \
-             export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-             export HOME=/root; \
-             export TERM=xterm; \
-             export HOSTNAME=carrier-{host}; \
-             exec chroot {root} {cmd}",
-            root = root_dir,
-            host = &container_id[..8],
-            cmd = command_str
-        );
-
-        c.arg("--user")
-            .arg("--map-root-user") // Map current user to root in container
-            .arg("--mount")
-            .arg("--pid")
-            .arg("--fork") // Fork to properly handle PID namespace
-            .arg("--net") // Create network namespace for rootless
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(setup_and_run);
-        c
-    };
-
-    // For elevated containers, environment is already set in the shell command
-    // For rootless, it was set above
+    tokio::task::spawn_blocking(move || {
+        generate_oci_config(
+            &config_path,
+            &container_id_clone,
+            rootfs_clone,
+            cmd_clone,
+            env_strings,
+            wd_clone,
+            !elevated,
+            &volumes_clone,
+        ).map_err(|e| e.to_string())
+    }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     if detach {
-        // For detached containers, pipe stdout/stderr and write timestamped lines to log file
-        let log_path = storage.container_path(&container_id).join("container.log");
-
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        // Save the PID to a file
-        let pid_file = storage.container_path(&container_id).join("pid");
-        std::fs::write(&pid_file, child.id().to_string())?;
-
-        // Set up network for rootless containers
-        if !elevated {
-            let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
-            setup_container_network_if_needed(
-                &storage.container_path(&container_id),
-                &rootfs,
-                container_pid,
-            )?;
-        }
-
-        // Spawn logging threads
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let log_writer = std::sync::Arc::new(std::sync::Mutex::new(log_file));
-
-        // stdout thread
-        if let Some(stdout) = child.stdout.take() {
-            let writer = log_writer.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Write};
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    let stamp = chrono::Utc::now().to_rfc3339();
-                    let mut w = writer.lock().unwrap();
-                    let _ = writeln!(w, "{} {}", stamp, line);
-                }
-            });
-        }
-        // stderr thread
-        if let Some(stderr) = child.stderr.take() {
-            let writer = log_writer.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Write};
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().flatten() {
-                    let stamp = chrono::Utc::now().to_rfc3339();
-                    let mut w = writer.lock().unwrap();
-                    let _ = writeln!(w, "{} {}", stamp, line);
-                }
-            });
-        }
-
-        println!("Container {} started in background", short12(&container_id));
-        println!("Logs are being written to: {}", log_path.display());
-        println!("To view logs: carrier logs {}", short12(&container_id));
-        println!("To stop: carrier stop {}", short12(&container_id));
-
-        // Do not wait for the child; threads handle logging
-        return Ok(());
-    } else if is_interactive {
-        println!("\nStarting interactive container session...");
-        println!("Type 'exit' or press Ctrl+D to exit the container.\n");
-
-        // Build argv for unshare + chroot + command
-        let mut args: Vec<String> = vec![
-            "--user".into(),
-            "--map-root-user".into(),
-            "--mount".into(),
-            "--pid".into(),
-        ];
-
-        // Add network namespace for rootless containers
-        if !elevated {
-            args.push("--net".into());
-        }
-
-        args.extend(vec!["chroot".into(), rootfs.display().to_string()]);
-        args.extend(command_to_run.clone());
-
-        let exit_code = spawn_with_pty_and_network(
-            "unshare",
-            &args,
-            Some(&storage.container_path(&container_id)),
-            Some(&rootfs),
-            !elevated, // needs_network
-        )?;
-
-        // Remove PID file after process exits
-        let pid_file = storage.container_path(&container_id).join("pid");
-        let _ = std::fs::remove_file(&pid_file);
-
-        // Update container status
-        let metadata = serde_json::json!({
-            "id": container_id,
-            "image": parsed_image.to_string(),
-            "created": chrono::Utc::now().to_rfc3339(),
-            "rootfs": rootfs.to_string_lossy(),
-            "status": format!("exited ({})", exit_code)
-        });
-        std::fs::write(&container_meta_path, metadata.to_string())?;
-
-        if exit_code == 0 {
-            println!("\nContainer {} exited successfully", container_id);
-        } else {
+        // Detached mode: runc create + start
+        if verbose {
             println!(
-                "\nContainer {} exited with code {}",
-                container_id, exit_code
+                "Container {} started in detached mode",
+                short12(&container_id)
             );
         }
-    } else {
-        // For non-interactive containers, capture output
-        use std::process::Command;
-        match Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--pid",
-                "chroot",
-                &rootfs.to_string_lossy(),
-            ])
-            .args(&command_to_run)
-            .output()
-        {
-            Ok(output) => {
-                // Print output
-                if !output.stdout.is_empty() {
-                    print!("{}", String::from_utf8_lossy(&output.stdout));
-                }
-                if !output.stderr.is_empty() {
-                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-                }
 
-                let exit_code = output.status.code().unwrap_or(-1);
+        // Create the container
+        let create_status = Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("create")
+            .arg("--bundle")
+            .arg(&bundle_dir)
+            .arg(&container_id)
+            .status()?;
 
-                // Update container status
-                let metadata = serde_json::json!({
-                    "id": container_id,
-                    "image": parsed_image.to_string(),
-                    "created": chrono::Utc::now().to_rfc3339(),
-                    "rootfs": rootfs.to_string_lossy(),
-                    "status": format!("exited ({})", exit_code)
-                });
-                std::fs::write(&container_meta_path, metadata.to_string())?;
+        if !create_status.success() {
+            return Err(format!("Failed to create container with runc").into());
+        }
 
-                if exit_code == 0 {
-                    println!("\nContainer {} exited successfully", container_id);
-                } else {
-                    println!(
-                        "\nContainer {} exited with code {}",
-                        container_id, exit_code
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to execute container: {}", e);
+        // Start the container
+        let start_status = Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("start")
+            .arg(&container_id)
+            .status()?;
 
-                // Fallback for systems without proper unshare support
-                if e.to_string().contains("Operation not permitted") {
-                    println!("\nFalling back to direct execution mode...");
+        if !start_status.success() {
+            return Err(format!("Failed to start container with runc").into());
+        }
 
-                    // Execute directly in the overlay filesystem
-                    let cmd_path = rootfs.join(cmd_in_container.trim_start_matches('/'));
-                    if cmd_path.exists() {
-                        let mut fallback = Command::new(&cmd_path);
-                        fallback
-                            .args(&command_to_run[1..])
-                            .current_dir(&rootfs)
-                            .env(
-                                "PATH",
-                                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                            );
+        // Get container PID from runc state
+        let state_output = Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("state")
+            .arg(&container_id)
+            .output()?;
 
-                        if is_interactive {
-                            fallback
-                                .stdin(Stdio::inherit())
-                                .stdout(Stdio::inherit())
-                                .stderr(Stdio::inherit());
+        if state_output.status.success() {
+            if let Ok(state_json) = String::from_utf8(state_output.stdout) {
+                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) {
+                    if let Some(pid) = state["pid"].as_i64() {
+                        let pid_file = bundle_dir.join("pid");
+                        std::fs::write(&pid_file, pid.to_string())?;
 
-                            let mut child = fallback.spawn()?;
-                            let _ = child.wait();
-                        } else {
-                            if let Ok(output) = fallback.output() {
-                                print!("{}", String::from_utf8_lossy(&output.stdout));
-                                if !output.stderr.is_empty() {
-                                    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-                                }
-                            }
+                        // Set up network for rootless containers with port mappings
+                        if !elevated {
+                            setup_container_network_with_ports(
+                                &bundle_dir,
+                                &rootfs,
+                                nix::unistd::Pid::from_raw(pid as i32),
+                                ports,
+                            )?;
                         }
                     }
                 }
             }
+        }
+
+        println!("To view logs: carrier logs {}", short12(&container_id));
+        println!("To stop: carrier stop {}", short12(&container_id));
+
+        return Ok(());
+    }
+
+    // Foreground mode: use runc create + network setup + exec
+    // This ensures network is properly configured before the container runs
+    if is_interactive && verbose {
+        println!("\nStarting interactive container session...");
+        println!("Type 'exit' or press Ctrl+D to exit the container.\n");
+    }
+
+    // Modify OCI spec to use a pause-like init process
+    // We'll use `sleep infinity` as init, then exec the real command
+    let config_path = bundle_dir.join("config.json");
+    let mut oci_spec: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+
+    // Save the original command to exec later
+    let original_command = command_to_run.clone();
+
+    // Replace process args with a long-running process for init
+    oci_spec["process"]["args"] = serde_json::json!([
+        "/bin/sh",
+        "-c",
+        "trap 'exit 0' TERM; sleep infinity & wait $!"
+    ]);
+
+    // Disable terminal for the init process (we'll use it for exec)
+    oci_spec["process"]["terminal"] = serde_json::json!(false);
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&oci_spec)?)?;
+
+    // Create the container with the pause process
+    let create_status = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("create")
+        .arg("--bundle")
+        .arg(&bundle_dir)
+        .arg(&container_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !create_status.success() {
+        return Err(format!("Failed to create container with runc").into());
+    }
+
+    // Get container PID from runc state
+    let state_output = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("state")
+        .arg(&container_id)
+        .output()?;
+
+    if state_output.status.success() {
+        if let Ok(state_json) = String::from_utf8(state_output.stdout) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) {
+                if let Some(pid) = state["pid"].as_i64() {
+                    let pid_file = bundle_dir.join("pid");
+                    std::fs::write(&pid_file, pid.to_string())?;
+
+                    // Set up network for rootless containers with port mappings
+                    if !elevated {
+                        setup_container_network_with_ports(
+                            &bundle_dir,
+                            &rootfs,
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            ports,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Start the container (starts the pause process)
+    let start_status = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("start")
+        .arg(&container_id)
+        .status()?;
+
+    if !start_status.success() {
+        return Err(format!("Failed to start container with runc").into());
+    }
+
+    // Now exec the actual command with inherited stdio
+    use std::io::IsTerminal;
+    let use_tty = is_interactive && std::io::stdin().is_terminal();
+
+    // Try with TTY first if interactive, fall back to non-TTY if it fails
+    let exec_result = if use_tty {
+        let mut exec_cmd = Command::new("runc");
+        exec_cmd
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("exec")
+            .arg("-t") // Allocate pseudo-TTY
+            .arg(&container_id);
+
+        for arg in &original_command {
+            exec_cmd.arg(arg);
+        }
+
+        exec_cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let result = exec_cmd.status();
+
+        // If TTY allocation failed, retry without -t
+        if result.as_ref().map(|s| s.code() == Some(255)).unwrap_or(false) {
+            eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
+            let mut retry_cmd = Command::new("runc");
+            retry_cmd
+                .arg("--root")
+                .arg(&runc_root_path)
+                .arg("exec")
+                .arg(&container_id);
+
+            for arg in &original_command {
+                retry_cmd.arg(arg);
+            }
+
+            retry_cmd
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+
+            retry_cmd.status()
+        } else {
+            result
+        }
+    } else {
+        let mut exec_cmd = Command::new("runc");
+        exec_cmd
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("exec")
+            .arg(&container_id);
+
+        for arg in &original_command {
+            exec_cmd.arg(arg);
+        }
+
+        exec_cmd
+            .stdin(if is_interactive {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        exec_cmd.status()
+    };
+
+    // Get exit code from exec
+    let exit_code = match exec_result {
+        Ok(status) => status.code().unwrap_or(-1),
+        Err(e) => {
+            let _ = Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root_path)
+                .arg("kill")
+                .arg(&container_id)
+                .arg("SIGKILL")
+                .status();
+            let _ = Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root_path)
+                .arg("delete")
+                .arg(&container_id)
+                .status();
+            return Err(format!("Failed to exec in container: {}", e).into());
+        }
+    };
+
+    // Kill and delete the container
+    let _ = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("kill")
+        .arg(&container_id)
+        .arg("SIGTERM")
+        .status();
+
+    // Give it a moment to clean up
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let _ = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("delete")
+        .arg(&container_id)
+        .status();
+
+    // Update container status
+    let metadata = serde_json::json!({
+        "id": container_id,
+        "name": container_name,
+        "image": parsed_image.to_string(),
+        "created": chrono::Utc::now().to_rfc3339(),
+        "rootfs": rootfs.to_string_lossy(),
+        "command": original_command,
+        "status": "exited",
+        "exit_code": exit_code,
+        "storage_driver": storage_driver_str,
+        "elevated": elevated
+    });
+    std::fs::write(&container_meta_path, metadata.to_string())?;
+
+    if verbose {
+        if exit_code == 0 {
+            println!("\nContainer {} exited successfully", short12(&container_id));
+        } else {
+            println!(
+                "\nContainer {} exited with code {}",
+                short12(&container_id),
+                exit_code
+            );
         }
     }
 
@@ -2828,62 +2763,365 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
+/// Cache for subuid/subgid mappings to avoid repeated file I/O
+use std::sync::OnceLock;
+static SUBID_CACHE: OnceLock<(Option<(u32, u32)>, Option<(u32, u32)>)> = OnceLock::new();
+
+/// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid (with caching)
+fn read_subid_mappings(file_path: &str, username: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let content = fs::read_to_string(file_path)?;
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 && parts[0] == username {
+            let start: u32 = parts[1].parse()?;
+            let count: u32 = parts[2].parse()?;
+            return Ok((start, count));
+        }
+    }
+
+    Err(format!("No mapping found for user {} in {}", username, file_path).into())
+}
+
+/// Get UID/GID mappings for rootless containers (with caching)
+fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    use std::env;
+
+    // Initialize cache if needed
+    let (cached_subuid, cached_subgid) = SUBID_CACHE.get_or_init(|| {
+        // Get username for looking up subuid/subgid
+        let username = env::var("USER").unwrap_or_else(|_| {
+            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .unwrap_or_else(|| uid.to_string())
+        });
+
+        let subuid = read_subid_mappings("/etc/subuid", &username).ok();
+        let subgid = read_subid_mappings("/etc/subgid", &username).ok();
+
+        // Only print warnings once when cache is initialized
+        if subuid.is_none() {
+            eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
+            eprintln!("Consider adding an entry to /etc/subuid: {}:100000:65536", username);
+        }
+        if subgid.is_none() {
+            eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
+            eprintln!("Consider adding an entry to /etc/subgid: {}:100000:65536", username);
+        }
+
+        (subuid, subgid)
+    });
+
+    // Build UID mappings from cache
+    let uid_mappings = if let Some((subuid_start, subuid_count)) = cached_subuid {
+        vec![
+            serde_json::json!({"containerID": 0, "hostID": uid, "size": 1}),
+            serde_json::json!({"containerID": 1, "hostID": subuid_start, "size": subuid_count}),
+        ]
+    } else {
+        vec![serde_json::json!({"containerID": 0, "hostID": uid, "size": 1})]
+    };
+
+    // Build GID mappings from cache
+    let gid_mappings = if let Some((subgid_start, subgid_count)) = cached_subgid {
+        vec![
+            serde_json::json!({"containerID": 0, "hostID": gid, "size": 1}),
+            serde_json::json!({"containerID": 1, "hostID": subgid_start, "size": subgid_count}),
+        ]
+    } else {
+        vec![serde_json::json!({"containerID": 0, "hostID": gid, "size": 1})]
+    };
+
+    (uid_mappings, gid_mappings)
+}
+
+/// Parse a volume specification string (host_path:container_path[:ro])
+fn parse_volume_spec(spec: &str) -> Option<(String, String, bool)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let host_path = parts[0].to_string();
+    let container_path = parts[1].to_string();
+    let readonly = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
+    Some((host_path, container_path, readonly))
+}
+
+/// Parse a port mapping specification (host_port:container_port or host_port:container_port/protocol)
+fn parse_port_spec(spec: &str) -> Option<(u16, u16, String)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let host_port: u16 = parts[0].parse().ok()?;
+
+    // Check for protocol specification (e.g., 80/tcp)
+    let (container_port, protocol) = if parts[1].contains('/') {
+        let port_proto: Vec<&str> = parts[1].split('/').collect();
+        (port_proto[0].parse().ok()?, port_proto.get(1).unwrap_or(&"tcp").to_string())
+    } else {
+        (parts[1].parse().ok()?, "tcp".to_string())
+    };
+
+    Some((host_port, container_port, protocol))
+}
+
+fn generate_oci_config(
+    config_path: &Path,
+    container_id: &str,
+    rootfs: PathBuf,
+    command: Vec<String>,
+    env: Vec<String>,
+    working_dir: String,
+    add_network_ns: bool,
+    volumes: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let uid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
+
+    // Get proper UID/GID mappings from subuid/subgid
+    let (uid_mappings, gid_mappings) = get_id_mappings(uid, gid);
+
+    let mut namespaces = vec![
+        serde_json::json!({"type": "pid"}),
+        serde_json::json!({"type": "ipc"}),
+        serde_json::json!({"type": "uts"}),
+        serde_json::json!({"type": "mount"}),
+        serde_json::json!({"type": "user"}),
+    ];
+
+    if add_network_ns {
+        namespaces.push(serde_json::json!({"type": "network"}));
+    }
+
+    // Build mounts array with default mounts
+    let mut mounts = vec![
+        serde_json::json!({
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc"
+        }),
+        serde_json::json!({
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/pts",
+            "type": "devpts",
+            "source": "devpts",
+            "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/mqueue",
+            "type": "mqueue",
+            "source": "mqueue",
+            "options": ["nosuid", "noexec", "nodev"]
+        }),
+        serde_json::json!({
+            "destination": "/sys",
+            "type": "sysfs",
+            "source": "sysfs",
+            "options": ["nosuid", "noexec", "nodev", "ro"]
+        }),
+    ];
+
+    // Add user-specified volume mounts
+    for vol_spec in volumes {
+        if let Some((host_path, container_path, readonly)) = parse_volume_spec(vol_spec) {
+            // Resolve to absolute path
+            let abs_host_path = if host_path.starts_with('/') {
+                PathBuf::from(&host_path)
+            } else {
+                std::env::current_dir()?.join(&host_path)
+            };
+
+            // Ensure host path exists
+            if !abs_host_path.exists() {
+                std::fs::create_dir_all(&abs_host_path)?;
+            }
+
+            let mut options = vec!["rbind".to_string()];
+            if readonly {
+                options.push("ro".to_string());
+            } else {
+                options.push("rw".to_string());
+            }
+
+            mounts.push(serde_json::json!({
+                "destination": container_path,
+                "type": "bind",
+                "source": abs_host_path.to_string_lossy(),
+                "options": options
+            }));
+        }
+    }
+
+    let config = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "process": {
+            "terminal": true,
+            "user": {"uid": 0, "gid": 0},
+            "args": command,
+            "env": env,
+            "cwd": working_dir,
+            "capabilities": {
+                "bounding": [],
+                "effective": [],
+                "inheritable": [],
+                "permitted": [],
+                "ambient": []
+            },
+            "rlimits": [
+                {"type": "RLIMIT_NOFILE", "hard": 1024, "soft": 1024}
+            ]
+        },
+        "root": {
+            "path": rootfs,
+            "readonly": false
+        },
+        "hostname": container_id,
+        "mounts": mounts,
+        "linux": {
+            "namespaces": namespaces,
+            "uidMappings": uid_mappings,
+            "gidMappings": gid_mappings
+        }
+    });
+
+    std::fs::write(config_path, serde_json::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+
 /// Set up network for an existing container if not already configured
 fn setup_container_network_if_needed(
     container_dir: &Path,
     rootfs: &Path,
     container_pid: nix::unistd::Pid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    setup_container_network_with_ports(container_dir, rootfs, container_pid, &[])
+}
+
+/// Set up network for a container with optional port mappings
+fn setup_container_network_with_ports(
+    container_dir: &Path,
+    _rootfs: &Path,
+    container_pid: nix::unistd::Pid,
+    ports: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     // Check if network is already set up by looking for network helper processes
     let pid_raw = container_pid.as_raw();
 
-    // Check for existing pasta or slirp4netns processes for this container
-    let check_pasta = Command::new("pgrep")
-        .args(&["-f", &format!("pasta.*{}", pid_raw)])
-        .output();
-
-    let check_slirp = Command::new("pgrep")
-        .args(&["-f", &format!("slirp4netns.*{}", pid_raw)])
-        .output();
-
-    let network_exists = (check_pasta.is_ok() && check_pasta.unwrap().status.success())
-        || (check_slirp.is_ok() && check_slirp.unwrap().status.success());
+    // Single pgrep call to check for both pasta and slirp4netns
+    let network_exists = Command::new("pgrep")
+        .args(&["-f", &format!("(pasta|slirp4netns).*{}", pid_raw)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
     if network_exists {
-        println!("Network already configured for container");
         return Ok(());
     }
 
-    println!("Setting up network for container...");
+    // Set up basic DNS configuration for container in the upper layer
+    // We write to the upper directory since the merged overlay is root-owned
+    // from outside the user namespace and we can't write to it directly
+    let upper_dir = container_dir.join("upper");
+    let etc_dir = upper_dir.join("etc");
+    std::fs::create_dir_all(&etc_dir)?;
+    let resolv_conf = etc_dir.join("resolv.conf");
+    std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
 
-    // Create network configuration
-    let network_config = NetworkConfig::default();
-    let mut network_mgr = NetworkManager::new(network_config);
-
-    // Set up DNS configuration files
-    network_mgr.setup_dns(rootfs)?;
-
-    // Start network helper (pasta or slirp4netns)
-    network_mgr.setup_network(container_pid)?;
-
-    // Store network manager info for cleanup later
+    // Start slirp4netns to provide userspace networking
     let network_pid_file = container_dir.join("network.pid");
-    if let Ok(output) = Command::new("pgrep")
-        .args(&["-f", &format!("(pasta|slirp4netns).*{}", pid_raw)])
-        .output()
-    {
-        if output.status.success() {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_pid) = pids.lines().next() {
-                std::fs::write(&network_pid_file, first_pid)?;
-            }
+
+    // Build slirp4netns command with port forwarding - skip `which` check for performance
+    let mut slirp_cmd = Command::new("slirp4netns");
+    slirp_cmd
+        .arg("--configure")
+        .arg("--mtu=65520")
+        .arg("--disable-host-loopback");
+
+    // Add port forwards
+    for port_spec in ports {
+        if let Some((host_port, container_port, _protocol)) = parse_port_spec(port_spec) {
+            // slirp4netns uses format: host_port:guest_port
+            slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
+            println!("Port mapping: {} -> {}", host_port, container_port);
         }
     }
 
-    println!("Network setup complete");
+    slirp_cmd
+        .arg(pid_raw.to_string())
+        .arg("tap0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
-    // Keep network manager alive by leaking it - it will be cleaned up when container stops
-    std::mem::forget(network_mgr);
+    match slirp_cmd.spawn() {
+        Ok(child) => {
+            // Store the slirp4netns PID for cleanup
+            let slirp_pid = child.id();
+            let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
+        }
+        Err(_) => {
+            // Silent failure - slirp4netns not available, network will be limited but container can still run
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up cgroup resource limits for carrier globally and move current process into it
+fn setup_carrier_cgroup_limits() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    // Get user's delegated cgroup path
+    let uid = nix::unistd::getuid().as_raw();
+    let carrier_cgroup = format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service/carrier.slice",
+        uid, uid
+    );
+
+    let carrier_path = std::path::Path::new(&carrier_cgroup);
+    if !carrier_path.exists() {
+        // Create carrier.slice if it doesn't exist
+        let _ = fs::create_dir_all(carrier_path);
+    }
+
+    // Set generous per-container limits on the carrier.slice itself
+    // These will be inherited by all containers
+
+    // Memory: 8GB per carrier.slice (shared by all containers)
+    let memory_max = carrier_path.join("memory.max");
+    if memory_max.exists() {
+        let _ = fs::write(&memory_max, (8u64 * 1024 * 1024 * 1024).to_string());
+    }
+
+    // PIDs: 32768 total PIDs for all containers (generous limit)
+    let pids_max = carrier_path.join("pids.max");
+    if pids_max.exists() {
+        let _ = fs::write(&pids_max, "32768");
+    }
+
+    // Move current process (and all future children) into carrier.slice
+    let cgroup_procs = carrier_path.join("cgroup.procs");
+    if cgroup_procs.exists() {
+        let pid = std::process::id();
+        let _ = fs::write(&cgroup_procs, pid.to_string());
+    }
 
     Ok(())
 }
@@ -2913,53 +3151,12 @@ fn detect_compatible_term() -> &'static str {
     }
 }
 
-fn spawn_with_pty_and_network(
-    program: &str,
-    args: &[String],
-    container_dir: Option<&Path>,
-    rootfs: Option<&Path>,
-    needs_network: bool,
-) -> Result<i32, Box<dyn std::error::Error>> {
-    use std::process::Stdio;
-
-    // First spawn the process to get its PID for network setup
-    if needs_network && container_dir.is_some() && rootfs.is_some() {
-        let mut initial_cmd = Command::new(program);
-        initial_cmd.args(args);
-        initial_cmd.stdin(Stdio::null());
-        initial_cmd.stdout(Stdio::null());
-        initial_cmd.stderr(Stdio::null());
-
-        let mut child = initial_cmd.spawn()?;
-        let container_pid = nix::unistd::Pid::from_raw(child.id() as i32);
-
-        // Give the process a moment to set up namespaces
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // Set up networking
-        if let Err(e) = setup_container_network_if_needed(
-            container_dir.unwrap(),
-            rootfs.unwrap(),
-            container_pid,
-        ) {
-            eprintln!("Warning: Failed to set up network: {}", e);
-        }
-
-        // Kill the initial process
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    // Now run the actual PTY session
-    spawn_with_pty(program, args)
-}
-
 fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read, Write};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     };
 
     // Check if we're actually in a TTY
@@ -3010,6 +3207,15 @@ fn spawn_with_pty(program: &str, args: &[String]) -> Result<i32, Box<dyn std::er
         pixel_width: 0,
         pixel_height: 0,
     };
+
+    // Ensure /dev/ptmx exists - create symlink if needed
+    if !std::path::Path::new("/dev/ptmx").exists() && std::path::Path::new("/dev/pts/ptmx").exists()
+    {
+        eprintln!("Warning: /dev/ptmx not found. PTY functionality requires /dev/ptmx");
+        eprintln!("Run: sudo ln -s /dev/pts/ptmx /dev/ptmx");
+        return Err("PTY not available: /dev/ptmx missing".into());
+    }
+
     let pair = pty_system.openpty(size)?;
 
     // Build command
@@ -3239,10 +3445,10 @@ fn fuzzy_match(text: &str, pattern: &str) -> bool {
         return true;
     }
     let mut it = text.chars();
-    for pc in pattern.chars() {
+    for pc in pattern.chars().map(|c| c.to_ascii_lowercase()) {
         let mut found = false;
         while let Some(tc) = it.next() {
-            if tc == pc {
+            if tc.to_ascii_lowercase() == pc {
                 found = true;
                 break;
             }
@@ -3333,7 +3539,7 @@ mod tests {
     fn test_parse_since_rfc3339() {
         let s = "2020-01-01T00:00:00Z";
         let dt = parse_since(s).unwrap();
-        assert_eq!(dt.to_rfc3339(), s);
+        assert_eq!(dt.to_rfc3339(), "2020-01-01T00:00:00+00:00");
     }
 
     #[test]
@@ -3420,27 +3626,31 @@ fn seek_to_last_n_lines(
     if n == 0 {
         return Ok(0);
     }
-    let pos_len = file.metadata()?.len() as i64;
-    let mut pos = pos_len;
-    let mut count = 0usize;
-    let mut buf = [0u8; 1024];
-    while pos > 0 && count <= n {
-        let read_size = std::cmp::min(buf.len() as i64, pos) as usize;
-        pos -= read_size as i64;
-        file.seek(SeekFrom::Start(pos as u64))?;
-        file.read_exact(&mut buf[..read_size])?;
-        for &b in buf[..read_size].iter().rev() {
-            if b == b'\n' {
-                count += 1;
-                if count > n {
-                    break;
-                }
-            }
+    let file_len = file.metadata()?.len();
+
+    // Read the entire file backwards to find newlines
+    let mut newline_positions = Vec::new();
+    let mut buf = vec![0u8; file_len as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut buf)?;
+
+    // Find all newline positions
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
+            newline_positions.push(i);
         }
     }
-    // If file shorter than requested lines, start at 0
-    let start = if count > n { pos as u64 } else { 0 };
-    Ok(start)
+
+    // If we have fewer or equal newlines than requested lines, return start of file
+    if newline_positions.len() <= n {
+        return Ok(0);
+    }
+
+    // Get the position after the newline that precedes the last n lines
+    let target_newline_idx = newline_positions.len() - n - 1;
+    let start_pos = newline_positions[target_newline_idx] + 1;
+
+    Ok(start_pos as u64)
 }
 
 // List command implementation
@@ -3702,31 +3912,83 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     "Unknown".to_string()
                                 };
 
-                                // Check if container is actually running if it claims to be
+                                // Check if container is actually running using runc state
                                 let actual_status = if status == "running"
                                     || status.starts_with("Up")
                                 {
-                                    // Check PID file and process
-                                    let pid_file = entry.path().join("pid");
-                                    if pid_file.exists() {
-                                        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                                            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                                                use nix::sys::signal::{kill, Signal};
-                                                use nix::unistd::Pid;
+                                    // Query runc for actual state
+                                    let runc_root_path = get_runc_root();
 
-                                                let process_pid = Pid::from_raw(pid);
-                                                if kill(process_pid, None).is_ok() {
-                                                    status // Process is actually running
+                                    let state_result = std::process::Command::new("runc")
+                                        .arg("--root")
+                                        .arg(&runc_root_path)
+                                        .arg("state")
+                                        .arg(&container_id)
+                                        .output();
+
+                                    if let Ok(output) = state_result {
+                                        if output.status.success() {
+                                            if let Ok(state_json) = String::from_utf8(output.stdout)
+                                            {
+                                                if let Ok(state) =
+                                                    serde_json::from_str::<serde_json::Value>(
+                                                        &state_json,
+                                                    )
+                                                {
+                                                    if let Some(runc_status) =
+                                                        state["status"].as_str()
+                                                    {
+                                                        match runc_status {
+                                                            "running" => status,
+                                                            "stopped" | "created" => {
+                                                                // Update metadata to reflect stopped state
+                                                                let mut metadata_mut =
+                                                                    metadata.clone();
+                                                                metadata_mut["status"] =
+                                                                    serde_json::json!("exited");
+                                                                let _ = std::fs::write(
+                                                                    &metadata_path,
+                                                                    metadata_mut.to_string(),
+                                                                );
+                                                                "exited"
+                                                            }
+                                                            _ => "exited",
+                                                        }
+                                                    } else {
+                                                        status
+                                                    }
                                                 } else {
-                                                    // Process is dead, update metadata
-                                                    let mut metadata_mut = metadata.clone();
-                                                    metadata_mut["status"] =
-                                                        serde_json::json!("exited");
-                                                    let _ = std::fs::write(
-                                                        &metadata_path,
-                                                        metadata_mut.to_string(),
-                                                    );
-                                                    let _ = std::fs::remove_file(&pid_file);
+                                                    status
+                                                }
+                                            } else {
+                                                status
+                                            }
+                                        } else {
+                                            // Container doesn't exist in runc, mark as exited
+                                            let mut metadata_mut = metadata.clone();
+                                            metadata_mut["status"] = serde_json::json!("exited");
+                                            let _ = std::fs::write(
+                                                &metadata_path,
+                                                metadata_mut.to_string(),
+                                            );
+                                            "exited"
+                                        }
+                                    } else {
+                                        // Fallback: check PID file
+                                        let pid_file = entry.path().join("pid");
+                                        if pid_file.exists() {
+                                            if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+                                            {
+                                                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                                                    use nix::sys::signal::kill;
+                                                    use nix::unistd::Pid;
+
+                                                    if kill(Pid::from_raw(pid), None).is_ok() {
+                                                        status
+                                                    } else {
+                                                        "exited"
+                                                    }
+                                                } else {
                                                     "exited"
                                                 }
                                             } else {
@@ -3735,15 +3997,6 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                         } else {
                                             "exited"
                                         }
-                                    } else {
-                                        // No PID file, container is not running
-                                        let mut metadata_mut = metadata.clone();
-                                        metadata_mut["status"] = serde_json::json!("exited");
-                                        let _ = std::fs::write(
-                                            &metadata_path,
-                                            metadata_mut.to_string(),
-                                        );
-                                        "exited"
                                     }
                                 } else {
                                     status
@@ -3952,8 +4205,23 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
     }
 }
 
+/// Ask user for confirmation when in interactive mode
+fn confirm_removal(item_type: &str, name: &str) -> bool {
+    print!("Remove {} '{}'? (y/N): ", item_type, name);
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => {
+            let input = input.trim().to_lowercase();
+            input == "y" || input == "yes"
+        }
+        Err(_) => false,
+    }
+}
+
 // Remove command implementation
-pub async fn remove_item(item: String, force: bool) {
+pub async fn remove_item(item: String, force: bool, interactive: bool) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
         Ok(s) => s,
@@ -3992,6 +4260,14 @@ pub async fn remove_item(item: String, force: bool) {
             }
         }
 
+        // Interactive confirmation for container removal
+        if interactive {
+            if !confirm_removal("container", &container_id) {
+                println!("Container removal cancelled.");
+                return;
+            }
+        }
+
         // Unmount overlay if it's mounted
         let merged_dir = container_path.join("merged");
         if merged_dir.exists() {
@@ -4018,6 +4294,14 @@ pub async fn remove_item(item: String, force: bool) {
     // Not a container, try as an image
     // First try to find by image ID (digest)
     if let Ok(Some(image_info)) = find_image_by_id(&storage, &item) {
+        // Interactive confirmation for image removal
+        if interactive {
+            let image_name = format!("{}:{}", image_info.0, image_info.1);
+            if !confirm_removal("image", &image_name) {
+                println!("Image removal cancelled.");
+                return;
+            }
+        }
         remove_image(&storage, &image_info.0, &image_info.1, &image_info.2, force);
         return;
     }
@@ -4031,6 +4315,15 @@ pub async fn remove_item(item: String, force: bool) {
             if !metadata_path.exists() {
                 eprintln!("Image {} not found", item);
                 return;
+            }
+
+            // Interactive confirmation for image removal
+            if interactive {
+                let image_name = format!("{}:{}", parsed_image.image, parsed_image.tag);
+                if !confirm_removal("image", &image_name) {
+                    println!("Image removal cancelled.");
+                    return;
+                }
             }
 
             // Read the actual manifest to get layer info
@@ -4068,15 +4361,19 @@ pub async fn remove_all_stopped_containers(force: bool) {
 
     let mut removed_count = 0;
     let mut failed_count = 0;
-    let mut skipped_count = 0;
+    let skipped_count;
 
-    // Iterate through all containers
+    // First pass: collect containers to remove
+    let mut containers_to_remove = Vec::new();
+    let mut containers_to_skip = Vec::new();
+
     match std::fs::read_dir(&containers_dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
                     let container_id = entry.file_name().to_string_lossy().to_string();
-                    let metadata_path = entry.path().join("metadata.json");
+                    let container_path = entry.path();
+                    let metadata_path = container_path.join("metadata.json");
 
                     // Check container status
                     let should_remove = if metadata_path.exists() {
@@ -4099,43 +4396,9 @@ pub async fn remove_all_stopped_containers(force: bool) {
                     };
 
                     if should_remove {
-                        // Unmount overlay if mounted
-                        let merged_dir = entry.path().join("merged");
-                        if merged_dir.exists() {
-                            let _ = std::process::Command::new("fusermount")
-                                .arg("-u")
-                                .arg(&merged_dir)
-                                .output();
-
-                            let _ = std::process::Command::new("umount")
-                                .arg(&merged_dir)
-                                .output();
-                        }
-
-                        // Remove container directory
-                        match std::fs::remove_dir_all(entry.path()) {
-                            Ok(_) => {
-                                println!(
-                                    "Removed container {}",
-                                    &container_id[..12.min(container_id.len())]
-                                );
-                                removed_count += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Failed to remove container {}: {}",
-                                    &container_id[..12.min(container_id.len())],
-                                    e
-                                );
-                                failed_count += 1;
-                            }
-                        }
+                        containers_to_remove.push((container_id, container_path));
                     } else {
-                        println!(
-                            "Skipping running container {}",
-                            &container_id[..12.min(container_id.len())]
-                        );
-                        skipped_count += 1;
+                        containers_to_skip.push(container_id);
                     }
                 }
             }
@@ -4143,6 +4406,70 @@ pub async fn remove_all_stopped_containers(force: bool) {
         Err(e) => {
             eprintln!("Failed to read containers directory: {}", e);
             return;
+        }
+    }
+
+    // Report skipped containers
+    for container_id in &containers_to_skip {
+        println!(
+            "Skipping running container {}",
+            &container_id[..12.min(container_id.len())]
+        );
+    }
+    skipped_count = containers_to_skip.len();
+
+    // Parallel removal of containers
+    if !containers_to_remove.is_empty() {
+        let mut removal_handles = Vec::new();
+
+        for (container_id, container_path) in containers_to_remove {
+            let handle = tokio::task::spawn_blocking(move || {
+                // Unmount overlay if mounted
+                let merged_dir = container_path.join("merged");
+                if merged_dir.exists() {
+                    let _ = std::process::Command::new("fusermount")
+                        .arg("-u")
+                        .arg(&merged_dir)
+                        .output();
+
+                    let _ = std::process::Command::new("umount")
+                        .arg(&merged_dir)
+                        .output();
+                }
+
+                // Remove container directory
+                match std::fs::remove_dir_all(&container_path) {
+                    Ok(_) => Ok(container_id),
+                    Err(e) => Err((container_id, e.to_string())),
+                }
+            });
+
+            removal_handles.push(handle);
+        }
+
+        // Wait for all removals to complete
+        for handle in removal_handles {
+            match handle.await {
+                Ok(Ok(container_id)) => {
+                    println!(
+                        "Removed container {}",
+                        &container_id[..12.min(container_id.len())]
+                    );
+                    removed_count += 1;
+                }
+                Ok(Err((container_id, e))) => {
+                    eprintln!(
+                        "Failed to remove container {}: {}",
+                        &container_id[..12.min(container_id.len())],
+                        e
+                    );
+                    failed_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("Task failed: {}", e);
+                    failed_count += 1;
+                }
+            }
         }
     }
 
@@ -4210,55 +4537,112 @@ pub async fn stop_container(
 
     println!("Stopping container {}...", short12(&full_container_id));
 
-    // Get the PID file if it exists
-    let pid_file = container_dir.join("pid");
-    if pid_file.exists() {
-        let pid_str = std::fs::read_to_string(&pid_file)?;
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
+    // Use runc to stop the container properly
+    let runc_root_path = get_runc_root();
 
-            let container_pid = Pid::from_raw(pid);
+    // Check if container exists in runc
+    let state_result = Command::new("runc")
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("state")
+        .arg(&full_container_id)
+        .output();
 
-            // Try graceful shutdown with SIGTERM
-            if !force {
-                println!("Sending SIGTERM to process {}...", pid);
-                if let Err(e) = kill(container_pid, Signal::SIGTERM) {
-                    // Process might have already exited
-                    if e != nix::errno::Errno::ESRCH {
-                        eprintln!("Warning: Failed to send SIGTERM: {}", e);
-                    }
-                } else {
-                    // Wait for process to terminate gracefully
-                    let start = std::time::Instant::now();
-                    let timeout_duration = std::time::Duration::from_secs(timeout);
+    let container_in_runc = state_result
+        .map(|out| out.status.success())
+        .unwrap_or(false);
 
-                    while start.elapsed() < timeout_duration {
-                        // Check if process still exists
-                        if kill(container_pid, None).is_err() {
-                            // Process has exited
+    if container_in_runc {
+        // Use runc to stop the container
+        if !force {
+            println!("Sending SIGTERM via runc...");
+            let kill_status = Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root_path)
+                .arg("kill")
+                .arg(&full_container_id)
+                .arg("TERM")
+                .status();
+
+            if kill_status.is_ok() {
+                // Wait for graceful shutdown
+                let start = std::time::Instant::now();
+                let timeout_duration = std::time::Duration::from_secs(timeout);
+
+                while start.elapsed() < timeout_duration {
+                    let state = Command::new("runc")
+                        .arg("--root")
+                        .arg(&runc_root_path)
+                        .arg("state")
+                        .arg(&full_container_id)
+                        .output();
+
+                    if let Ok(out) = state {
+                        if !out.status.success() {
+                            // Container no longer exists
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if let Ok(json) = String::from_utf8(out.stdout) {
+                            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&json) {
+                                if state["status"].as_str() == Some("stopped") {
+                                    break;
+                                }
+                            }
+                        }
                     }
-
-                    // Check if we need to force kill
-                    if kill(container_pid, None).is_ok() {
-                        println!(
-                            "Container did not stop within {} seconds, forcing...",
-                            timeout
-                        );
-                        force_kill_container(container_pid)?;
-                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-            } else {
-                // Force kill immediately
-                force_kill_container(container_pid)?;
             }
         }
 
+        // Force kill if needed or requested
+        if force {
+            println!("Force killing container...");
+        } else {
+            println!("Sending SIGKILL via runc...");
+        }
+
+        let _ = Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("kill")
+            .arg(&full_container_id)
+            .arg("KILL")
+            .status();
+
+        // Delete the container from runc
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("delete")
+            .arg(&full_container_id)
+            .status();
+
         // Remove PID file
+        let pid_file = container_dir.join("pid");
         let _ = std::fs::remove_file(&pid_file);
+    } else {
+        // Container not in runc, try legacy PID-based stopping
+        let pid_file = container_dir.join("pid");
+        if pid_file.exists() {
+            let pid_str = std::fs::read_to_string(&pid_file)?;
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                use nix::sys::signal::{Signal, kill};
+                use nix::unistd::Pid;
+
+                let container_pid = Pid::from_raw(pid);
+                println!("Using legacy PID-based stop for process {}...", pid);
+
+                if !force {
+                    let _ = kill(container_pid, Signal::SIGTERM);
+                    std::thread::sleep(std::time::Duration::from_secs(timeout.min(5)));
+                }
+
+                let _ = kill(container_pid, Signal::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&pid_file);
+        }
     }
 
     // Clean up network processes (pasta or slirp4netns)
@@ -4266,7 +4650,7 @@ pub async fn stop_container(
     if network_pid_file.exists() {
         if let Ok(net_pid_str) = std::fs::read_to_string(&network_pid_file) {
             if let Ok(net_pid) = net_pid_str.trim().parse::<i32>() {
-                use nix::sys::signal::{kill, Signal};
+                use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
 
                 let network_pid = Pid::from_raw(net_pid);
@@ -4286,7 +4670,7 @@ pub async fn stop_container(
             let pids = String::from_utf8_lossy(&output.stdout);
             for pid_str in pids.lines() {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    use nix::sys::signal::{kill, Signal};
+                    use nix::sys::signal::{Signal, kill};
                     use nix::unistd::Pid;
 
                     let net_pid = Pid::from_raw(pid);
@@ -4322,23 +4706,14 @@ pub async fn stop_container(
     Ok(())
 }
 
-fn force_kill_container(pid: nix::unistd::Pid) -> Result<(), Box<dyn std::error::Error>> {
-    use nix::sys::signal::{kill, Signal};
-
-    println!("Sending SIGKILL to process {}...", pid);
-    if let Err(e) = kill(pid, Signal::SIGKILL) {
-        // Process might have already exited
-        if e != nix::errno::Errno::ESRCH {
-            return Err(format!("Failed to kill process: {}", e).into());
+fn calculate_image_size(storage: &StorageLayout, manifest: &serde_json::Value) -> String {
+    // First check for cached size (calculated during pull)
+    if let Some(cached_size) = manifest.get("cached_size").and_then(|v| v.as_u64()) {
+        if cached_size > 0 {
+            return format_size(cached_size);
         }
     }
 
-    // Give it a moment to die
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    Ok(())
-}
-
-fn calculate_image_size(storage: &StorageLayout, manifest: &serde_json::Value) -> String {
     let mut total_size: u64 = 0;
 
     // First check if this is a manifest list or a direct manifest
@@ -4668,7 +5043,8 @@ fn remove_image(
                                 {
                                     eprintln!(
                                         "Image {}:{} is being used by container {}. Use --force to remove",
-                                        image, tag,
+                                        image,
+                                        tag,
                                         entry.file_name().to_string_lossy()
                                     );
                                     return;
@@ -4789,12 +5165,12 @@ pub async fn authenticate_registry(
             auth_config.save()?;
 
             println!(
-                "✓ Successfully authenticated with {} as {}",
+                "[OK] Successfully authenticated with {} as {}",
                 registry, username
             );
         }
         Err(e) => {
-            eprintln!("✗ Authentication failed: {}", e);
+            eprintln!("[FAILED] Authentication failed: {}", e);
             return Err(e);
         }
     }
@@ -4818,11 +5194,19 @@ async fn test_registry_credentials(
 
     // Test with a simple API endpoint for each registry
     let test_url = match registry {
-        "docker.io" => "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/hello-world:pull",
+        "docker.io" => {
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/hello-world:pull"
+        }
         "quay.io" => "https://quay.io/v2/auth?service=quay.io&scope=repository:quay/busybox:pull",
-        "ghcr.io" => "https://ghcr.io/token?service=ghcr.io&scope=repository:library/hello-world:pull",
-        "gcr.io" => "https://gcr.io/v2/token?service=gcr.io&scope=repository:library/hello-world:pull",
-        "public.ecr.aws" => "https://public.ecr.aws/token?service=public.ecr.aws&scope=repository:library/hello-world:pull",
+        "ghcr.io" => {
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:library/hello-world:pull"
+        }
+        "gcr.io" => {
+            "https://gcr.io/v2/token?service=gcr.io&scope=repository:library/hello-world:pull"
+        }
+        "public.ecr.aws" => {
+            "https://public.ecr.aws/token?service=public.ecr.aws&scope=repository:library/hello-world:pull"
+        }
         _ => return Err(format!("Unsupported registry: {}", registry).into()),
     };
 
@@ -4897,8 +5281,8 @@ async fn get_token_with_credentials(
         .get(registry)
         .ok_or_else(|| format!("No auth endpoint configured for registry: {}", registry))?;
 
-    // Build scope for the specific image
-    let scope = format!("repository:{}:pull,push", image_path);
+    // Build scope for the specific image (only pull access needed for downloading)
+    let scope = format!("repository:{}:pull", image_path);
 
     let auth_url = match registry {
         "docker.io" => format!(
@@ -4944,15 +5328,15 @@ pub async fn verify_authentication() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Verifying stored credentials:");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("------------------------------");
 
     for (registry, creds) in &auth_config.auths {
         print!("  {}: ", registry);
         std::io::stdout().flush()?;
 
         match test_registry_credentials(registry, &creds.username, &creds.password).await {
-            Ok(_) => println!("✓ Valid (user: {})", creds.username),
-            Err(e) => println!("✗ Failed - {}", e),
+            Ok(_) => println!("[OK] Valid (user: {})", creds.username),
+            Err(e) => println!("[FAILED] {}", e),
         }
     }
 

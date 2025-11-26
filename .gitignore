@@ -1,1 +1,7 @@
 /target
+*.cargo/
+.cargo/*
+CLAUDE.md
+AGENTS.md
+*.claude/
+.claude/*

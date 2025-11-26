@@ -2,7 +2,7 @@
 
 ## Overview
 
-Carrier features a custom, lightweight, secure container runtime designed specifically for rootless operation. Unlike traditional container runtimes that depend on external tools like runc or crun, Carrier's runtime is fully integrated and optimized for performance and security.
+Carrier uses **runc** as its OCI-compliant container runtime for managing container execution and permissions. The runtime is designed specifically for rootless operation with comprehensive security features and automatic dependency management.
 
 ## Key Features
 
@@ -138,15 +138,17 @@ NetworkConfig {
 
 ```rust
 CgroupConfig {
-    memory_limit: Option<u64>,      // Bytes
-    memory_swap_limit: Option<u64>, // Bytes
-    cpu_quota: Option<u64>,         // Microseconds
-    cpu_period: Option<u64>,        // Microseconds
-    cpu_weight: Option<u32>,        // 1-10000
-    pids_limit: Option<u64>,        // Max processes
-    io_weight: Option<u32>,         // 1-10000
+    memory_limit: Option<u64>,      // Bytes (None = unlimited)
+    memory_swap_limit: Option<u64>, // Bytes (None = unlimited)
+    cpu_quota: Option<u64>,         // Microseconds (None = unlimited)
+    cpu_period: Option<u64>,        // Microseconds (None = unlimited)
+    cpu_weight: Option<u32>,        // 1-10000 (None = default weight)
+    pids_limit: Option<u64>,        // Max processes (None = unlimited)
+    io_weight: Option<u32>,         // 1-10000 (None = default weight)
 }
 ```
+
+**Default Configuration**: By default, all resource limits are set to `None` (unlimited). This prevents memory allocation issues with fork operations in user namespaces. Resource limits can be configured when needed but are disabled by default for maximum compatibility.
 
 ## Usage
 
@@ -240,19 +242,30 @@ carrier rm abc123
 carrier rm -c
 ```
 
-## Advantages Over Traditional Runtimes
+## Runtime Components
 
-### vs Podman/runc
-- **No External Dependencies**: No runc/crun binary required
-- **Tighter Integration**: Direct integration with Carrier's storage
-- **Faster Startup**: No OCI spec generation/parsing overhead
-- **Simpler Architecture**: No daemon, no complex state management
+### runc Integration
+Carrier uses **runc** for container lifecycle management:
+- **Container Creation**: OCI-compliant container initialization via `runc create`
+- **Container Execution**: Process execution with `runc exec`
+- **State Management**: Container state tracking via `runc state`
+- **Security**: Full namespace isolation and capability management
+- **Permissions**: User namespace mapping for rootless operation
+
+### Storage Driver Integration
+The runtime works seamlessly with multiple storage drivers:
+- **FUSE-OverlayFS**: Default choice with automatic installation
+- **Native Overlay**: Fallback for kernel-supported overlay
+- **VFS**: Final fallback ensuring compatibility everywhere
+
+## Advantages Over Traditional Setups
 
 ### vs Docker
 - **Fully Rootless**: No root daemon required
 - **No Daemon**: Direct execution without background service
 - **Lighter Weight**: Minimal resource overhead
 - **Better Security**: Rootless by default with strong isolation
+- **Automatic Setup**: Dependencies installed and configured automatically
 
 ## Requirements
 
@@ -260,8 +273,11 @@ carrier rm -c
 - Linux kernel 4.18+ (5.14+ recommended)
 - User namespaces enabled
 - Cgroups v2 mounted at `/sys/fs/cgroup`
+- `runc` installed (automatically checked)
 - `newuidmap` and `newgidmap` installed (uidmap package)
 - `slirp4netns` for networking
+- `fuse-overlayfs` (automatically installed if possible)
+- `fuse3` packages (automatically installed if possible)
 
 ### Kernel Configuration
 Required kernel features:
@@ -309,6 +325,12 @@ Planned improvements:
 **"Operation not permitted" errors**
 - Verify subuid/subgid configuration for your user
 - Ensure newuidmap/newgidmap have proper setuid permissions
+
+**"fork: cannot allocate memory"**
+- This typically occurs when memory cgroup limits are too restrictive
+- Default configuration now uses unlimited memory (no cgroups limits)
+- If you've set custom memory limits, increase them or remove them
+- Check system overcommit setting: `cat /proc/sys/vm/overcommit_memory`
 
 ## Technical Details
 

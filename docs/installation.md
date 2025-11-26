@@ -9,10 +9,11 @@ curl -LsSf https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh | sh
 ```
 
 This script will automatically:
-1. Check for required dependencies
-2. Install Rust if not present
-3. Clone and build Carrier from source
-4. Install the binary to `/usr/local/bin`
+1. Download pre-built binary (or build from source if unavailable)
+2. Verify SHA256 checksum for security
+3. Install the binary to `/usr/local/bin`
+4. Install shell completions (bash, zsh, fish)
+5. Install runtime dependencies (runc, fuse-overlayfs, etc.)
 
 ## Installation Methods
 
@@ -40,6 +41,66 @@ chmod +x setup.sh
 
 # Run installation
 ./setup.sh install
+```
+
+### Setup Script Commands
+
+The installation script supports multiple commands:
+
+```bash
+./setup.sh [COMMAND] [OPTIONS]
+
+Commands:
+  install       Install Carrier (default)
+  uninstall     Remove Carrier from system
+  update        Update to latest version
+  deps          Install runtime dependencies only
+  completions   Install shell completions only
+```
+
+### Setup Script Options
+
+```bash
+Options:
+  --binary          Force binary download (skip source build)
+  --source          Force source build (skip binary download)
+  --prefix PATH     Install to custom directory (default: /usr/local)
+  --no-deps         Skip runtime dependency installation
+  --no-completions  Skip shell completion installation
+  -y, --yes         Skip confirmation prompts
+  -v, --verbose     Show detailed output
+  -h, --help        Show help message
+```
+
+### Installation Examples
+
+```bash
+# Quick install with all defaults
+curl -LsSf https://raw.githubusercontent.com/javanhut/carrier/main/setup.sh | sh
+
+# Install to custom directory
+./setup.sh install --prefix ~/.local
+
+# Install without runtime dependencies
+./setup.sh install --no-deps
+
+# Force source build (useful if binaries not available)
+./setup.sh install --source
+
+# Non-interactive installation (skip prompts)
+./setup.sh install -y
+
+# Update to latest version
+./setup.sh update
+
+# Install only runtime dependencies
+./setup.sh deps
+
+# Install shell completions
+./setup.sh completions
+
+# Uninstall
+./setup.sh uninstall
 ```
 
 ### 2. Manual Installation from Source
@@ -167,9 +228,144 @@ carrier --version
 # Check help
 carrier --help
 
+# Check system dependencies
+carrier doctor
+
 # Test with a simple container
 carrier run alpine echo "Hello from Carrier!"
 ```
+
+## Dependency Checking with `carrier doctor`
+
+Carrier includes a built-in dependency checker that verifies all required and recommended dependencies are properly installed and configured.
+
+### Basic Usage
+
+```bash
+# Check all dependencies
+carrier doctor
+
+# Attempt to automatically fix missing dependencies
+carrier doctor --fix
+
+# Output results in JSON format (for scripting)
+carrier doctor --json
+
+# Show what would be installed without making changes (dry run)
+carrier doctor --dry-run
+
+# Install all dependencies at once
+carrier doctor --all
+
+# Install all dependencies without prompts
+carrier doctor --all -y
+
+# Install missing dependencies with verbose output
+carrier doctor --fix --verbose
+
+# Preview what will be installed with verbose output
+carrier doctor --fix --dry-run --verbose
+```
+
+### What It Checks
+
+The `carrier doctor` command verifies:
+
+**Essential Dependencies:**
+- `runc` - OCI container runtime
+- `fuse-overlayfs` - FUSE-based overlay filesystem
+- `/dev/fuse` - FUSE device
+- `fusermount3` - FUSE mount utility (with SUID bit)
+- User namespaces enabled
+
+**Recommended Dependencies:**
+- `pasta` - High-performance userspace networking
+- `slirp4netns` - Userspace networking (fallback)
+- `nsenter` - For shell/exec into containers
+- `newuidmap`/`newgidmap` - UID/GID mapping tools
+- `/etc/subuid` and `/etc/subgid` - Subordinate ID configuration
+
+### Example Output
+
+```
+Carrier Dependency Check
+========================
+
+Platform: Linux (Ubuntu)
+Kernel: 6.5.0-44-generic
+Package Manager: apt
+
+[OK] runc (runc version 1.1.12)
+[OK] fuse-overlayfs (fuse-overlayfs 1.13)
+[WARN] pasta - not found
+       Alternative: slirp4netns is available
+       To install: sudo apt-get install -y passt
+[OK] slirp4netns (slirp4netns version 1.2.0)
+[OK] nsenter (nsenter from util-linux 2.39.3)
+[WARN] newuidmap - missing SUID bit
+       Fix: sudo chmod u+s /usr/bin/newuidmap
+[OK] /dev/fuse
+[OK] fusermount3
+[OK] user_namespaces
+[OK] /etc/subuid (65536 UIDs)
+[OK] /etc/subgid (65536 GIDs)
+
+------------------------
+Summary: 9 passed, 2 warnings, 0 errors
+
+Run 'carrier doctor --fix' to attempt automatic fixes.
+```
+
+### Auto-Fix Mode
+
+When running with `--fix`, Carrier will:
+1. Check sudo availability before attempting installation
+2. Wait for package manager if locked by another process
+3. Update package cache before installing
+4. Prompt before installing each missing package (skip with `-y`)
+5. Use your system's package manager (apt, dnf, pacman, etc.)
+6. Retry failed installations with exponential backoff
+7. Verify each installation succeeded
+8. Set required SUID bits on binaries
+9. Load kernel modules if needed
+10. Configure subordinate UID/GID ranges
+
+```bash
+# Fix all issues with prompts
+carrier doctor --fix
+
+# Fix all issues without prompts
+carrier doctor --fix -y
+
+# See what would be fixed without making changes
+carrier doctor --fix --dry-run
+```
+
+### Batch Installation
+
+Use `--all` to install all dependencies in a single command:
+
+```bash
+# Install all dependencies with prompts
+carrier doctor --all
+
+# Install all dependencies without prompts
+carrier doctor --all -y
+
+# Preview the batch install command
+carrier doctor --all --dry-run
+```
+
+### Command Line Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--fix` | | Install missing dependencies individually |
+| `--all` | | Install all dependencies in one batch |
+| `--dry-run` | | Show what would be done without making changes |
+| `--yes` | `-y` | Skip confirmation prompts |
+| `--verbose` | `-v` | Show detailed output during installation |
+| `--json` | | Output results in JSON format |
 
 ## Uninstallation
 

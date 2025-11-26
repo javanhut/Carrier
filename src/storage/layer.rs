@@ -1,6 +1,6 @@
 use flate2::read::GzDecoder;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tar::Archive;
 
 pub fn extract_layer_rootless(
@@ -22,31 +22,4 @@ pub fn extract_layer_rootless(
     archive.unpack(output_dir)?;
 
     Ok(())
-}
-
-pub fn extract_layers_sequential(
-    layer_archives: &[PathBuf],
-    target_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Extracting {} layers...", layer_archives.len());
-
-    for (idx, archive_path) in layer_archives.iter().enumerate() {
-        println!("  Extracting layer {}/{}...", idx + 1, layer_archives.len());
-        extract_layer_rootless(archive_path, target_dir)?;
-    }
-
-    Ok(())
-}
-
-pub fn prepare_layer_directory(
-    digest: &str,
-    base_path: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Clean digest for filesystem use
-    let clean_digest = digest.replace(":", "_");
-    let layer_dir = base_path.join(&clean_digest);
-
-    fs::create_dir_all(&layer_dir)?;
-
-    Ok(layer_dir)
 }

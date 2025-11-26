@@ -1,4 +1,5 @@
 use clap::{error::Result, Parser, Subcommand};
+pub use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "carrier", version, about, long_about = None)]
@@ -63,13 +64,29 @@ pub enum Commands {
         #[arg(long = "elevated")]
         elevated: bool,
 
-        /// Optional command to override the image default
-        #[arg(trailing_var_arg = true)]
-        command: Vec<String>,
+        /// Bind mount a volume (host_path:container_path[:ro])
+        #[arg(short = 'v', long = "volume", action = clap::ArgAction::Append)]
+        volumes: Vec<String>,
+
+        /// Publish a container's port to the host (host_port:container_port)
+        #[arg(short = 'p', long = "publish", action = clap::ArgAction::Append)]
+        ports: Vec<String>,
+
+        /// Set environment variables (KEY=VALUE)
+        #[arg(short = 'e', long = "env", action = clap::ArgAction::Append)]
+        env: Vec<String>,
 
         /// Target platform (e.g., linux/amd64, linux/arm64)
         #[arg(long = "platform")]
         platform: Option<String>,
+
+        /// Show verbose output (download progress, layer extraction, etc.)
+        #[arg(long = "verbose")]
+        verbose: bool,
+
+        /// Optional command to override the image default
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
 
     /// Build a container image
@@ -82,7 +99,7 @@ pub enum Commands {
     AuthVerify,
 
     /// Remove an image or container
-    #[command(alias = "rm")]
+    #[command(alias = "rm", aliases = ["rmi"])]
     Remove {
         /// Image or container ID to remove (optional if using --all-containers)
         image: Option<String>,
@@ -94,6 +111,10 @@ pub enum Commands {
         /// Remove all stopped containers
         #[arg(short = 'c', long = "all-containers")]
         all_containers: bool,
+
+        /// Interactive mode - prompt before removing
+        #[arg(short, long)]
+        interactive: bool,
     },
 
     /// List images and containers
@@ -162,6 +183,41 @@ pub enum Commands {
         /// Target platform (e.g., linux/amd64)
         #[arg(long = "platform")]
         platform: Option<String>,
+    },
+
+    /// Check system dependencies and provide installation guidance
+    #[command(alias = "check")]
+    Doctor {
+        /// Attempt to fix missing dependencies automatically
+        #[arg(long)]
+        fix: bool,
+
+        /// Output results in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Install all dependencies at once
+        #[arg(long)]
+        all: bool,
+
+        /// Show what would be installed without making changes
+        #[arg(long, alias = "dry-run")]
+        dry_run: bool,
+
+        /// Skip confirmation prompts (use with --fix or --all)
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Show verbose output during installation
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Generate shell completions for the specified shell
+    Completions {
+        /// Shell to generate completions for (bash, zsh, fish, powershell, elvish)
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 

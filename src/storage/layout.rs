@@ -63,15 +63,6 @@ impl StorageLayout {
             .join(format!("{}_{}.json", clean_name, tag))
     }
 
-    pub fn temp_dir(&self) -> PathBuf {
-        self.base.join("storage/tmp")
-    }
-
-    pub fn runtime_dir(&self) -> PathBuf {
-        self.base.join("run")
-    }
-
-    // Check if a blob is already cached
     pub fn blob_exists(&self, digest: &str) -> bool {
         self.blob_cache_path(digest).exists()
     }
@@ -79,16 +70,6 @@ impl StorageLayout {
     // Check if a layer is already extracted
     pub fn layer_exists(&self, digest: &str) -> bool {
         self.image_layer_path(digest).exists()
-    }
-
-    // Clean up old temporary files
-    pub fn cleanup_temp(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = self.temp_dir();
-        if temp_dir.exists() {
-            fs::remove_dir_all(&temp_dir)?;
-            fs::create_dir_all(&temp_dir)?;
-        }
-        Ok(())
     }
 }
 
@@ -105,23 +86,5 @@ impl StorageLayout {
         }
         fs::write(&blob_path, data)?;
         Ok(blob_path)
-    }
-
-    pub fn list_containers(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let containers_dir = self.base.join("storage/overlay-containers");
-        let mut containers = Vec::new();
-
-        if containers_dir.exists() {
-            for entry in fs::read_dir(containers_dir)? {
-                let entry = entry?;
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        containers.push(name.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(containers)
     }
 }

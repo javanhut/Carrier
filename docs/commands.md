@@ -3,6 +3,8 @@
 ## Overview
 Carrier provides comprehensive container management with commands for pulling images, running containers (interactive or detached), executing commands in running containers, and managing container lifecycle. All commands support pulling images from various container registries including Docker Hub, Quay.io, GitHub Container Registry, and more.
 
+Carrier is optimized for performance with sub-100ms container startup times. See [performance.md](performance.md) for detailed benchmarks and optimization tips.
+
 ## Quick Start
 ```bash
 # Run a container interactively
@@ -20,6 +22,10 @@ carrier sh <container-id>
 # Stop and remove containers
 carrier stop <container-id>
 carrier rm -c  # Remove all stopped containers
+
+# Force specific storage driver (global flag, before subcommand)
+carrier --storage-driver overlay-fuse run alpine
+carrier --storage-driver vfs run debian
 ```
 
 ## Commands
@@ -57,13 +63,21 @@ Run a container from a local or remote image.
 
 **Usage:**
 ```bash
-carrier run [OPTIONS] <image|image-id> [COMMAND...]
+carrier [GLOBAL-OPTIONS] run [OPTIONS] <image|image-id> [COMMAND...]
 ```
 
-**Options:**
+**Global Options:**
+- `--storage-driver <DRIVER>`: Force storage driver: overlay-fuse, overlay-native, or vfs
+
+**Run Options:**
 - `-d, --detach`: Run container in detached mode (background)
 - `--name <NAME>`: Assign a custom name to the container
 - `--elevated`: Run with elevated privileges (no user namespace, may require sudo)
+- `--platform <PLATFORM>`: Target platform (e.g., linux/amd64, linux/arm64)
+- `--verbose`: Show verbose output (download progress, layer extraction, container setup details)
+- `-v, --volume <HOST:CONTAINER[:ro]>`: Bind mount a volume from host to container (can be used multiple times)
+- `-p, --publish <HOST_PORT:CONTAINER_PORT>`: Publish a container port to the host (can be used multiple times)
+- `-e, --env <KEY=VALUE>`: Set environment variable (can be used multiple times)
 
 **Examples:**
 ```bash
@@ -86,13 +100,47 @@ carrier run --detach redis:latest
 # Run with custom name
 carrier run --name my-web-server nginx
 
+# Run with volume mount
+carrier run -v /host/data:/container/data alpine
+carrier run -v ./config:/etc/app:ro nginx  # Read-only mount
+carrier run -v /logs:/var/log -v /data:/data alpine  # Multiple volumes
+
+# Run with port mapping
+carrier run -p 8080:80 nginx  # Map host port 8080 to container port 80
+carrier run -p 3000:3000 -p 5432:5432 myapp  # Multiple port mappings
+
+# Run with environment variables
+carrier run -e DEBUG=1 alpine
+carrier run -e DB_HOST=localhost -e DB_PORT=5432 myapp
+
+# Combine options for a complete setup
+carrier run -d \
+  --name my-webapp \
+  -p 8080:80 \
+  -p 443:443 \
+  -v ./html:/usr/share/nginx/html:ro \
+  -v ./nginx.conf:/etc/nginx/nginx.conf:ro \
+  -e NGINX_HOST=example.com \
+  nginx:latest
+
 # Run with elevated privileges (requires sudo)
 sudo carrier run --elevated ubuntu
 sudo carrier run -d --elevated --name ubuntu-dev ubuntu sleep infinity
 carrier run --name dev-db -d postgres:latest
 
-# Run with custom command (future feature)
+# Force specific storage driver (global flag)
+carrier --storage-driver overlay-fuse run alpine
+carrier --storage-driver vfs run debian
+carrier --storage-driver overlay-native run ubuntu:22.04
+
+# Run with custom command
 carrier run alpine echo "Hello World"
+
+# Run with verbose output (shows download progress, layer extraction)
+carrier run --verbose alpine cat /etc/os-release
+
+# Quiet run - only shows command output (default behavior)
+carrier run alpine cat /etc/os-release
 ```
 
 **Features:**
@@ -105,6 +153,9 @@ carrier run alpine echo "Hello World"
 - Supports both native overlay and fuse-overlayfs for rootless operation
 - Detached mode for background execution
 - Interactive mode for shells (bash, sh)
+- Volume mounts for sharing data between host and container
+- Port mapping for exposing container services
+- Environment variable injection for runtime configuration
 
 **Detached Mode:**
 When running with `-d` or `--detach`:
@@ -505,6 +556,105 @@ Build a container image (not yet implemented).
 **Usage:**
 ```bash
 carrier build <image> <url>
+```
+
+### doctor
+Check system dependencies and provide installation guidance.
+
+**Usage:**
+```bash
+carrier doctor [OPTIONS]
+carrier check [OPTIONS]  # Alias
+```
+
+**Options:**
+- `--fix`: Attempt to automatically fix missing dependencies individually
+- `--all`: Install all dependencies in a single batch command
+- `--dry-run`: Show what would be installed without making changes
+- `-y, --yes`: Skip confirmation prompts (use with --fix or --all)
+- `-v, --verbose`: Show detailed output during installation
+- `--json`: Output results in JSON format for scripting
+
+**Examples:**
+```bash
+# Check all dependencies
+carrier doctor
+
+# Attempt to fix missing dependencies (with prompts)
+carrier doctor --fix
+
+# Fix missing dependencies without prompts
+carrier doctor --fix -y
+
+# Preview what would be installed
+carrier doctor --dry-run
+
+# Install all dependencies at once
+carrier doctor --all
+
+# Install all dependencies without prompts
+carrier doctor --all -y
+
+# Verbose output with dry-run
+carrier doctor --fix --dry-run --verbose
+
+# Output as JSON for CI/scripting
+carrier doctor --json
+```
+
+**Installation Features:**
+- Checks sudo availability before attempting installation
+- Waits for package manager if locked by another process
+- Updates package cache before installing
+- Retries failed installations with exponential backoff
+- Verifies each installation succeeded
+- Sets required SUID bits on binaries automatically
+- Configures subordinate UID/GID ranges
+
+**What It Checks:**
+
+Essential dependencies:
+- `runc` - OCI container runtime
+- `fuse-overlayfs` - FUSE-based overlay filesystem
+- `/dev/fuse` - FUSE device availability
+- `fusermount3` - FUSE mount utility with SUID bit
+- User namespaces - Kernel support enabled
+
+Recommended dependencies:
+- `pasta` - High-performance userspace networking
+- `slirp4netns` - Fallback networking
+- `nsenter` - For shell/exec operations
+- `newuidmap`/`newgidmap` - UID/GID mapping
+- `/etc/subuid` and `/etc/subgid` - Subordinate ID ranges
+
+**Platform Support:**
+- Detects Linux distributions (Ubuntu, Debian, Fedora, Arch, etc.)
+- Suggests correct package manager commands
+- macOS support with graceful degradation (Lima recommended)
+
+**Output Format:**
+```
+[OK] runc (version 1.1.12)
+[WARN] pasta - not found
+       Alternative: slirp4netns is available
+       To install: sudo apt-get install -y passt
+[MISSING] fuse-overlayfs
+       To install: sudo apt-get install -y fuse-overlayfs
+```
+
+**JSON Output:**
+```json
+{
+  "platform": {
+    "os": "linux",
+    "distro": "ubuntu",
+    "version": "22.04"
+  },
+  "checks": [
+    {"name": "runc", "status": "ok", "details": "1.1.12"}
+  ],
+  "summary": {"passed": 8, "warnings": 2, "errors": 0}
+}
 ```
 
 ## Image Format
