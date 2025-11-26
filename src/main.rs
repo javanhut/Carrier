@@ -27,6 +27,7 @@ async fn main() {
             ports,
             env,
             platform,
+            verbose,
             command,
         } => {
             if command.is_empty() {
@@ -40,6 +41,7 @@ async fn main() {
                     env,
                     platform,
                     cli.storage_driver.clone(),
+                    verbose,
                 )
                 .await;
             } else {
@@ -54,6 +56,7 @@ async fn main() {
                     env,
                     platform,
                     cli.storage_driver.clone(),
+                    verbose,
                 )
                 .await;
             }

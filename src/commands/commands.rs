@@ -128,6 +128,7 @@ pub async fn run_image(
     env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
+    verbose: bool,
 ) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -158,7 +159,9 @@ pub async fn run_image(
 
     // First check if this is an image ID for a local image
     if let Ok(Some((image, tag, manifest_content))) = find_image_by_id(&storage, &image_name) {
-        println!("Found local image: {}:{}", image, tag);
+        if verbose {
+            println!("Found local image: {}:{}", image, tag);
+        }
 
         // Parse the manifest
         let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
@@ -190,7 +193,9 @@ pub async fn run_image(
             tag: tag.clone(),
         };
 
-        println!("Running container from local image {}:{}...", image, tag);
+        if verbose {
+            println!("Running container from local image {}:{}...", image, tag);
+        }
 
         // Run the container with the local image
         if let Err(e) = run_container_with_storage(
@@ -206,6 +211,7 @@ pub async fn run_image(
             &ports,
             &env_vars,
             storage_driver.as_deref(),
+            verbose,
         )
         .await
         {
@@ -226,10 +232,12 @@ pub async fn run_image(
     // Check if we have this image locally already
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
     if metadata_path.exists() {
-        println!(
-            "Image {}:{} found locally",
-            parsed_image.image, parsed_image.tag
-        );
+        if verbose {
+            println!(
+                "Image {}:{} found locally",
+                parsed_image.image, parsed_image.tag
+            );
+        }
 
         // Load the manifest from local storage
         let manifest_content = match std::fs::read_to_string(&metadata_path) {
@@ -253,7 +261,9 @@ pub async fn run_image(
         for layer in &manifest.layers {
             let layer_path = storage.image_layer_path(&layer.digest);
             if !layer_path.exists() {
-                println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                if verbose {
+                    println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                }
                 break; // Will fall through to pull
             }
             layer_paths.push(layer_path);
@@ -261,7 +271,9 @@ pub async fn run_image(
 
         // If all layers exist, run directly
         if layer_paths.len() == manifest.layers.len() {
-            println!("Running container from local image...");
+            if verbose {
+                println!("Running container from local image...");
+            }
             if let Err(e) = run_container_with_storage(
                 &parsed_image,
                 &manifest,
@@ -275,6 +287,7 @@ pub async fn run_image(
                 &ports,
                 &env_vars,
                 storage_driver.as_deref(),
+                verbose,
             )
             .await
             {
@@ -286,15 +299,19 @@ pub async fn run_image(
 
     // Image not found locally or incomplete, pull it
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
-    println!("Registry: {}", registry);
-    println!("Image: {}", parsed_image.image);
-    println!("Tag: {}", parsed_image.tag);
+    if verbose {
+        println!("Registry: {}", registry);
+        println!("Image: {}", parsed_image.image);
+        println!("Tag: {}", parsed_image.tag);
+    }
 
     // Get auth token (try authenticated first, fall back to anonymous)
     let image_path = normalize_image_path(&parsed_image.image);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
-            println!("Successfully obtained auth token");
+            if verbose {
+                println!("Successfully obtained auth token");
+            }
             t
         }
         Err(e) => {
@@ -306,7 +323,9 @@ pub async fn run_image(
     // Get manifest
     let manifest_json = match get_manifest_content(&parsed_image, &token).await {
         Ok(m) => {
-            println!("Successfully downloaded manifest");
+            if verbose {
+                println!("Successfully downloaded manifest");
+            }
             m
         }
         Err(e) => {
@@ -317,7 +336,7 @@ pub async fn run_image(
 
     // Parse manifest - handle both manifest list and single manifest
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
             .await
         {
             Ok(m) => m,
@@ -348,7 +367,7 @@ pub async fn run_image(
 
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -356,8 +375,10 @@ pub async fn run_image(
             }
         };
 
-    println!("\nImage {} pulled successfully!", image_name);
-    println!("Ready to run container...");
+    if verbose {
+        println!("\nImage {} pulled successfully!", image_name);
+        println!("Ready to run container...");
+    }
 
     // Run the container with proper storage
     if let Err(e) = run_container_with_storage(
@@ -373,6 +394,7 @@ pub async fn run_image(
         &ports,
         &env_vars,
         storage_driver.as_deref(),
+        verbose,
     )
     .await
     {
@@ -391,6 +413,7 @@ pub async fn run_image_with_command(
     env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
+    verbose: bool,
 ) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -403,7 +426,9 @@ pub async fn run_image_with_command(
 
     // First check if this is an image ID for a local image
     if let Ok(Some((image, tag, manifest_content))) = find_image_by_id(&storage, &image_name) {
-        println!("Found local image: {}:{}", image, tag);
+        if verbose {
+            println!("Found local image: {}:{}", image, tag);
+        }
 
         let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
             Ok(m) => m,
@@ -434,10 +459,12 @@ pub async fn run_image_with_command(
             tag: tag.clone(),
         };
 
-        println!(
-            "Running container from local image {}:{} with override...",
-            image, tag
-        );
+        if verbose {
+            println!(
+                "Running container from local image {}:{} with override...",
+                image, tag
+            );
+        }
 
         if let Err(e) = run_container_with_storage(
             &parsed_image,
@@ -452,6 +479,7 @@ pub async fn run_image_with_command(
             &ports,
             &env_vars,
             storage_driver.as_deref(),
+            verbose,
         )
         .await
         {
@@ -472,10 +500,12 @@ pub async fn run_image_with_command(
     // Check if we have this image locally already
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
     if metadata_path.exists() {
-        println!(
-            "Image {}:{} found locally",
-            parsed_image.image, parsed_image.tag
-        );
+        if verbose {
+            println!(
+                "Image {}:{} found locally",
+                parsed_image.image, parsed_image.tag
+            );
+        }
 
         // Load the manifest from local storage
         let manifest_content = match std::fs::read_to_string(&metadata_path) {
@@ -499,7 +529,9 @@ pub async fn run_image_with_command(
         for layer in &manifest.layers {
             let layer_path = storage.image_layer_path(&layer.digest);
             if !layer_path.exists() {
-                println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                if verbose {
+                    println!("Layer {} missing, pulling image...", &layer.digest[..12]);
+                }
                 break; // Will fall through to pull
             }
             layer_paths.push(layer_path);
@@ -507,7 +539,9 @@ pub async fn run_image_with_command(
 
         // If all layers exist, run directly
         if layer_paths.len() == manifest.layers.len() {
-            println!("Running container from local image with override...");
+            if verbose {
+                println!("Running container from local image with override...");
+            }
             if let Err(e) = run_container_with_storage(
                 &parsed_image,
                 &manifest,
@@ -521,6 +555,7 @@ pub async fn run_image_with_command(
                 &ports,
                 &env_vars,
                 storage_driver.as_deref(),
+                verbose,
             )
             .await
             {
@@ -532,15 +567,19 @@ pub async fn run_image_with_command(
 
     // Image not found locally or incomplete, pull it
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
-    println!("Registry: {}", registry);
-    println!("Image: {}", parsed_image.image);
-    println!("Tag: {}", parsed_image.tag);
+    if verbose {
+        println!("Registry: {}", registry);
+        println!("Image: {}", parsed_image.image);
+        println!("Tag: {}", parsed_image.tag);
+    }
 
     // Get auth token (try authenticated first, fall back to anonymous)
     let image_path = normalize_image_path(&parsed_image.image);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
-            println!("Successfully obtained auth token");
+            if verbose {
+                println!("Successfully obtained auth token");
+            }
             t
         }
         Err(e) => {
@@ -552,7 +591,9 @@ pub async fn run_image_with_command(
     // Get manifest
     let manifest_json = match get_manifest_content(&parsed_image, &token).await {
         Ok(m) => {
-            println!("Successfully downloaded manifest");
+            if verbose {
+                println!("Successfully downloaded manifest");
+            }
             m
         }
         Err(e) => {
@@ -563,7 +604,7 @@ pub async fn run_image_with_command(
 
     // Parse manifest - handle both manifest list and single manifest
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
             .await
         {
             Ok(m) => m,
@@ -580,7 +621,7 @@ pub async fn run_image_with_command(
 
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -588,8 +629,10 @@ pub async fn run_image_with_command(
             }
         };
 
-    println!("\nImage {} pulled successfully!", image_name);
-    println!("Ready to run container with override...");
+    if verbose {
+        println!("\nImage {} pulled successfully!", image_name);
+        println!("Ready to run container with override...");
+    }
 
     // Run the container with proper storage and command override
     if let Err(e) = run_container_with_storage(
@@ -605,6 +648,7 @@ pub async fn run_image_with_command(
         &ports,
         &env_vars,
         storage_driver.as_deref(),
+        verbose,
     )
     .await
     {
@@ -1556,8 +1600,9 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     };
 
     // Parse manifest - handle both manifest list and single manifest
+    // Pull always shows verbose output since user explicitly requested pull
     let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref())
+        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), true)
             .await
         {
             Ok(m) => m,
@@ -1586,8 +1631,8 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         eprintln!("Warning: Failed to save manifest metadata: {}", e);
     }
 
-    // Download layers with progress using storage
-    if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage).await {
+    // Download layers with progress using storage - always verbose for explicit pull
+    if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage, true).await {
         eprintln!("Failed to download layers: {}", e);
         return;
     }
@@ -1632,10 +1677,13 @@ async fn parse_and_get_manifest(
     parsed_image: &RegistryImage,
     token: &str,
     platform: Option<&str>,
+    verbose: bool,
 ) -> Result<ManifestV2, Box<dyn std::error::Error>> {
     // First try to parse as manifest list
     if let Ok(manifest_list) = serde_json::from_str::<ManifestList>(manifest_json) {
-        println!("Detected manifest list, selecting appropriate platform...");
+        if verbose {
+            println!("Detected manifest list, selecting appropriate platform...");
+        }
 
         // Determine desired platform
         let (want_os, want_arch) = platform
@@ -1651,10 +1699,12 @@ async fn parse_and_get_manifest(
             .or_else(|| manifest_list.manifests.first())
             .ok_or("No suitable manifest found in manifest list")?;
 
-        println!(
-            "Selected platform: {}/{}",
-            selected_manifest.platform.os, selected_manifest.platform.architecture
-        );
+        if verbose {
+            println!(
+                "Selected platform: {}/{}",
+                selected_manifest.platform.os, selected_manifest.platform.architecture
+            );
+        }
 
         // Fetch the specific manifest
         let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
@@ -1690,6 +1740,7 @@ async fn download_layers_with_storage(
     parsed_image: &RegistryImage,
     token: &str,
     storage: &StorageLayout,
+    verbose: bool,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
     let registry_url = REGISTRYMAP
@@ -1705,7 +1756,9 @@ async fn download_layers_with_storage(
 
     // Download config first
     if !storage.blob_exists(&manifest.config.digest) {
-        println!("\nDownloading config: {}", &manifest.config.digest[..12]);
+        if verbose {
+            println!("\nDownloading config: {}", &manifest.config.digest[..12]);
+        }
         let config_url = format!(
             "{}{}/blobs/{}",
             registry_url, image_path, manifest.config.digest
@@ -1719,16 +1772,21 @@ async fn download_layers_with_storage(
             manifest.config.size as u64,
             &multi_progress,
             "config",
+            verbose,
         )
         .await?;
 
         storage.save_blob(&manifest.config.digest, &blob_data)?;
     } else {
-        println!("Config already cached: {}", &manifest.config.digest[..12]);
+        if verbose {
+            println!("Config already cached: {}", &manifest.config.digest[..12]);
+        }
     }
 
     // Download each layer - parallel downloads for layers that need fetching
-    println!("Processing {} layers", manifest.layers.len());
+    if verbose {
+        println!("Processing {} layers", manifest.layers.len());
+    }
 
     // First, identify which layers need downloading
     let mut layers_to_download = Vec::new();
@@ -1738,19 +1796,23 @@ async fn download_layers_with_storage(
         let layer_dir = storage.image_layer_path(&layer.digest);
 
         if storage.layer_exists(&layer.digest) {
-            println!(
-                "Layer {}/{} already cached: {}",
-                index + 1,
-                manifest.layers.len(),
-                &layer.digest[..12]
-            );
+            if verbose {
+                println!(
+                    "Layer {}/{} already cached: {}",
+                    index + 1,
+                    manifest.layers.len(),
+                    &layer.digest[..12]
+                );
+            }
             cached_layers.push((index, layer.digest.clone(), layer_dir, None));
         } else if storage.blob_exists(&layer.digest) {
-            println!(
-                "Layer blob {}/{} already cached",
-                index + 1,
-                manifest.layers.len()
-            );
+            if verbose {
+                println!(
+                    "Layer blob {}/{} already cached",
+                    index + 1,
+                    manifest.layers.len()
+                );
+            }
             let blob_path = storage.blob_cache_path(&layer.digest);
             cached_layers.push((index, layer.digest.clone(), layer_dir, Some(blob_path)));
         } else {
@@ -1782,6 +1844,7 @@ async fn download_layers_with_storage(
             let storage_base = storage_base.clone();
             let layer_digest = layer.digest.clone();
             let layer_size = layer.size as u64;
+            let verbose_flag = verbose;
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -1796,6 +1859,7 @@ async fn download_layers_with_storage(
                     layer_size,
                     &mp,
                     &format!("layer {}/{}", index + 1, total_layers),
+                    verbose_flag,
                 )
                 .await
                 {
@@ -1854,7 +1918,9 @@ async fn download_layers_with_storage(
 
     if !layers_needing_extraction.is_empty() {
         let total_layers = manifest.layers.len();
-        println!("Extracting {} layers in parallel...", layers_needing_extraction.len());
+        if verbose {
+            println!("Extracting {} layers in parallel...", layers_needing_extraction.len());
+        }
 
         let mut extraction_handles = Vec::new();
 
@@ -1879,11 +1945,13 @@ async fn download_layers_with_storage(
         for (index, handle) in extraction_handles {
             match handle.await {
                 Ok(Ok((idx, _))) => {
-                    println!(
-                        "Extracted layer {}/{}",
-                        idx + 1,
-                        total_layers
-                    );
+                    if verbose {
+                        println!(
+                            "Extracted layer {}/{}",
+                            idx + 1,
+                            total_layers
+                        );
+                    }
                 }
                 Ok(Err(e)) => {
                     return Err(format!("Failed to extract layer {}: {}", index + 1, e).into());
@@ -1900,7 +1968,9 @@ async fn download_layers_with_storage(
         layer_paths.push(layer_dir);
     }
 
-    println!("All layers processed successfully!");
+    if verbose {
+        println!("All layers processed successfully!");
+    }
     Ok(layer_paths)
 }
 
@@ -1912,20 +1982,26 @@ async fn download_blob_with_progress(
     expected_size: u64,
     multi_progress: &MultiProgress,
     label: &str,
+    verbose: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut attempt = 0;
     let max_attempts = 3;
     loop {
-        // Create progress bar for this attempt
-        let pb = multi_progress.add(ProgressBar::new(expected_size));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )?
-                .progress_chars("#>-"),
-        );
-        pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
+        // Create progress bar for this attempt (only if verbose)
+        let pb = if verbose {
+            let pb = multi_progress.add(ProgressBar::new(expected_size));
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                    )?
+                    .progress_chars("#>-"),
+            );
+            pb.set_message(format!("{} {} (try {})", label, &digest[..12], attempt + 1));
+            Some(pb)
+        } else {
+            None
+        };
 
         // Make request
         let response = client
@@ -1935,7 +2011,9 @@ async fn download_blob_with_progress(
             .await?;
 
         if !response.status().is_success() {
-            pb.finish_with_message(format!("[FAILED] {} {}", label, &digest[..12]));
+            if let Some(ref pb) = pb {
+                pb.finish_with_message(format!("[FAILED] {} {}", label, &digest[..12]));
+            }
             attempt += 1;
             if attempt >= max_attempts {
                 return Err(format!("Failed to download blob: {}", response.status()).into());
@@ -1946,8 +2024,10 @@ async fn download_blob_with_progress(
 
         // Get content length if available
         let content_length = response.content_length().unwrap_or(expected_size);
-        if content_length != expected_size && content_length > 0 {
-            pb.set_length(content_length);
+        if let Some(ref pb) = pb {
+            if content_length != expected_size && content_length > 0 {
+                pb.set_length(content_length);
+            }
         }
 
         // Download with progress
@@ -1958,7 +2038,9 @@ async fn download_blob_with_progress(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             downloaded.extend_from_slice(&chunk);
-            pb.inc(chunk.len() as u64);
+            if let Some(ref pb) = pb {
+                pb.inc(chunk.len() as u64);
+            }
         }
 
         // Verify digest if provided as sha256
@@ -1969,7 +2051,9 @@ async fn download_blob_with_progress(
             let actual = hasher.finalize();
             let actual_hex = hex::encode(actual);
             if actual_hex != hex_expected {
-                pb.finish_with_message(format!("[FAILED] digest mismatch for {}", &digest[..12]));
+                if let Some(ref pb) = pb {
+                    pb.finish_with_message(format!("[FAILED] digest mismatch for {}", &digest[..12]));
+                }
                 attempt += 1;
                 if attempt >= max_attempts {
                     return Err("Downloaded blob digest verification failed".into());
@@ -1979,7 +2063,9 @@ async fn download_blob_with_progress(
             }
         }
 
-        pb.finish_with_message(format!("[OK] {} {}", label, &digest[..12]));
+        if let Some(ref pb) = pb {
+            pb.finish_with_message(format!("[OK] {} {}", label, &digest[..12]));
+        }
         return Ok(downloaded);
     }
 }
@@ -2094,11 +2180,14 @@ async fn run_container_with_storage(
     ports: &[String],
     extra_env: &[String],
     storage_driver: Option<&str>,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "\nStarting container from image {}...",
-        parsed_image.to_string()
-    );
+    if verbose {
+        println!(
+            "\nStarting container from image {}...",
+            parsed_image.to_string()
+        );
+    }
 
     // Set up cgroup resource limits for carrier containers
     let _ = setup_carrier_cgroup_limits();
@@ -2108,10 +2197,14 @@ async fn run_container_with_storage(
         Some(custom_name) => custom_name.clone(),
         None => generate_container_id(),
     };
-    println!("Container ID: {}", container_id);
+    if verbose {
+        println!("Container ID: {}", container_id);
+    }
 
     // Create container with overlay filesystem
-    println!("Setting up container filesystem with overlay...");
+    if verbose {
+        println!("Setting up container filesystem with overlay...");
+    }
 
     // Elevated containers need a healthy host /dev/null to create device nodes inside the namespace
     if elevated {
@@ -2199,7 +2292,9 @@ async fn run_container_with_storage(
                     || command[0] == "sh"
                     || command[0] == "bash")))
     {
-        println!("No persistent command specified for detached container, using 'sleep infinity'");
+        if verbose {
+            println!("No persistent command specified for detached container, using 'sleep infinity'");
+        }
         command = vec!["sleep".to_string(), "infinity".to_string()];
     }
 
@@ -2293,13 +2388,13 @@ async fn run_container_with_storage(
     dirs_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     // Execute in container environment with proper isolation
-    if detach {
-        println!(
-            "\nRunning container {} in detached mode...",
-            short12(&container_id)
-        );
-    } else {
-        if !detach {
+    if verbose {
+        if detach {
+            println!(
+                "\nRunning container {} in detached mode...",
+                short12(&container_id)
+            );
+        } else {
             println!("\nRunning container {}...", container_id);
         }
     }
@@ -2308,7 +2403,9 @@ async fn run_container_with_storage(
     use std::process::Stdio;
 
     if command_to_run.is_empty() || command_to_run[0].is_empty() {
-        println!("No command specified in image");
+        if verbose {
+            println!("No command specified in image");
+        }
         return Ok(());
     }
 
@@ -2358,10 +2455,12 @@ async fn run_container_with_storage(
 
     if detach {
         // Detached mode: runc create + start
-        println!(
-            "Container {} started in detached mode",
-            short12(&container_id)
-        );
+        if verbose {
+            println!(
+                "Container {} started in detached mode",
+                short12(&container_id)
+            );
+        }
 
         // Create the container
         let create_status = Command::new("runc")
@@ -2426,7 +2525,7 @@ async fn run_container_with_storage(
 
     // Foreground mode: use runc create + network setup + exec
     // This ensures network is properly configured before the container runs
-    if is_interactive {
+    if is_interactive && verbose {
         println!("\nStarting interactive container session...");
         println!("Type 'exit' or press Ctrl+D to exit the container.\n");
     }
@@ -2637,14 +2736,16 @@ async fn run_container_with_storage(
     });
     std::fs::write(&container_meta_path, metadata.to_string())?;
 
-    if exit_code == 0 {
-        println!("\nContainer {} exited successfully", short12(&container_id));
-    } else {
-        println!(
-            "\nContainer {} exited with code {}",
-            short12(&container_id),
-            exit_code
-        );
+    if verbose {
+        if exit_code == 0 {
+            println!("\nContainer {} exited successfully", short12(&container_id));
+        } else {
+            println!(
+                "\nContainer {} exited with code {}",
+                short12(&container_id),
+                exit_code
+            );
+        }
     }
 
     Ok(())

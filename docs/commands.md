@@ -74,6 +74,7 @@ carrier [GLOBAL-OPTIONS] run [OPTIONS] <image|image-id> [COMMAND...]
 - `--name <NAME>`: Assign a custom name to the container
 - `--elevated`: Run with elevated privileges (no user namespace, may require sudo)
 - `--platform <PLATFORM>`: Target platform (e.g., linux/amd64, linux/arm64)
+- `--verbose`: Show verbose output (download progress, layer extraction, container setup details)
 - `-v, --volume <HOST:CONTAINER[:ro]>`: Bind mount a volume from host to container (can be used multiple times)
 - `-p, --publish <HOST_PORT:CONTAINER_PORT>`: Publish a container port to the host (can be used multiple times)
 - `-e, --env <KEY=VALUE>`: Set environment variable (can be used multiple times)
@@ -134,6 +135,12 @@ carrier --storage-driver overlay-native run ubuntu:22.04
 
 # Run with custom command
 carrier run alpine echo "Hello World"
+
+# Run with verbose output (shows download progress, layer extraction)
+carrier run --verbose alpine cat /etc/os-release
+
+# Quiet run - only shows command output (default behavior)
+carrier run alpine cat /etc/os-release
 ```
 
 **Features:**

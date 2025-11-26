@@ -80,6 +80,10 @@ pub enum Commands {
         #[arg(long = "platform")]
         platform: Option<String>,
 
+        /// Show verbose output (download progress, layer extraction, etc.)
+        #[arg(long = "verbose")]
+        verbose: bool,
+
         /// Optional command to override the image default
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
