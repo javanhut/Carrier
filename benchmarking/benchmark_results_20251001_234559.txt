@@ -1,0 +1,21 @@
+Benchmark Results - Wed Oct  1 11:45:59 PM EDT 2025
+==========================
+
+Configuration:
+  Image: docker.io/library/alpine:latest
+  Iterations: 5
+
+Raw Pull Times (ms):
+  Podman: 1233 991 994 975 900
+  Docker: 1454 1235 1318 1009 947
+  Carrier: 1363 1100 1022 768 758
+
+Raw List Times (ms):
+  Podman: 37 34 39 32 45
+  Docker: 9 9 9 10 8
+  Carrier: 2 2 2 2 2
+
+Raw Run Times (ms):
+  Podman: 298 542 252 243 495
+  Docker: 339 645 281 276 577
+  Carrier: 303 380 306 295 313

@@ -123,6 +123,9 @@ pub async fn run_image(
     detach: bool,
     name: Option<String>,
     elevated: bool,
+    volumes: Vec<String>,
+    ports: Vec<String>,
+    env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
 ) {
@@ -199,6 +202,9 @@ pub async fn run_image(
             name.clone(),
             elevated,
             None,
+            &volumes,
+            &ports,
+            &env_vars,
             storage_driver.as_deref(),
         )
         .await
@@ -265,6 +271,9 @@ pub async fn run_image(
                 name.clone(),
                 elevated,
                 None,
+                &volumes,
+                &ports,
+                &env_vars,
                 storage_driver.as_deref(),
             )
             .await
@@ -348,6 +357,9 @@ pub async fn run_image(
         name,
         elevated,
         None,
+        &volumes,
+        &ports,
+        &env_vars,
         storage_driver.as_deref(),
     )
     .await
@@ -362,6 +374,9 @@ pub async fn run_image_with_command(
     name: Option<String>,
     elevated: bool,
     command: Vec<String>,
+    volumes: Vec<String>,
+    ports: Vec<String>,
+    env_vars: Vec<String>,
     platform: Option<String>,
     storage_driver: Option<String>,
 ) {
@@ -421,6 +436,9 @@ pub async fn run_image_with_command(
             name.clone(),
             elevated,
             Some(command.clone()),
+            &volumes,
+            &ports,
+            &env_vars,
             storage_driver.as_deref(),
         )
         .await
@@ -487,6 +505,9 @@ pub async fn run_image_with_command(
                 name.clone(),
                 elevated,
                 Some(command.clone()),
+                &volumes,
+                &ports,
+                &env_vars,
                 storage_driver.as_deref(),
             )
             .await
@@ -568,6 +589,9 @@ pub async fn run_image_with_command(
         name,
         elevated,
         Some(command),
+        &volumes,
+        &ports,
+        &env_vars,
         storage_driver.as_deref(),
     )
     .await
@@ -869,19 +893,8 @@ pub async fn exec_in_container(
     // Check if the container was started with elevated privileges
     let elevated = metadata["elevated"].as_bool().unwrap_or(false);
 
-    if !elevated {
-        return exec_rootless_container(
-            &container_dir,
-            &rootfs,
-            container_pid,
-            cmd_to_run,
-            is_interactive,
-        )
-        .await;
-    }
-
-    // For elevated containers, use elevated exec (rootless but without user namespace mapping)
     if elevated {
+        // For elevated containers, use elevated exec (rootless but without user namespace mapping)
         return exec_elevated_container(
             &container_dir,
             &rootfs,
@@ -892,10 +905,15 @@ pub async fn exec_in_container(
         .await;
     }
 
-    // This should never be reached - all containers should be either rootless or elevated (but still rootless)
-    return Err(
-        "Invalid container execution path - all containers should use rootless execution".into(),
-    );
+    // Default: rootless container execution
+    exec_rootless_container(
+        &container_dir,
+        &rootfs,
+        container_pid,
+        cmd_to_run,
+        is_interactive,
+    )
+    .await
 }
 
 pub async fn show_container_logs(
@@ -1082,11 +1100,11 @@ fn show_container_details(
     // Status
     let status = metadata["status"].as_str().unwrap_or("unknown");
     let status_display = if status == "running" || status.starts_with("Up") {
-        format!("🟢 {}", status)
+        format!("[RUNNING] {}", status)
     } else if status.starts_with("exited") || status.starts_with("Exited") {
-        format!("🔴 {}", status)
+        format!("[EXITED] {}", status)
     } else {
-        format!("⚫ {}", status)
+        format!("[UNKNOWN] {}", status)
     };
     println!("║ Status:    {:<54} ║", status_display);
     // Storage driver indicator
@@ -1775,7 +1793,7 @@ async fn download_blob_with_progress(
             .await?;
 
         if !response.status().is_success() {
-            pb.finish_with_message(format!("✗ {} {}", label, &digest[..12]));
+            pb.finish_with_message(format!("[FAILED] {} {}", label, &digest[..12]));
             attempt += 1;
             if attempt >= max_attempts {
                 return Err(format!("Failed to download blob: {}", response.status()).into());
@@ -1809,7 +1827,7 @@ async fn download_blob_with_progress(
             let actual = hasher.finalize();
             let actual_hex = hex::encode(actual);
             if actual_hex != hex_expected {
-                pb.finish_with_message(format!("✗ digest mismatch for {}", &digest[..12]));
+                pb.finish_with_message(format!("[FAILED] digest mismatch for {}", &digest[..12]));
                 attempt += 1;
                 if attempt >= max_attempts {
                     return Err("Downloaded blob digest verification failed".into());
@@ -1819,19 +1837,22 @@ async fn download_blob_with_progress(
             }
         }
 
-        pb.finish_with_message(format!("✓ {} {}", label, &digest[..12]));
+        pb.finish_with_message(format!("[OK] {} {}", label, &digest[..12]));
         return Ok(downloaded);
     }
 }
 
 /// Set up essential directories and files in the container
 fn setup_container_essential_files(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: These operations may fail in rootless mode when the rootfs is
+    // a mounted overlay with user namespace mappings. We ignore errors since
+    // these directories typically already exist from the image layers.
     let essential_dirs = vec!["etc", "tmp", "var", "var/tmp", "dev", "proc", "sys"];
 
     for dir in essential_dirs {
         let dir_path = rootfs.join(dir);
         if !dir_path.exists() {
-            std::fs::create_dir_all(&dir_path)?;
+            let _ = std::fs::create_dir_all(&dir_path);
         }
 
         if dir.contains("tmp") {
@@ -1927,6 +1948,9 @@ async fn run_container_with_storage(
     name: Option<String>,
     elevated: bool,
     command_override: Option<Vec<String>>,
+    volumes: &[String],
+    ports: &[String],
+    extra_env: &[String],
     storage_driver: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
@@ -2035,6 +2059,20 @@ async fn run_container_with_storage(
     {
         println!("No persistent command specified for detached container, using 'sleep infinity'");
         command = vec!["sleep".to_string(), "infinity".to_string()];
+    }
+
+    // Add extra environment variables from command line
+    for env_str in extra_env {
+        if let Some(eq_pos) = env_str.find('=') {
+            let key = env_str[..eq_pos].to_string();
+            let value = env_str[eq_pos + 1..].to_string();
+            // Override existing or add new
+            if let Some(pos) = env.iter().position(|(k, _)| k == &key) {
+                env[pos] = (key, value);
+            } else {
+                env.push((key, value));
+            }
+        }
     }
 
     // Add default environment if not present
@@ -2161,6 +2199,7 @@ async fn run_container_with_storage(
     let rootfs_clone = rootfs.clone();
     let cmd_clone = command_to_run.clone();
     let wd_clone = final_working_dir.clone();
+    let volumes_clone: Vec<String> = volumes.to_vec();
 
     tokio::task::spawn_blocking(move || {
         generate_oci_config(
@@ -2171,6 +2210,7 @@ async fn run_container_with_storage(
             env_strings,
             wd_clone,
             !elevated,
+            &volumes_clone,
         ).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
@@ -2222,12 +2262,13 @@ async fn run_container_with_storage(
                         let pid_file = bundle_dir.join("pid");
                         std::fs::write(&pid_file, pid.to_string())?;
 
-                        // Set up network for rootless containers
+                        // Set up network for rootless containers with port mappings
                         if !elevated {
-                            setup_container_network_if_needed(
+                            setup_container_network_with_ports(
                                 &bundle_dir,
                                 &rootfs,
                                 nix::unistd::Pid::from_raw(pid as i32),
+                                ports,
                             )?;
                         }
                     }
@@ -2301,12 +2342,13 @@ async fn run_container_with_storage(
                     let pid_file = bundle_dir.join("pid");
                     std::fs::write(&pid_file, pid.to_string())?;
 
-                    // Set up network for rootless containers
+                    // Set up network for rootless containers with port mappings
                     if !elevated {
-                        setup_container_network_if_needed(
+                        setup_container_network_with_ports(
                             &bundle_dir,
                             &rootfs,
                             nix::unistd::Pid::from_raw(pid as i32),
+                            ports,
                         )?;
                     }
                 }
@@ -2327,33 +2369,76 @@ async fn run_container_with_storage(
     }
 
     // Now exec the actual command with inherited stdio
-    let mut exec_cmd = Command::new("runc");
-    exec_cmd.arg("--root").arg(&runc_root_path).arg("exec");
-
-    // Only allocate TTY if stdin is actually a terminal
     use std::io::IsTerminal;
-    if is_interactive && std::io::stdin().is_terminal() {
-        exec_cmd.arg("-t"); // Allocate pseudo-TTY
-    }
+    let use_tty = is_interactive && std::io::stdin().is_terminal();
 
-    exec_cmd.arg(&container_id);
+    // Try with TTY first if interactive, fall back to non-TTY if it fails
+    let exec_result = if use_tty {
+        let mut exec_cmd = Command::new("runc");
+        exec_cmd
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("exec")
+            .arg("-t") // Allocate pseudo-TTY
+            .arg(&container_id);
 
-    // Add the command arguments
-    for arg in &original_command {
-        exec_cmd.arg(arg);
-    }
+        for arg in &original_command {
+            exec_cmd.arg(arg);
+        }
 
-    // Set stdio
-    exec_cmd
-        .stdin(if is_interactive {
-            Stdio::inherit()
+        exec_cmd
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let result = exec_cmd.status();
+
+        // If TTY allocation failed, retry without -t
+        if result.as_ref().map(|s| s.code() == Some(255)).unwrap_or(false) {
+            eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
+            let mut retry_cmd = Command::new("runc");
+            retry_cmd
+                .arg("--root")
+                .arg(&runc_root_path)
+                .arg("exec")
+                .arg(&container_id);
+
+            for arg in &original_command {
+                retry_cmd.arg(arg);
+            }
+
+            retry_cmd
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+
+            retry_cmd.status()
         } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+            result
+        }
+    } else {
+        let mut exec_cmd = Command::new("runc");
+        exec_cmd
+            .arg("--root")
+            .arg(&runc_root_path)
+            .arg("exec")
+            .arg(&container_id);
 
-    let exec_result = exec_cmd.status();
+        for arg in &original_command {
+            exec_cmd.arg(arg);
+        }
+
+        exec_cmd
+            .stdin(if is_interactive {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        exec_cmd.status()
+    };
 
     // Get exit code from exec
     let exit_code = match exec_result {
@@ -2511,6 +2596,37 @@ fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_jso
     (uid_mappings, gid_mappings)
 }
 
+/// Parse a volume specification string (host_path:container_path[:ro])
+fn parse_volume_spec(spec: &str) -> Option<(String, String, bool)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let host_path = parts[0].to_string();
+    let container_path = parts[1].to_string();
+    let readonly = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
+    Some((host_path, container_path, readonly))
+}
+
+/// Parse a port mapping specification (host_port:container_port or host_port:container_port/protocol)
+fn parse_port_spec(spec: &str) -> Option<(u16, u16, String)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let host_port: u16 = parts[0].parse().ok()?;
+
+    // Check for protocol specification (e.g., 80/tcp)
+    let (container_port, protocol) = if parts[1].contains('/') {
+        let port_proto: Vec<&str> = parts[1].split('/').collect();
+        (port_proto[0].parse().ok()?, port_proto.get(1).unwrap_or(&"tcp").to_string())
+    } else {
+        (parts[1].parse().ok()?, "tcp".to_string())
+    };
+
+    Some((host_port, container_port, protocol))
+}
+
 fn generate_oci_config(
     config_path: &Path,
     container_id: &str,
@@ -2519,6 +2635,7 @@ fn generate_oci_config(
     env: Vec<String>,
     working_dir: String,
     add_network_ns: bool,
+    volumes: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
@@ -2536,6 +2653,76 @@ fn generate_oci_config(
 
     if add_network_ns {
         namespaces.push(serde_json::json!({"type": "network"}));
+    }
+
+    // Build mounts array with default mounts
+    let mut mounts = vec![
+        serde_json::json!({
+            "destination": "/proc",
+            "type": "proc",
+            "source": "proc"
+        }),
+        serde_json::json!({
+            "destination": "/dev",
+            "type": "tmpfs",
+            "source": "tmpfs",
+            "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/pts",
+            "type": "devpts",
+            "source": "devpts",
+            "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "source": "shm",
+            "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]
+        }),
+        serde_json::json!({
+            "destination": "/dev/mqueue",
+            "type": "mqueue",
+            "source": "mqueue",
+            "options": ["nosuid", "noexec", "nodev"]
+        }),
+        serde_json::json!({
+            "destination": "/sys",
+            "type": "sysfs",
+            "source": "sysfs",
+            "options": ["nosuid", "noexec", "nodev", "ro"]
+        }),
+    ];
+
+    // Add user-specified volume mounts
+    for vol_spec in volumes {
+        if let Some((host_path, container_path, readonly)) = parse_volume_spec(vol_spec) {
+            // Resolve to absolute path
+            let abs_host_path = if host_path.starts_with('/') {
+                PathBuf::from(&host_path)
+            } else {
+                std::env::current_dir()?.join(&host_path)
+            };
+
+            // Ensure host path exists
+            if !abs_host_path.exists() {
+                std::fs::create_dir_all(&abs_host_path)?;
+            }
+
+            let mut options = vec!["rbind".to_string()];
+            if readonly {
+                options.push("ro".to_string());
+            } else {
+                options.push("rw".to_string());
+            }
+
+            mounts.push(serde_json::json!({
+                "destination": container_path,
+                "type": "bind",
+                "source": abs_host_path.to_string_lossy(),
+                "options": options
+            }));
+        }
     }
 
     let config = serde_json::json!({
@@ -2562,43 +2749,7 @@ fn generate_oci_config(
             "readonly": false
         },
         "hostname": container_id,
-        "mounts": [
-            {
-                "destination": "/proc",
-                "type": "proc",
-                "source": "proc"
-            },
-            {
-                "destination": "/dev",
-                "type": "tmpfs",
-                "source": "tmpfs",
-                "options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
-            },
-            {
-                "destination": "/dev/pts",
-                "type": "devpts",
-                "source": "devpts",
-                "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]
-            },
-            {
-                "destination": "/dev/shm",
-                "type": "tmpfs",
-                "source": "shm",
-                "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]
-            },
-            {
-                "destination": "/dev/mqueue",
-                "type": "mqueue",
-                "source": "mqueue",
-                "options": ["nosuid", "noexec", "nodev"]
-            },
-            {
-                "destination": "/sys",
-                "type": "sysfs",
-                "source": "sysfs",
-                "options": ["nosuid", "noexec", "nodev", "ro"]
-            }
-        ],
+        "mounts": mounts,
         "linux": {
             "namespaces": namespaces,
             "uidMappings": uid_mappings,
@@ -2617,6 +2768,16 @@ fn setup_container_network_if_needed(
     rootfs: &Path,
     container_pid: nix::unistd::Pid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    setup_container_network_with_ports(container_dir, rootfs, container_pid, &[])
+}
+
+/// Set up network for a container with optional port mappings
+fn setup_container_network_with_ports(
+    container_dir: &Path,
+    _rootfs: &Path,
+    container_pid: nix::unistd::Pid,
+    ports: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     // Check if network is already set up by looking for network helper processes
     let pid_raw = container_pid.as_raw();
 
@@ -2631,8 +2792,11 @@ fn setup_container_network_if_needed(
         return Ok(());
     }
 
-    // Set up basic DNS configuration for container (inline for speed)
-    let etc_dir = rootfs.join("etc");
+    // Set up basic DNS configuration for container in the upper layer
+    // We write to the upper directory since the merged overlay is root-owned
+    // from outside the user namespace and we can't write to it directly
+    let upper_dir = container_dir.join("upper");
+    let etc_dir = upper_dir.join("etc");
     std::fs::create_dir_all(&etc_dir)?;
     let resolv_conf = etc_dir.join("resolv.conf");
     std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
@@ -2649,19 +2813,30 @@ fn setup_container_network_if_needed(
         .unwrap_or(false);
 
     if slirp_available {
-        // Start slirp4netns in the background (async, no wait)
-        let slirp_child = Command::new("slirp4netns")
+        // Build slirp4netns command with port forwarding
+        let mut slirp_cmd = Command::new("slirp4netns");
+        slirp_cmd
             .arg("--configure")
             .arg("--mtu=65520")
-            .arg("--disable-host-loopback")
+            .arg("--disable-host-loopback");
+
+        // Add port forwards
+        for port_spec in ports {
+            if let Some((host_port, container_port, _protocol)) = parse_port_spec(port_spec) {
+                // slirp4netns uses format: host_port:guest_port
+                slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
+                println!("Port mapping: {} -> {}", host_port, container_port);
+            }
+        }
+
+        slirp_cmd
             .arg(pid_raw.to_string())
             .arg("tap0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
 
-        match slirp_child {
+        match slirp_cmd.spawn() {
             Ok(child) => {
                 // Store the slirp4netns PID for cleanup
                 let slirp_pid = child.id();
@@ -4718,12 +4893,12 @@ pub async fn authenticate_registry(
             auth_config.save()?;
 
             println!(
-                "✓ Successfully authenticated with {} as {}",
+                "[OK] Successfully authenticated with {} as {}",
                 registry, username
             );
         }
         Err(e) => {
-            eprintln!("✗ Authentication failed: {}", e);
+            eprintln!("[FAILED] Authentication failed: {}", e);
             return Err(e);
         }
     }
@@ -4834,8 +5009,8 @@ async fn get_token_with_credentials(
         .get(registry)
         .ok_or_else(|| format!("No auth endpoint configured for registry: {}", registry))?;
 
-    // Build scope for the specific image
-    let scope = format!("repository:{}:pull,push", image_path);
+    // Build scope for the specific image (only pull access needed for downloading)
+    let scope = format!("repository:{}:pull", image_path);
 
     let auth_url = match registry {
         "docker.io" => format!(
@@ -4881,15 +5056,15 @@ pub async fn verify_authentication() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Verifying stored credentials:");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("------------------------------");
 
     for (registry, creds) in &auth_config.auths {
         print!("  {}: ", registry);
         std::io::stdout().flush()?;
 
         match test_registry_credentials(registry, &creds.username, &creds.password).await {
-            Ok(_) => println!("✓ Valid (user: {})", creds.username),
-            Err(e) => println!("✗ Failed - {}", e),
+            Ok(_) => println!("[OK] Valid (user: {})", creds.username),
+            Err(e) => println!("[FAILED] {}", e),
         }
     }
 

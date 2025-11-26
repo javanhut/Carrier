@@ -8,11 +8,12 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Get runtime directory with auto-detection and fallback
-fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// Ensure runtime directory exists and is configured.
+/// Returns the runtime directory path and whether it was auto-detected or created as fallback.
+fn ensure_runtime_dir() -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
     // First check if XDG_RUNTIME_DIR is already set
     if let Some(dir) = dirs::runtime_dir() {
-        return Ok(dir);
+        return Ok((dir, false));
     }
 
     // If not set, try to detect and set it
@@ -22,11 +23,11 @@ fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Check if the expected runtime dir exists
     if runtime_dir.exists() {
         // Set the environment variable for this process and children
+        // SAFETY: This is safe as we're setting a valid path string
         unsafe {
             env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
         }
-        println!("Auto-detected XDG_RUNTIME_DIR: {}", runtime_dir.display());
-        Ok(runtime_dir)
+        Ok((runtime_dir, true))
     } else {
         // Fallback to /tmp if /run/user/{uid} doesn't exist
         let fallback = PathBuf::from(format!("/tmp/runtime-{}", uid));
@@ -39,11 +40,11 @@ fn get_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
         perms.set_mode(0o700);
         fs::set_permissions(&fallback, perms)?;
 
+        // SAFETY: This is safe as we're setting a valid path string
         unsafe {
             env::set_var("XDG_RUNTIME_DIR", &fallback);
         }
-        println!("Using fallback XDG_RUNTIME_DIR: {}", fallback.display());
-        Ok(fallback)
+        Ok((fallback, true))
     }
 }
 
@@ -104,8 +105,9 @@ impl ContainerStorage {
         container_id: &str,
         image_layers: Vec<PathBuf>,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let persist_container = self.persistent_dir.join("containers").join(container_id);
-        let run_container = self.runtime_dir.join("containers").join(container_id);
+        // Use overlay-containers to match StorageLayout paths used by commands
+        let persist_container = self.persistent_dir.join("overlay-containers").join(container_id);
+        let run_container = self.runtime_dir.join("overlay-containers").join(container_id);
         let upper_dir = persist_container.join("upper");
         let work_dir = persist_container.join("work");
         let merged_dir = run_container.join("merged");
@@ -114,8 +116,19 @@ impl ContainerStorage {
         fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(&merged_dir)?;
 
+        // Ensure upper and work dirs are writable by current user (for user namespace mapping)
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&upper_dir)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&upper_dir, perms)?;
+
+        let mut work_perms = fs::metadata(&work_dir)?.permissions();
+        work_perms.set_mode(0o755);
+        fs::set_permissions(&work_dir, work_perms)?;
+
         if self.is_already_mounted(&merged_dir) {
-            self.last_driver = Some(StorageDriver::OverlayFuse);
+            // Detect the actual driver from /proc/mounts
+            self.last_driver = Some(self.detect_mount_driver(&merged_dir));
             return Ok(merged_dir);
         }
 
@@ -206,12 +219,48 @@ impl ContainerStorage {
             return false;
         }
 
-        if let Ok(entries) = fs::read_dir(path) {
-            if entries.count() > 0 {
-                return true;
+        // Check /proc/mounts for actual mount status
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            let path_str = path.to_string_lossy();
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == path_str {
+                    return true;
+                }
             }
         }
+
+        // Alternative: check if device ID differs from parent (indicates mount point)
+        if let Some(parent) = path.parent() {
+            if let (Ok(path_meta), Ok(parent_meta)) = (fs::metadata(path), fs::metadata(parent)) {
+                use std::os::unix::fs::MetadataExt;
+                if path_meta.dev() != parent_meta.dev() {
+                    return true;
+                }
+            }
+        }
+
         false
+    }
+
+    fn detect_mount_driver(&self, path: &Path) -> StorageDriver {
+        // Check /proc/mounts for the filesystem type
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            let path_str = path.to_string_lossy();
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[1] == path_str {
+                    let fs_type = parts[2];
+                    return match fs_type {
+                        "fuse.fuse-overlayfs" => StorageDriver::OverlayFuse,
+                        "overlay" => StorageDriver::OverlayNative,
+                        _ => StorageDriver::Vfs,
+                    };
+                }
+            }
+        }
+        // Default to VFS if we can't determine
+        StorageDriver::Vfs
     }
 
     fn mount_fuse_overlayfs(
@@ -221,14 +270,13 @@ impl ContainerStorage {
         work: &Path,
         merged: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Note: We don't use uidmapping/gidmapping in fuse-overlayfs because:
-        // 1. It prevents the host from writing to the merged filesystem
-        // 2. The user namespace mapping in the OCI spec handles UID/GID translation
-        // 3. This is how Podman does it - fuse-overlayfs without uidmapping + user namespace
+        // Use squash_to_root so all files appear as root (UID 0) in the overlay.
+        // The user namespace mapping then makes container root (UID 0) map to the host user,
+        // allowing proper write permissions while maintaining correct ownership semantics.
         let output = Command::new("fuse-overlayfs")
             .arg("-o")
             .arg(format!(
-                "lowerdir={},upperdir={},workdir={}",
+                "lowerdir={},upperdir={},workdir={},squash_to_root",
                 lower,
                 upper.display(),
                 work.display()
@@ -339,13 +387,16 @@ impl ContainerStorage {
         for lower in lower_dirs.iter() {
             let src = Path::new(lower);
 
+            // Use "src/." to copy directory contents (not the directory itself)
+            // This properly handles the copy without shell glob expansion
+            let src_contents = format!("{}/.", src.display());
             let output = Command::new("cp")
                 .arg("-a")
-                .arg(format!("{}/*", src.display()))
+                .arg(&src_contents)
                 .arg(merged)
                 .output();
 
-            if output.is_err() || !output.as_ref().unwrap().status.success() {
+            if output.is_err() || !output.as_ref().map(|o| o.status.success()).unwrap_or(false) {
                 self.copy_recursive(src, merged)?;
             }
         }
@@ -540,12 +591,14 @@ fn try_install_fuse3() -> Result<(), Box<dyn std::error::Error>> {
 // Preflight rootless environment checks with actionable hints
 pub fn preflight_rootless_checks() {
     // XDG_RUNTIME_DIR with auto-detection
-    match get_runtime_dir() {
-        Ok(p) => {
-            if !p.exists() {
-                let _ = fs::create_dir_all(&p);
+    match ensure_runtime_dir() {
+        Ok((path, was_configured)) => {
+            if !path.exists() {
+                let _ = fs::create_dir_all(&path);
             }
-            println!("Using runtime dir: {}", p.display());
+            if was_configured {
+                eprintln!("Note: Configured runtime dir: {}", path.display());
+            }
         }
         Err(e) => eprintln!("Warning: Could not determine runtime directory: {}", e),
     }

@@ -74,6 +74,9 @@ carrier [GLOBAL-OPTIONS] run [OPTIONS] <image|image-id> [COMMAND...]
 - `--name <NAME>`: Assign a custom name to the container
 - `--elevated`: Run with elevated privileges (no user namespace, may require sudo)
 - `--platform <PLATFORM>`: Target platform (e.g., linux/amd64, linux/arm64)
+- `-v, --volume <HOST:CONTAINER[:ro]>`: Bind mount a volume from host to container (can be used multiple times)
+- `-p, --publish <HOST_PORT:CONTAINER_PORT>`: Publish a container port to the host (can be used multiple times)
+- `-e, --env <KEY=VALUE>`: Set environment variable (can be used multiple times)
 
 **Examples:**
 ```bash
@@ -96,6 +99,29 @@ carrier run --detach redis:latest
 # Run with custom name
 carrier run --name my-web-server nginx
 
+# Run with volume mount
+carrier run -v /host/data:/container/data alpine
+carrier run -v ./config:/etc/app:ro nginx  # Read-only mount
+carrier run -v /logs:/var/log -v /data:/data alpine  # Multiple volumes
+
+# Run with port mapping
+carrier run -p 8080:80 nginx  # Map host port 8080 to container port 80
+carrier run -p 3000:3000 -p 5432:5432 myapp  # Multiple port mappings
+
+# Run with environment variables
+carrier run -e DEBUG=1 alpine
+carrier run -e DB_HOST=localhost -e DB_PORT=5432 myapp
+
+# Combine options for a complete setup
+carrier run -d \
+  --name my-webapp \
+  -p 8080:80 \
+  -p 443:443 \
+  -v ./html:/usr/share/nginx/html:ro \
+  -v ./nginx.conf:/etc/nginx/nginx.conf:ro \
+  -e NGINX_HOST=example.com \
+  nginx:latest
+
 # Run with elevated privileges (requires sudo)
 sudo carrier run --elevated ubuntu
 sudo carrier run -d --elevated --name ubuntu-dev ubuntu sleep infinity
@@ -106,7 +132,7 @@ carrier --storage-driver overlay-fuse run alpine
 carrier --storage-driver vfs run debian
 carrier --storage-driver overlay-native run ubuntu:22.04
 
-# Run with custom command (future feature)
+# Run with custom command
 carrier run alpine echo "Hello World"
 ```
 
@@ -120,6 +146,9 @@ carrier run alpine echo "Hello World"
 - Supports both native overlay and fuse-overlayfs for rootless operation
 - Detached mode for background execution
 - Interactive mode for shells (bash, sh)
+- Volume mounts for sharing data between host and container
+- Port mapping for exposing container services
+- Environment variable injection for runtime configuration
 
 **Detached Mode:**
 When running with `-d` or `--detach`:

@@ -63,13 +63,25 @@ pub enum Commands {
         #[arg(long = "elevated")]
         elevated: bool,
 
-        /// Optional command to override the image default
-        #[arg(trailing_var_arg = true)]
-        command: Vec<String>,
+        /// Bind mount a volume (host_path:container_path[:ro])
+        #[arg(short = 'v', long = "volume", action = clap::ArgAction::Append)]
+        volumes: Vec<String>,
+
+        /// Publish a container's port to the host (host_port:container_port)
+        #[arg(short = 'p', long = "publish", action = clap::ArgAction::Append)]
+        ports: Vec<String>,
+
+        /// Set environment variables (KEY=VALUE)
+        #[arg(short = 'e', long = "env", action = clap::ArgAction::Append)]
+        env: Vec<String>,
 
         /// Target platform (e.g., linux/amd64, linux/arm64)
         #[arg(long = "platform")]
         platform: Option<String>,
+
+        /// Optional command to override the image default
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
 
     /// Build a container image
