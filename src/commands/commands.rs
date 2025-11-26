@@ -81,7 +81,7 @@ struct ManifestV2 {
     layers: Vec<Descriptor>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
@@ -328,8 +328,20 @@ pub async fn run_image(
         };
 
     // Save the actual manifest (not the manifest list) as metadata
+    // Calculate and cache total image size for faster listing
+    let cached_size: u64 = {
+        let config_size = manifest.config.size as u64;
+        let layers_size: u64 = manifest.layers.iter().map(|l| l.size as u64).sum();
+        config_size + layers_size
+    };
+
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
-    let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
+    // Add cached_size to manifest JSON for faster listing
+    let mut manifest_json_obj = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
+        map.insert("cached_size".to_string(), serde_json::json!(cached_size));
+    }
+    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
         eprintln!("Warning: Failed to save manifest metadata: {}", e);
     }
@@ -1556,8 +1568,20 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         };
 
     // Save the actual manifest (not the manifest list) as metadata
+    // Calculate and cache total image size for faster listing
+    let cached_size: u64 = {
+        let config_size = manifest.config.size as u64;
+        let layers_size: u64 = manifest.layers.iter().map(|l| l.size as u64).sum();
+        config_size + layers_size
+    };
+
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
-    let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
+    // Add cached_size to manifest JSON for faster listing
+    let mut manifest_json_obj = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
+        map.insert("cached_size".to_string(), serde_json::json!(cached_size));
+    }
+    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
         eprintln!("Warning: Failed to save manifest metadata: {}", e);
     }
@@ -1703,13 +1727,16 @@ async fn download_layers_with_storage(
         println!("Config already cached: {}", &manifest.config.digest[..12]);
     }
 
-    // Download each layer
+    // Download each layer - parallel downloads for layers that need fetching
     println!("Processing {} layers", manifest.layers.len());
+
+    // First, identify which layers need downloading
+    let mut layers_to_download = Vec::new();
+    let mut cached_layers = Vec::new();
 
     for (index, layer) in manifest.layers.iter().enumerate() {
         let layer_dir = storage.image_layer_path(&layer.digest);
 
-        // Check if layer is already extracted
         if storage.layer_exists(&layer.digest) {
             println!(
                 "Layer {}/{} already cached: {}",
@@ -1717,44 +1744,159 @@ async fn download_layers_with_storage(
                 manifest.layers.len(),
                 &layer.digest[..12]
             );
-            layer_paths.push(layer_dir);
-            continue;
-        }
-
-        // Download blob if not cached
-        let blob_path = if !storage.blob_exists(&layer.digest) {
-            let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer.digest);
-
-            let blob_data = download_blob_with_progress(
-                &client,
-                &blob_url,
-                token,
-                &layer.digest,
-                layer.size as u64,
-                &multi_progress,
-                &format!("layer {}/{}", index + 1, manifest.layers.len()),
-            )
-            .await?;
-
-            storage.save_blob(&layer.digest, &blob_data)?
-        } else {
+            cached_layers.push((index, layer.digest.clone(), layer_dir, None));
+        } else if storage.blob_exists(&layer.digest) {
             println!(
                 "Layer blob {}/{} already cached",
                 index + 1,
                 manifest.layers.len()
             );
-            storage.blob_cache_path(&layer.digest)
-        };
+            let blob_path = storage.blob_cache_path(&layer.digest);
+            cached_layers.push((index, layer.digest.clone(), layer_dir, Some(blob_path)));
+        } else {
+            layers_to_download.push((index, layer.clone()));
+        }
+    }
 
-        // Extract layer to storage
-        println!(
-            "Extracting layer {}/{}...",
-            index + 1,
-            manifest.layers.len()
-        );
-        std::fs::create_dir_all(&layer_dir)?;
-        extract_layer_rootless(&blob_path, &layer_dir)?;
+    // Download layers in parallel (max 4 concurrent)
+    if !layers_to_download.is_empty() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
 
+        let semaphore = Arc::new(Semaphore::new(4)); // Max 4 concurrent downloads
+        let total_layers = manifest.layers.len();
+        let registry_url = registry_url.to_string();
+        let image_path = image_path.clone();
+        let token = token.to_string();
+        let storage_base = storage.base.clone();
+
+        let mut download_handles = Vec::new();
+
+        for (index, layer) in layers_to_download {
+            let sem = semaphore.clone();
+            let client = client.clone();
+            let mp = multi_progress.clone();
+            let registry_url = registry_url.clone();
+            let image_path = image_path.clone();
+            let token = token.clone();
+            let storage_base = storage_base.clone();
+            let layer_digest = layer.digest.clone();
+            let layer_size = layer.size as u64;
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer_digest);
+
+                let blob_data = match download_blob_with_progress(
+                    &client,
+                    &blob_url,
+                    &token,
+                    &layer_digest,
+                    layer_size,
+                    &mp,
+                    &format!("layer {}/{}", index + 1, total_layers),
+                )
+                .await
+                {
+                    Ok(data) => data,
+                    Err(e) => return Err(format!("Download failed: {}", e)),
+                };
+
+                // Save blob to cache - match StorageLayout::blob_cache_path format
+                let clean_digest = layer_digest.replace(":", "_");
+                let blob_cache = storage_base.join("cache/blobs").join(format!("{}.tar.gz", &clean_digest));
+                if let Some(parent) = blob_cache.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Err(format!("Failed to create blob dir: {}", e));
+                    }
+                }
+                if let Err(e) = std::fs::write(&blob_cache, &blob_data) {
+                    return Err(format!("Failed to write blob: {}", e));
+                }
+
+                Ok::<(usize, String, PathBuf), String>((index, layer_digest, blob_cache))
+            });
+
+            download_handles.push(handle);
+        }
+
+        // Wait for all downloads to complete
+        let mut downloaded_layers = Vec::new();
+        for handle in download_handles {
+            match handle.await {
+                Ok(Ok((index, digest, blob_path))) => {
+                    let layer_dir = storage.image_layer_path(&digest);
+                    downloaded_layers.push((index, digest, layer_dir, Some(blob_path)));
+                }
+                Ok(Err(e)) => {
+                    return Err(format!("Layer download failed: {}", e).into());
+                }
+                Err(e) => {
+                    return Err(format!("Task join failed: {}", e).into());
+                }
+            }
+        }
+
+        // Merge cached and downloaded layers
+        cached_layers.extend(downloaded_layers);
+    }
+
+    // Sort by original index to maintain layer order
+    cached_layers.sort_by_key(|(idx, _, _, _)| *idx);
+
+    // Extract layers that need extraction - parallel extraction using spawn_blocking
+    let layers_needing_extraction: Vec<_> = cached_layers
+        .iter()
+        .filter(|(_, _, _, blob_path_opt)| blob_path_opt.is_some())
+        .cloned()
+        .collect();
+
+    if !layers_needing_extraction.is_empty() {
+        let total_layers = manifest.layers.len();
+        println!("Extracting {} layers in parallel...", layers_needing_extraction.len());
+
+        let mut extraction_handles = Vec::new();
+
+        for (index, _digest, layer_dir, blob_path_opt) in layers_needing_extraction {
+            let blob_path = blob_path_opt.unwrap();
+            let layer_dir = layer_dir.clone();
+
+            let handle = tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::create_dir_all(&layer_dir) {
+                    return Err(format!("Failed to create layer dir: {}", e));
+                }
+                if let Err(e) = extract_layer_rootless(&blob_path, &layer_dir) {
+                    return Err(format!("Failed to extract layer: {}", e));
+                }
+                Ok::<(usize, PathBuf), String>((index, layer_dir))
+            });
+
+            extraction_handles.push((index, handle));
+        }
+
+        // Wait for all extractions and report progress
+        for (index, handle) in extraction_handles {
+            match handle.await {
+                Ok(Ok((idx, _))) => {
+                    println!(
+                        "Extracted layer {}/{}",
+                        idx + 1,
+                        total_layers
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(format!("Failed to extract layer {}: {}", index + 1, e).into());
+                }
+                Err(e) => {
+                    return Err(format!("Extraction task failed: {}", e).into());
+                }
+            }
+        }
+    }
+
+    // Build final layer_paths in order
+    for (_index, _digest, layer_dir, _blob_path_opt) in cached_layers {
         layer_paths.push(layer_dir);
     }
 
@@ -2802,51 +2944,39 @@ fn setup_container_network_with_ports(
     std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
 
     // Start slirp4netns to provide userspace networking
-    // Try slirp4netns first, then fall back to pasta if available
     let network_pid_file = container_dir.join("network.pid");
 
-    // Check if slirp4netns is available
-    let slirp_available = Command::new("which")
-        .arg("slirp4netns")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // Build slirp4netns command with port forwarding - skip `which` check for performance
+    let mut slirp_cmd = Command::new("slirp4netns");
+    slirp_cmd
+        .arg("--configure")
+        .arg("--mtu=65520")
+        .arg("--disable-host-loopback");
 
-    if slirp_available {
-        // Build slirp4netns command with port forwarding
-        let mut slirp_cmd = Command::new("slirp4netns");
-        slirp_cmd
-            .arg("--configure")
-            .arg("--mtu=65520")
-            .arg("--disable-host-loopback");
-
-        // Add port forwards
-        for port_spec in ports {
-            if let Some((host_port, container_port, _protocol)) = parse_port_spec(port_spec) {
-                // slirp4netns uses format: host_port:guest_port
-                slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
-                println!("Port mapping: {} -> {}", host_port, container_port);
-            }
+    // Add port forwards
+    for port_spec in ports {
+        if let Some((host_port, container_port, _protocol)) = parse_port_spec(port_spec) {
+            // slirp4netns uses format: host_port:guest_port
+            slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
+            println!("Port mapping: {} -> {}", host_port, container_port);
         }
+    }
 
-        slirp_cmd
-            .arg(pid_raw.to_string())
-            .arg("tap0")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+    slirp_cmd
+        .arg(pid_raw.to_string())
+        .arg("tap0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
-        match slirp_cmd.spawn() {
-            Ok(child) => {
-                // Store the slirp4netns PID for cleanup
-                let slirp_pid = child.id();
-                let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
-                // Note: Removed sleep - slirp4netns will configure asynchronously
-                // The container process can start immediately
-            }
-            Err(_) => {
-                // Silent failure - network will be limited but container can still run
-            }
+    match slirp_cmd.spawn() {
+        Ok(child) => {
+            // Store the slirp4netns PID for cleanup
+            let slirp_pid = child.id();
+            let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
+        }
+        Err(_) => {
+            // Silent failure - slirp4netns not available, network will be limited but container can still run
         }
     }
 
@@ -4130,15 +4260,19 @@ pub async fn remove_all_stopped_containers(force: bool) {
 
     let mut removed_count = 0;
     let mut failed_count = 0;
-    let mut skipped_count = 0;
+    let skipped_count;
 
-    // Iterate through all containers
+    // First pass: collect containers to remove
+    let mut containers_to_remove = Vec::new();
+    let mut containers_to_skip = Vec::new();
+
     match std::fs::read_dir(&containers_dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
                     let container_id = entry.file_name().to_string_lossy().to_string();
-                    let metadata_path = entry.path().join("metadata.json");
+                    let container_path = entry.path();
+                    let metadata_path = container_path.join("metadata.json");
 
                     // Check container status
                     let should_remove = if metadata_path.exists() {
@@ -4161,43 +4295,9 @@ pub async fn remove_all_stopped_containers(force: bool) {
                     };
 
                     if should_remove {
-                        // Unmount overlay if mounted
-                        let merged_dir = entry.path().join("merged");
-                        if merged_dir.exists() {
-                            let _ = std::process::Command::new("fusermount")
-                                .arg("-u")
-                                .arg(&merged_dir)
-                                .output();
-
-                            let _ = std::process::Command::new("umount")
-                                .arg(&merged_dir)
-                                .output();
-                        }
-
-                        // Remove container directory
-                        match std::fs::remove_dir_all(entry.path()) {
-                            Ok(_) => {
-                                println!(
-                                    "Removed container {}",
-                                    &container_id[..12.min(container_id.len())]
-                                );
-                                removed_count += 1;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Failed to remove container {}: {}",
-                                    &container_id[..12.min(container_id.len())],
-                                    e
-                                );
-                                failed_count += 1;
-                            }
-                        }
+                        containers_to_remove.push((container_id, container_path));
                     } else {
-                        println!(
-                            "Skipping running container {}",
-                            &container_id[..12.min(container_id.len())]
-                        );
-                        skipped_count += 1;
+                        containers_to_skip.push(container_id);
                     }
                 }
             }
@@ -4205,6 +4305,70 @@ pub async fn remove_all_stopped_containers(force: bool) {
         Err(e) => {
             eprintln!("Failed to read containers directory: {}", e);
             return;
+        }
+    }
+
+    // Report skipped containers
+    for container_id in &containers_to_skip {
+        println!(
+            "Skipping running container {}",
+            &container_id[..12.min(container_id.len())]
+        );
+    }
+    skipped_count = containers_to_skip.len();
+
+    // Parallel removal of containers
+    if !containers_to_remove.is_empty() {
+        let mut removal_handles = Vec::new();
+
+        for (container_id, container_path) in containers_to_remove {
+            let handle = tokio::task::spawn_blocking(move || {
+                // Unmount overlay if mounted
+                let merged_dir = container_path.join("merged");
+                if merged_dir.exists() {
+                    let _ = std::process::Command::new("fusermount")
+                        .arg("-u")
+                        .arg(&merged_dir)
+                        .output();
+
+                    let _ = std::process::Command::new("umount")
+                        .arg(&merged_dir)
+                        .output();
+                }
+
+                // Remove container directory
+                match std::fs::remove_dir_all(&container_path) {
+                    Ok(_) => Ok(container_id),
+                    Err(e) => Err((container_id, e.to_string())),
+                }
+            });
+
+            removal_handles.push(handle);
+        }
+
+        // Wait for all removals to complete
+        for handle in removal_handles {
+            match handle.await {
+                Ok(Ok(container_id)) => {
+                    println!(
+                        "Removed container {}",
+                        &container_id[..12.min(container_id.len())]
+                    );
+                    removed_count += 1;
+                }
+                Ok(Err((container_id, e))) => {
+                    eprintln!(
+                        "Failed to remove container {}: {}",
+                        &container_id[..12.min(container_id.len())],
+                        e
+                    );
+                    failed_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("Task failed: {}", e);
+                    failed_count += 1;
+                }
+            }
         }
     }
 
@@ -4442,6 +4606,13 @@ pub async fn stop_container(
 }
 
 fn calculate_image_size(storage: &StorageLayout, manifest: &serde_json::Value) -> String {
+    // First check for cached size (calculated during pull)
+    if let Some(cached_size) = manifest.get("cached_size").and_then(|v| v.as_u64()) {
+        if cached_size > 0 {
+            return format_size(cached_size);
+        }
+    }
+
     let mut total_size: u64 = 0;
 
     // First check if this is a manifest list or a direct manifest
