@@ -551,6 +551,105 @@ Build a container image (not yet implemented).
 carrier build <image> <url>
 ```
 
+### doctor
+Check system dependencies and provide installation guidance.
+
+**Usage:**
+```bash
+carrier doctor [OPTIONS]
+carrier check [OPTIONS]  # Alias
+```
+
+**Options:**
+- `--fix`: Attempt to automatically fix missing dependencies individually
+- `--all`: Install all dependencies in a single batch command
+- `--dry-run`: Show what would be installed without making changes
+- `-y, --yes`: Skip confirmation prompts (use with --fix or --all)
+- `-v, --verbose`: Show detailed output during installation
+- `--json`: Output results in JSON format for scripting
+
+**Examples:**
+```bash
+# Check all dependencies
+carrier doctor
+
+# Attempt to fix missing dependencies (with prompts)
+carrier doctor --fix
+
+# Fix missing dependencies without prompts
+carrier doctor --fix -y
+
+# Preview what would be installed
+carrier doctor --dry-run
+
+# Install all dependencies at once
+carrier doctor --all
+
+# Install all dependencies without prompts
+carrier doctor --all -y
+
+# Verbose output with dry-run
+carrier doctor --fix --dry-run --verbose
+
+# Output as JSON for CI/scripting
+carrier doctor --json
+```
+
+**Installation Features:**
+- Checks sudo availability before attempting installation
+- Waits for package manager if locked by another process
+- Updates package cache before installing
+- Retries failed installations with exponential backoff
+- Verifies each installation succeeded
+- Sets required SUID bits on binaries automatically
+- Configures subordinate UID/GID ranges
+
+**What It Checks:**
+
+Essential dependencies:
+- `runc` - OCI container runtime
+- `fuse-overlayfs` - FUSE-based overlay filesystem
+- `/dev/fuse` - FUSE device availability
+- `fusermount3` - FUSE mount utility with SUID bit
+- User namespaces - Kernel support enabled
+
+Recommended dependencies:
+- `pasta` - High-performance userspace networking
+- `slirp4netns` - Fallback networking
+- `nsenter` - For shell/exec operations
+- `newuidmap`/`newgidmap` - UID/GID mapping
+- `/etc/subuid` and `/etc/subgid` - Subordinate ID ranges
+
+**Platform Support:**
+- Detects Linux distributions (Ubuntu, Debian, Fedora, Arch, etc.)
+- Suggests correct package manager commands
+- macOS support with graceful degradation (Lima recommended)
+
+**Output Format:**
+```
+[OK] runc (version 1.1.12)
+[WARN] pasta - not found
+       Alternative: slirp4netns is available
+       To install: sudo apt-get install -y passt
+[MISSING] fuse-overlayfs
+       To install: sudo apt-get install -y fuse-overlayfs
+```
+
+**JSON Output:**
+```json
+{
+  "platform": {
+    "os": "linux",
+    "distro": "ubuntu",
+    "version": "22.04"
+  },
+  "checks": [
+    {"name": "runc", "status": "ok", "details": "1.1.12"}
+  ],
+  "summary": {"passed": 8, "warnings": 2, "errors": 0}
+}
+```
+
 ## Image Format
 
 Images can be specified in various formats:

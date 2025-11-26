@@ -1,4 +1,5 @@
 use clap::{error::Result, Parser, Subcommand};
+pub use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "carrier", version, about, long_about = None)]
@@ -178,6 +179,41 @@ pub enum Commands {
         /// Target platform (e.g., linux/amd64)
         #[arg(long = "platform")]
         platform: Option<String>,
+    },
+
+    /// Check system dependencies and provide installation guidance
+    #[command(alias = "check")]
+    Doctor {
+        /// Attempt to fix missing dependencies automatically
+        #[arg(long)]
+        fix: bool,
+
+        /// Output results in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Install all dependencies at once
+        #[arg(long)]
+        all: bool,
+
+        /// Show what would be installed without making changes
+        #[arg(long, alias = "dry-run")]
+        dry_run: bool,
+
+        /// Skip confirmation prompts (use with --fix or --all)
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Show verbose output during installation
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Generate shell completions for the specified shell
+    Completions {
+        /// Shell to generate completions for (bash, zsh, fish, powershell, elvish)
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
