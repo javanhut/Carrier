@@ -216,6 +216,8 @@ carrier run gcr.io/project/image:tag
 carrier run public.ecr.aws/nginx/nginx:latest
 ```
 
+Carrier also honors Podman-style short-name resolution using `/etc/containers/shortnames.conf` and unqualified search registries from `/etc/containers/registries.conf`.
+
 ## Troubleshooting
 
 ### Container Won't Start

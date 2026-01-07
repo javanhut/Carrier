@@ -4,14 +4,11 @@ pub use clap_complete::Shell;
 #[derive(Parser)]
 #[command(name = "carrier", version, about, long_about = None)]
 pub struct Cli {
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
-
-    #[arg(short, long, default_value = "carrier_config.toml")]
+    #[arg(long, default_value = "carrier_config.toml", global = true)]
     config: String,
 
     /// Force storage driver: auto, overlay-fuse, overlay-native, or vfs
-    #[arg(long = "storage-driver")]
+    #[arg(long = "storage-driver", global = true)]
     pub storage_driver: Option<String>,
 
     #[command(subcommand)]
@@ -107,6 +104,10 @@ pub enum Commands {
         /// Force removal even if container is running
         #[arg(short, long)]
         force: bool,
+
+        /// Remove all images
+        #[arg(long = "all")]
+        all_images: bool,
 
         /// Remove all stopped containers
         #[arg(short = 'c', long = "all-containers")]

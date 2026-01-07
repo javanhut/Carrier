@@ -1,6 +1,6 @@
 # Rootless Container Execution
 
-Carrier supports running containers without root privileges, similar to Podman's rootless mode. This allows regular users to create and manage containers securely without needing sudo or root access.
+Carrier supports running containers without root privileges, similar to Podman's rootless mode. This allows regular users to create and manage containers securely without needing sudo or root access. Carrier may still prompt for sudo to install missing dependencies or adjust kernel settings when allowed.
 
 ## How It Works
 
@@ -12,6 +12,8 @@ Carrier implements rootless containers using:
 
 ## Prerequisites
 
+Carrier will automatically check and attempt to fix common rootless requirements on first run (user namespaces, `/proc` settings, runtime dependencies). To disable automatic changes, set `CARRIER_ALLOW_SYSTEM_CHANGES=0` and follow the manual steps below.
+
 ### 1. Kernel Support
 Ensure your kernel supports user namespaces:
 ```bash
@@ -21,6 +23,8 @@ Should return `1`. If not, enable it with:
 ```bash
 sudo sysctl kernel.unprivileged_userns_clone=1
 ```
+
+Carrier may also raise `user.max_user_namespaces` and relax AppArmor userns restrictions when allowed.
 
 ### 2. Subuid/Subgid Configuration
 Check if your user has subuid/subgid allocations:
@@ -51,7 +55,7 @@ ls -l /usr/bin/newuidmap /usr/bin/newgidmap
 
 **Why is this needed?**
 - Without setuid on these binaries, containers can only map a single UID (container root = host user)
-- With setuid, runc can map multiple UIDs using your subuid/subgid ranges
+- With setuid, runc or crun can map multiple UIDs using your subuid/subgid ranges
 - This allows package managers (apt, yum, dnf) and other tools to switch to unprivileged users
 - This is a **one-time system configuration**, not a security risk (these binaries are specifically designed to be setuid)
 
@@ -127,7 +131,8 @@ carrier terminal container-id bash
 Rootless mode automatically selects the best available storage driver:
 
 1. **OverlayFS (FUSE)**: Preferred when fuse-overlayfs is installed
-2. **VFS (Copy)**: Fallback option that copies all layers (slower but always works)
+2. **OverlayFS (Native)**: Used when supported by the kernel
+3. **VFS (Copy)**: Fallback option that copies all layers (slower but always works)
 
 The driver selection is automatic based on what's available and working on your system.
 
@@ -166,7 +171,7 @@ If you encounter "Operation not permitted" errors:
 ### Storage Driver Issues
 If overlay mounting fails:
 
-1. Install fuse-overlayfs:
+1. Install fuse-overlayfs (only needed if automatic setup is disabled):
    ```bash
    # Debian/Ubuntu
    sudo apt-get install fuse-overlayfs
@@ -209,10 +214,10 @@ Carrier's rootless implementation is inspired by Podman but uses a simpler appro
 
 | Aspect | Carrier | Podman |
 |--------|---------|--------|
-| **Runtime** | Direct namespace management | OCI runtime (crun/runc) |
-| **User Mapping** | unshare --map-root-user | newuidmap/newgidmap |
-| **Exec Method** | unshare + chroot | Runtime exec API |
-| **Configuration** | Minimal | Full OCI spec |
+| **Runtime** | OCI runtime (runc/crun) | OCI runtime (crun/runc) |
+| **User Mapping** | newuidmap/newgidmap | newuidmap/newgidmap |
+| **Exec Method** | nsenter + runtime exec | Runtime exec API |
+| **Configuration** | Minimal | Full OCI/libpod stack |
 
 ## Best Practices
 

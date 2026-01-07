@@ -84,9 +84,9 @@ Carrier supports multiple storage drivers with automatic fallback:
 ### Storage Driver Selection
 
 The driver selection follows this cascade:
-1. If `--storage-driver` flag is specified, use that driver first
-2. Otherwise, try fuse-overlayfs (attempt auto-install if missing)
-3. If fuse-overlayfs fails, try native overlay
+1. If `--storage-driver` is set to `overlay-fuse`, `overlay-native`, or `vfs`, force that driver
+2. Otherwise (auto), prefer fuse-overlayfs when available (Carrier can install it if allowed)
+3. If fuse-overlayfs fails or is unavailable, try native overlay
 4. If native overlay fails, fall back to VFS
 
 ### Automatic Dependency Management
@@ -135,7 +135,7 @@ The storage system is designed for rootless operation:
 
 **"fuse-overlayfs not found"**
 - Carrier will attempt automatic installation
-- If automatic installation fails, manually install: `sudo apt install fuse-overlayfs fuse3`
+- If automatic installation is disabled or fails, manually install: `sudo apt install fuse-overlayfs fuse3`
 - System will automatically fall back to VFS if fuse is unavailable
 
 **"fusermount3 is not setuid"**
@@ -153,7 +153,7 @@ The storage system is designed for rootless operation:
 
 ### Manual Storage Driver Selection
 
-You can force a specific storage driver using the global `--storage-driver` flag (must be placed before the subcommand):
+You can force a specific storage driver using the global `--storage-driver` flag:
 ```bash
 # Force fuse-overlayfs
 carrier --storage-driver overlay-fuse run alpine
@@ -165,7 +165,7 @@ carrier --storage-driver overlay-native run ubuntu
 carrier --storage-driver vfs run debian
 ```
 
-**Note**: The `--storage-driver` flag is a global option and must be specified **before** the subcommand (e.g., `run`, `pull`).
+**Note**: `--storage-driver auto` restores automatic selection.
 
 ## Future Enhancements
 

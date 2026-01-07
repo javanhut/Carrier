@@ -265,10 +265,8 @@ fn check_runc() -> CheckResult {
         let version = get_command_version("runc");
         CheckResult::Ok { version }
     } else if command_exists("crun") {
-        CheckResult::Unavailable {
-            reason: "runc not found".to_string(),
-            alternative: Some("crun is available and can be used instead".to_string()),
-        }
+        let version = get_command_version("crun");
+        CheckResult::Ok { version }
     } else {
         CheckResult::Missing {
             suggestion: "Install runc package".to_string(),

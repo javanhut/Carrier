@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 lazy_static! {
     static ref REGISTRYMAP: HashMap<&'static str, &'static str> = {
@@ -220,8 +221,9 @@ pub async fn run_image(
         return;
     }
 
-    // Not a local image ID, proceed with parsing as image reference
-    let parsed_image = match RegistryImage::parse(&image_name) {
+    // Not a local image ID, resolve and parse image reference
+    let resolved_image_name = resolve_image_reference(&image_name);
+    let parsed_image = match RegistryImage::parse(&resolved_image_name) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("Failed to parse image: {}", e);
@@ -306,7 +308,7 @@ pub async fn run_image(
     }
 
     // Get auth token (try authenticated first, fall back to anonymous)
-    let image_path = normalize_image_path(&parsed_image.image);
+    let image_path = normalize_image_path(&parsed_image.image, registry);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             if verbose {
@@ -488,8 +490,75 @@ pub async fn run_image_with_command(
         return;
     }
 
-    // Not a local image ID, proceed with parsing as image reference
-    let parsed_image = match RegistryImage::parse(&image_name) {
+    let resolved_image_name = resolve_image_reference(&image_name);
+    if resolved_image_name != image_name {
+        if let Ok(original_parsed) = RegistryImage::parse(&image_name) {
+            let original_path =
+                storage.image_metadata_path(&original_parsed.image, &original_parsed.tag);
+            if original_path.exists() {
+                if verbose {
+                    println!(
+                        "Image {}:{} found locally",
+                        original_parsed.image, original_parsed.tag
+                    );
+                }
+
+                // Load the manifest from local storage
+                let manifest_content = match std::fs::read_to_string(&original_path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("Failed to read local manifest: {}", e);
+                        return;
+                    }
+                };
+
+                let manifest: ManifestV2 = match serde_json::from_str(&manifest_content) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Failed to parse local manifest: {}", e);
+                        return;
+                    }
+                };
+
+                let mut layer_paths = Vec::new();
+                for layer in &manifest.layers {
+                    let layer_path = storage.image_layer_path(&layer.digest);
+                    if !layer_path.exists() {
+                        eprintln!(
+                            "Layer {} not found locally. Please re-pull the image.",
+                            &layer.digest[..12]
+                        );
+                        return;
+                    }
+                    layer_paths.push(layer_path);
+                }
+
+                if let Err(e) = run_container_with_storage(
+                    &original_parsed,
+                    &manifest,
+                    layer_paths,
+                    &storage,
+                    detach,
+                    name.clone(),
+                    elevated,
+                    Some(command.clone()),
+                    &volumes,
+                    &ports,
+                    &env_vars,
+                    storage_driver.as_deref(),
+                    verbose,
+                )
+                .await
+                {
+                    eprintln!("Failed to run container: {}", e);
+                }
+                return;
+            }
+        }
+    }
+
+    // Not a local image ID, resolve and parse image reference
+    let parsed_image = match RegistryImage::parse(&resolved_image_name) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("Failed to parse image: {}", e);
@@ -574,7 +643,7 @@ pub async fn run_image_with_command(
     }
 
     // Get auth token (try authenticated first, fall back to anonymous)
-    let image_path = normalize_image_path(&parsed_image.image);
+    let image_path = normalize_image_path(&parsed_image.image, registry);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             if verbose {
@@ -696,13 +765,13 @@ async fn exec_elevated_container(
     exec_cmd.env("TERM", "xterm");
 
     if is_interactive {
-        println!("Starting interactive session...");
-        println!("Type 'exit' or press Ctrl+D to exit.\n");
-
         // Check if we're in a TTY
         let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
 
         if is_tty {
+            println!("Starting interactive session...");
+            println!("Type 'exit' or press Ctrl+D to exit.\n");
+
             // For elevated containers, use nsenter directly (no user namespace mapping)
             let mut nsenter_args = vec![
                 "--target".to_string(),
@@ -734,7 +803,7 @@ async fn exec_elevated_container(
                 return Err(format!("Command exited with code {}", exit_code).into());
             }
         } else {
-            println!("Not running in a TTY, using regular command execution...");
+            println!("No TTY available, running without PTY...");
             exec_cmd.stdin(Stdio::inherit());
             exec_cmd.stdout(Stdio::inherit());
             exec_cmd.stderr(Stdio::inherit());
@@ -774,6 +843,7 @@ async fn exec_rootless_container(
     is_interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
+    use std::io::IsTerminal;
 
     // Get container ID from directory name
     let container_id = container_dir
@@ -782,23 +852,32 @@ async fn exec_rootless_container(
         .to_string_lossy()
         .to_string();
 
+    let runtime = runtime_binary()?;
     println!(
-        "Executing in container {} using runc exec",
-        short12(&container_id)
+        "Executing in container {} using {} exec",
+        short12(&container_id),
+        runtime
     );
 
     // Determine runc root directory
     let runc_root_path = get_runc_root();
 
     // Build runc exec command
-    let mut exec_cmd = Command::new("runc");
+    let mut exec_cmd = Command::new(runtime);
     exec_cmd.arg("--root").arg(&runc_root_path).arg("exec");
+
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let use_tty = is_interactive && stdin_is_tty;
 
     // Add -t flag for terminal if interactive
     if is_interactive {
-        println!("Starting interactive session...");
-        println!("Type 'exit' or press Ctrl+D to exit.\n");
-        exec_cmd.arg("-t");
+        if use_tty {
+            println!("Starting interactive session...");
+            println!("Type 'exit' or press Ctrl+D to exit.\n");
+            exec_cmd.arg("-t");
+        } else {
+            println!("No TTY available, running without PTY...");
+        }
     }
 
     // Set environment variables
@@ -827,7 +906,45 @@ async fn exec_rootless_container(
         .stderr(Stdio::inherit());
 
     // Execute the command
-    let status = exec_cmd.status()?;
+    let status = if use_tty {
+        let status = exec_cmd.status();
+        if status
+            .as_ref()
+            .map(|s| s.code() == Some(255))
+            .unwrap_or(false)
+        {
+            eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
+            let mut retry_cmd = Command::new(runtime);
+            retry_cmd.arg("--root").arg(&runc_root_path).arg("exec");
+
+            retry_cmd
+                .arg("--env")
+                .arg("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .arg("--env")
+                .arg("HOME=/root")
+                .arg("--env")
+                .arg("TERM=xterm");
+
+            retry_cmd.arg(&container_id);
+
+            if command.is_empty() {
+                retry_cmd.arg("/bin/sh");
+            } else {
+                retry_cmd.args(&command);
+            }
+
+            retry_cmd
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+
+            retry_cmd.status()
+        } else {
+            status
+        }
+    } else {
+        exec_cmd.status()
+    }?;
 
     if !status.success() {
         if let Some(code) = status.code() {
@@ -1561,7 +1678,8 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         return;
     }
 
-    let parsed_image = match RegistryImage::parse(&image_name) {
+    let resolved_image_name = resolve_image_reference(&image_name);
+    let parsed_image = match RegistryImage::parse(&resolved_image_name) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("Failed to parse image: {}", e);
@@ -1575,7 +1693,7 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     println!("Tag: {}", parsed_image.tag);
 
     // Get auth token (try authenticated first, fall back to anonymous)
-    let image_path = normalize_image_path(&parsed_image.image);
+    let image_path = normalize_image_path(&parsed_image.image, registry);
     let token = match get_authenticated_token(registry, &image_path).await {
         Ok(t) => {
             println!("Successfully obtained auth token");
@@ -1637,7 +1755,7 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         return;
     }
 
-    println!("\nImage {} pulled successfully!", image_name);
+    println!("\nImage {} pulled successfully!", resolved_image_name);
     println!(
         "Stored in: {}",
         storage
@@ -1653,7 +1771,7 @@ async fn get_manifest_content(
     let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
 
     if let Some(registry_endpoint) = REGISTRYMAP.get(registry) {
-        let image_path = normalize_image_path(&parsed_image.image);
+        let image_path = normalize_image_path(&parsed_image.image, registry);
         let manifest_url = format!(
             "{}{}/manifests/{}",
             registry_endpoint, image_path, parsed_image.tag
@@ -1662,6 +1780,9 @@ async fn get_manifest_content(
         let response = make_authenticated_request(&manifest_url, token).await?;
 
         if !response.status().is_success() {
+            if response.status().as_u16() == 401 {
+                return Err("Failed to get manifest: 401 Unauthorized. Check the image name or run `carrier auth <username> <registry>` for private images.".into());
+            }
             return Err(format!("Failed to get manifest: {}", response.status()).into());
         }
 
@@ -1709,7 +1830,7 @@ async fn parse_and_get_manifest(
         // Fetch the specific manifest
         let registry = parsed_image.registry.as_deref().unwrap_or("docker.io");
         if let Some(registry_endpoint) = REGISTRYMAP.get(registry) {
-            let image_path = normalize_image_path(&parsed_image.image);
+            let image_path = normalize_image_path(&parsed_image.image, registry);
             let manifest_url = format!(
                 "{}{}/manifests/{}",
                 registry_endpoint, image_path, selected_manifest.digest
@@ -1747,7 +1868,7 @@ async fn download_layers_with_storage(
         .get(registry)
         .ok_or_else(|| format!("Registry {} not found", registry))?;
 
-    let image_path = normalize_image_path(&parsed_image.image);
+    let image_path = normalize_image_path(&parsed_image.image, registry);
     let client = Client::new();
 
     // Create multi-progress for multiple layers
@@ -2213,6 +2334,10 @@ async fn run_container_with_storage(
 
     // Preflight checks for rootless operation
     crate::storage::preflight_rootless_checks();
+    if let Err(e) = ensure_userns_available() {
+        return Err(e);
+    }
+    let runtime = runtime_binary()?;
     // Allow forcing storage driver via CLI
     let mut container_storage = if let Some(ref drv) = storage_driver {
         ContainerStorage::new_with_driver(Some(drv))?
@@ -2411,6 +2536,8 @@ async fn run_container_with_storage(
 
     // Detect if this should be an interactive container (not applicable in detached mode)
     // Only use interactive mode if it's a plain shell without -c flag
+    use std::io::IsTerminal;
+    let stdin_is_tty = std::io::stdin().is_terminal();
     let has_command_flag = command_to_run.contains(&"-c".to_string());
     let is_shell_only = (command_to_run[0].contains("bash") || command_to_run[0].contains("sh"))
         && command_to_run.len() == 1;
@@ -2419,6 +2546,7 @@ async fn run_container_with_storage(
             || command_to_run.contains(&"-it".to_string())
             || command_to_run.contains(&"-i".to_string()))
         && !has_command_flag;
+    let use_tty = is_interactive && stdin_is_tty;
 
     // Build the command path
     let _cmd_in_container = &command_to_run[0];
@@ -2449,6 +2577,7 @@ async fn run_container_with_storage(
             env_strings,
             wd_clone,
             !elevated,
+            false,
             &volumes_clone,
         ).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
@@ -2463,7 +2592,7 @@ async fn run_container_with_storage(
         }
 
         // Create the container
-        let create_status = Command::new("runc")
+        let create_status = Command::new(runtime)
             .arg("--root")
             .arg(&runc_root_path)
             .arg("create")
@@ -2473,11 +2602,11 @@ async fn run_container_with_storage(
             .status()?;
 
         if !create_status.success() {
-            return Err(format!("Failed to create container with runc").into());
+            return Err(format!("Failed to create container with {}", runtime).into());
         }
 
         // Start the container
-        let start_status = Command::new("runc")
+        let start_status = Command::new(runtime)
             .arg("--root")
             .arg(&runc_root_path)
             .arg("start")
@@ -2485,11 +2614,11 @@ async fn run_container_with_storage(
             .status()?;
 
         if !start_status.success() {
-            return Err(format!("Failed to start container with runc").into());
+            return Err(format!("Failed to start container with {}", runtime).into());
         }
 
         // Get container PID from runc state
-        let state_output = Command::new("runc")
+        let state_output = Command::new(runtime)
             .arg("--root")
             .arg(&runc_root_path)
             .arg("state")
@@ -2525,9 +2654,11 @@ async fn run_container_with_storage(
 
     // Foreground mode: use runc create + network setup + exec
     // This ensures network is properly configured before the container runs
-    if is_interactive && verbose {
+    if use_tty && verbose {
         println!("\nStarting interactive container session...");
         println!("Type 'exit' or press Ctrl+D to exit the container.\n");
+    } else if is_interactive && !stdin_is_tty && verbose {
+        eprintln!("Note: No TTY available; running without TTY.");
     }
 
     // Modify OCI spec to use a pause-like init process
@@ -2552,7 +2683,7 @@ async fn run_container_with_storage(
     std::fs::write(&config_path, serde_json::to_string_pretty(&oci_spec)?)?;
 
     // Create the container with the pause process
-    let create_status = Command::new("runc")
+    let create_status = Command::new(runtime)
         .arg("--root")
         .arg(&runc_root_path)
         .arg("create")
@@ -2565,11 +2696,11 @@ async fn run_container_with_storage(
         .status()?;
 
     if !create_status.success() {
-        return Err(format!("Failed to create container with runc").into());
+        return Err(format!("Failed to create container with {}", runtime).into());
     }
 
     // Get container PID from runc state
-    let state_output = Command::new("runc")
+    let state_output = Command::new(runtime)
         .arg("--root")
         .arg(&runc_root_path)
         .arg("state")
@@ -2598,7 +2729,7 @@ async fn run_container_with_storage(
     }
 
     // Start the container (starts the pause process)
-    let start_status = Command::new("runc")
+    let start_status = Command::new(runtime)
         .arg("--root")
         .arg(&runc_root_path)
         .arg("start")
@@ -2606,16 +2737,15 @@ async fn run_container_with_storage(
         .status()?;
 
     if !start_status.success() {
-        return Err(format!("Failed to start container with runc").into());
+        return Err(format!("Failed to start container with {}", runtime).into());
     }
 
     // Now exec the actual command with inherited stdio
-    use std::io::IsTerminal;
-    let use_tty = is_interactive && std::io::stdin().is_terminal();
+    let inherit_stdin = use_tty || !stdin_is_tty;
 
     // Try with TTY first if interactive, fall back to non-TTY if it fails
     let exec_result = if use_tty {
-        let mut exec_cmd = Command::new("runc");
+        let mut exec_cmd = Command::new(runtime);
         exec_cmd
             .arg("--root")
             .arg(&runc_root_path)
@@ -2637,7 +2767,7 @@ async fn run_container_with_storage(
         // If TTY allocation failed, retry without -t
         if result.as_ref().map(|s| s.code() == Some(255)).unwrap_or(false) {
             eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
-            let mut retry_cmd = Command::new("runc");
+            let mut retry_cmd = Command::new(runtime);
             retry_cmd
                 .arg("--root")
                 .arg(&runc_root_path)
@@ -2658,7 +2788,7 @@ async fn run_container_with_storage(
             result
         }
     } else {
-        let mut exec_cmd = Command::new("runc");
+        let mut exec_cmd = Command::new(runtime);
         exec_cmd
             .arg("--root")
             .arg(&runc_root_path)
@@ -2670,7 +2800,7 @@ async fn run_container_with_storage(
         }
 
         exec_cmd
-            .stdin(if is_interactive {
+            .stdin(if inherit_stdin {
                 Stdio::inherit()
             } else {
                 Stdio::null()
@@ -2685,41 +2815,13 @@ async fn run_container_with_storage(
     let exit_code = match exec_result {
         Ok(status) => status.code().unwrap_or(-1),
         Err(e) => {
-            let _ = Command::new("runc")
-                .arg("--root")
-                .arg(&runc_root_path)
-                .arg("kill")
-                .arg(&container_id)
-                .arg("SIGKILL")
-                .status();
-            let _ = Command::new("runc")
-                .arg("--root")
-                .arg(&runc_root_path)
-                .arg("delete")
-                .arg(&container_id)
-                .status();
+            cleanup_runtime_container(runtime, &runc_root_path, &container_id);
             return Err(format!("Failed to exec in container: {}", e).into());
         }
     };
 
-    // Kill and delete the container
-    let _ = Command::new("runc")
-        .arg("--root")
-        .arg(&runc_root_path)
-        .arg("kill")
-        .arg(&container_id)
-        .arg("SIGTERM")
-        .status();
-
-    // Give it a moment to clean up
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    let _ = Command::new("runc")
-        .arg("--root")
-        .arg(&runc_root_path)
-        .arg("delete")
-        .arg(&container_id)
-        .status();
+    // Kill and delete the container if it exists in runtime
+    cleanup_runtime_container(runtime, &runc_root_path, &container_id);
 
     // Update container status
     let metadata = serde_json::json!({
@@ -2751,10 +2853,10 @@ async fn run_container_with_storage(
     Ok(())
 }
 
-fn normalize_image_path(image_name: &str) -> String {
+fn normalize_image_path(image_name: &str, registry: &str) -> String {
     let parts: Vec<&str> = image_name.split('/').collect();
     match parts.len() {
-        1 => format!("library/{}", parts[0]),
+        1 if registry == "docker.io" => format!("library/{}", parts[0]),
         _ => image_name.to_string(),
     }
 }
@@ -2763,8 +2865,514 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+static RUNTIME_BIN: OnceLock<String> = OnceLock::new();
+static SHORTNAME_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
+static UNQUALIFIED_REGISTRIES: OnceLock<Vec<String>> = OnceLock::new();
+
+fn allow_system_changes() -> bool {
+    if let Ok(v) = std::env::var("CARRIER_ALLOW_SYSTEM_CHANGES") {
+        let v = v.to_ascii_lowercase();
+        if v == "1" || v == "true" || v == "yes" {
+            return true;
+        }
+        if v == "0" || v == "false" || v == "no" {
+            return false;
+        }
+    }
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+fn runtime_install_map(
+    package: &'static str,
+) -> HashMap<crate::deps::platform::PackageManager, Vec<&'static str>> {
+    use crate::deps::platform::PackageManager;
+    let mut map = HashMap::new();
+    map.insert(PackageManager::Apt, vec![package]);
+    map.insert(PackageManager::Dnf, vec![package]);
+    map.insert(PackageManager::Yum, vec![package]);
+    map.insert(PackageManager::Pacman, vec![package]);
+    map.insert(PackageManager::Zypper, vec![package]);
+    map.insert(PackageManager::Apk, vec![package]);
+    map.insert(PackageManager::Brew, vec![package]);
+    map
+}
+
+fn run_sudo(args: &[String]) -> Result<bool, String> {
+    use std::io::IsTerminal;
+    let mut cmd = Command::new("sudo");
+    if !std::io::stdin().is_terminal() {
+        cmd.arg("-n");
+    }
+    cmd.args(args);
+    let status = cmd.status().map_err(|e| format!("sudo failed: {}", e))?;
+    Ok(status.success())
+}
+
+fn try_sysctl_set(key: &str, value: &str) -> Result<bool, String> {
+    let args = vec![
+        "sysctl".to_string(),
+        "-w".to_string(),
+        format!("{}={}", key, value),
+    ];
+    run_sudo(&args)
+}
+
+fn remount_proc_without_hidepid(options: &str) -> Result<bool, String> {
+    let mut opts: Vec<String> = options
+        .split(',')
+        .filter(|o| !o.starts_with("hidepid=") && !o.starts_with("gid="))
+        .map(|o| o.to_string())
+        .collect();
+    opts.push("hidepid=0".to_string());
+    let opt_str = format!("remount,{}", opts.join(","));
+    let args = vec!["mount".to_string(), "-o".to_string(), opt_str, "/proc".to_string()];
+    run_sudo(&args)
+}
+
+fn attempt_install_runtime(auto_yes: bool) -> Result<(), String> {
+    use crate::deps::checker::{Category, DependencyCheck};
+    use crate::deps::installer::{attempt_install, check_sudo_available, InstallOptions, InstallResult};
+    use crate::deps::platform::detect_platform;
+
+    check_sudo_available()?;
+
+    let platform = detect_platform();
+    let options = InstallOptions {
+        dry_run: false,
+        yes: auto_yes,
+        max_retries: 3,
+        verbose: false,
+    };
+
+    let crun_check = DependencyCheck {
+        name: "crun",
+        category: Category::Essential,
+        purpose: "OCI-compliant container runtime (crun)",
+        alternatives: vec!["runc"],
+        install_packages: runtime_install_map("crun"),
+    };
+
+    match attempt_install(&crun_check, &platform, &options) {
+        InstallResult::Success => Ok(()),
+        InstallResult::Skipped(reason) => Err(reason),
+        InstallResult::Failed(reason) => Err(reason),
+        InstallResult::DryRun(reason) => Err(reason),
+    }
+}
+
+fn runtime_binary() -> Result<&'static str, Box<dyn std::error::Error>> {
+    if let Some(bin) = RUNTIME_BIN.get() {
+        return Ok(bin.as_str());
+    }
+
+    if let Ok(val) = std::env::var("CARRIER_RUNTIME") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            if command_exists(trimmed) {
+                let _ = RUNTIME_BIN.set(trimmed.to_string());
+                return Ok(RUNTIME_BIN.get().unwrap().as_str());
+            }
+            return Err(format!("CARRIER_RUNTIME '{}' not found in PATH", trimmed).into());
+        }
+    }
+
+    if command_exists("runc") {
+        let _ = RUNTIME_BIN.set("runc".to_string());
+        return Ok(RUNTIME_BIN.get().unwrap().as_str());
+    }
+
+    if command_exists("crun") {
+        eprintln!("Note: runc not found; using crun.");
+        let _ = RUNTIME_BIN.set("crun".to_string());
+        return Ok(RUNTIME_BIN.get().unwrap().as_str());
+    }
+
+    let auto_install = allow_system_changes();
+    let can_prompt = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+    };
+
+    if auto_install || can_prompt {
+        eprintln!("No OCI runtime found. Attempting to install crun...");
+        if let Err(e) = attempt_install_runtime(auto_install) {
+            eprintln!("Runtime installation failed: {}", e);
+        }
+
+        if command_exists("crun") {
+            let _ = RUNTIME_BIN.set("crun".to_string());
+            return Ok(RUNTIME_BIN.get().unwrap().as_str());
+        }
+        if command_exists("runc") {
+            let _ = RUNTIME_BIN.set("runc".to_string());
+            return Ok(RUNTIME_BIN.get().unwrap().as_str());
+        }
+    }
+
+    Err("Container runtime not found. Install crun or runc (or run `carrier doctor --fix`).".into())
+}
+
+fn ensure_userns_available() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+        if content.trim() != "1" {
+            if allow_system_changes() {
+                if try_sysctl_set("kernel.unprivileged_userns_clone", "1").ok() == Some(true) {
+                    // continue
+                } else {
+                    return Err("Unprivileged user namespaces are disabled. Enable with: sudo sysctl -w kernel.unprivileged_userns_clone=1".into());
+                }
+            } else {
+                return Err("Unprivileged user namespaces are disabled. Enable with: sudo sysctl -w kernel.unprivileged_userns_clone=1".into());
+            }
+        }
+    }
+
+    if let Ok(content) =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    {
+        if content.trim() == "1" {
+            if allow_system_changes() {
+                if try_sysctl_set("kernel.apparmor_restrict_unprivileged_userns", "0").ok()
+                    != Some(true)
+                {
+                    return Err("AppArmor restricts unprivileged user namespaces. Disable with: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".into());
+                }
+            } else {
+                return Err("AppArmor restricts unprivileged user namespaces. Disable with: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0".into());
+            }
+        }
+    }
+
+    if let Ok(content) = std::fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+        if content.trim() == "0" {
+            if allow_system_changes() {
+                if try_sysctl_set("user.max_user_namespaces", "28633").ok() == Some(true) {
+                    // continue
+                } else {
+                    return Err("User namespaces are disabled (user.max_user_namespaces=0). Enable with: sudo sysctl -w user.max_user_namespaces=28633".into());
+                }
+            } else {
+                return Err("User namespaces are disabled (user.max_user_namespaces=0). Enable with: sudo sysctl -w user.max_user_namespaces=28633".into());
+            }
+        }
+    }
+
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 && parts[1] == "/proc" {
+                let opts = parts[3];
+                if opts.split(',').any(|o| o == "hidepid=2") {
+                    let gid_opt = opts
+                        .split(',')
+                        .find(|o| o.starts_with("gid="))
+                        .and_then(|o| o.split('=').nth(1))
+                        .and_then(|v| v.parse::<u32>().ok());
+                    if let Some(gid) = gid_opt {
+                        let groups = nix::unistd::getgroups().unwrap_or_default();
+                        let in_group = groups.iter().any(|g| g.as_raw() == gid);
+                        if !in_group {
+                            if allow_system_changes() {
+                                if remount_proc_without_hidepid(opts).ok() == Some(true) {
+                                    // continue
+                                } else {
+                                    return Err(format!(
+                                        "procfs is mounted with hidepid=2 (gid={}). Add your user to that group or remount /proc with hidepid=0.",
+                                        gid
+                                    )
+                                    .into());
+                                }
+                            } else {
+                                return Err(format!(
+                                    "procfs is mounted with hidepid=2 (gid={}). Add your user to that group or remount /proc with hidepid=0.",
+                                    gid
+                                )
+                                .into());
+                            }
+                        }
+                    } else {
+                        if allow_system_changes() {
+                            if remount_proc_without_hidepid(opts).ok() == Some(true) {
+                                // continue
+                            } else {
+                                return Err("procfs is mounted with hidepid=2. Remount /proc with hidepid=0 to allow rootless containers.".into());
+                            }
+                        } else {
+                            return Err("procfs is mounted with hidepid=2. Remount /proc with hidepid=0 to allow rootless containers.".into());
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if command_exists("unshare") {
+        let status = Command::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .status();
+        if status.map(|s| !s.success()).unwrap_or(true) {
+            if allow_system_changes() {
+                let _ = try_sysctl_set("kernel.unprivileged_userns_clone", "1");
+                let _ = try_sysctl_set("user.max_user_namespaces", "28633");
+            }
+            return Err("Cannot create user namespaces. Enable CONFIG_USER_NS in the kernel or set kernel.unprivileged_userns_clone=1".into());
+        }
+    }
+
+    Ok(())
+}
+
+fn trim_quotes(input: &str) -> String {
+    let s = input.trim();
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        if (bytes[0] == b'"' && bytes[s.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
+        {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+fn split_image_and_tag(image_ref: &str) -> (String, Option<String>) {
+    let last_slash = image_ref.rfind('/');
+    let last_colon = image_ref.rfind(':');
+    if let Some(colon_idx) = last_colon {
+        if last_slash.map_or(true, |slash_idx| colon_idx > slash_idx) {
+            let name = image_ref[..colon_idx].to_string();
+            let tag = image_ref[colon_idx + 1..].to_string();
+            return (name, Some(tag));
+        }
+    }
+    (image_ref.to_string(), None)
+}
+
+fn runtime_container_state(
+    runtime: &str,
+    runc_root_path: &str,
+    container_id: &str,
+) -> Option<String> {
+    let output = Command::new(runtime)
+        .arg("--root")
+        .arg(runc_root_path)
+        .arg("state")
+        .arg(container_id)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let state_json = String::from_utf8(output.stdout).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&state_json).ok()?;
+    state["status"].as_str().map(|s| s.to_string())
+}
+
+fn cleanup_runtime_container(runtime: &str, runc_root_path: &str, container_id: &str) {
+    let state = runtime_container_state(runtime, runc_root_path, container_id);
+    let should_kill = matches!(state.as_deref(), Some("running") | Some("paused"));
+    let should_delete = matches!(state.as_deref(), Some("running") | Some("paused") | Some("stopped") | Some("created"));
+
+    if should_kill {
+        let _ = Command::new(runtime)
+            .arg("--root")
+            .arg(runc_root_path)
+            .arg("kill")
+            .arg(container_id)
+            .arg("SIGTERM")
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    if should_delete {
+        let _ = Command::new(runtime)
+            .arg("--root")
+            .arg(runc_root_path)
+            .arg("delete")
+            .arg(container_id)
+            .status();
+    }
+}
+
+fn parse_unqualified_search_registries(content: &str) -> Option<Vec<String>> {
+    let mut collecting = false;
+    let mut buf = String::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if !collecting {
+            if let Some(idx) = line.find("unqualified-search-registries") {
+                let after_key = &line[idx..];
+                if let Some(bracket_idx) = after_key.find('[') {
+                    let after_bracket = &after_key[bracket_idx + 1..];
+                    if let Some(end_idx) = after_bracket.find(']') {
+                        let inner = &after_bracket[..end_idx];
+                        let items = inner
+                            .split(',')
+                            .map(|s| trim_quotes(s))
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<String>>();
+                        if !items.is_empty() {
+                            return Some(items);
+                        }
+                    } else {
+                        collecting = true;
+                        buf.push_str(after_bracket);
+                        buf.push(' ');
+                    }
+                }
+            }
+        } else if let Some(end_idx) = line.find(']') {
+            buf.push_str(&line[..end_idx]);
+            let items = buf
+                .split(',')
+                .map(|s| trim_quotes(s))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<String>>();
+            if !items.is_empty() {
+                return Some(items);
+            }
+            collecting = false;
+            buf.clear();
+        } else {
+            buf.push_str(line);
+            buf.push(' ');
+        }
+    }
+
+    None
+}
+
+fn load_unqualified_search_registries() -> Vec<String> {
+    if let Some(cached) = UNQUALIFIED_REGISTRIES.get() {
+        return cached.clone();
+    }
+
+    let mut registries: Vec<String> = Vec::new();
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+        sources.push(config_dir.join("containers").join("registries.conf"));
+    }
+    sources.push(std::path::PathBuf::from("/etc/containers/registries.conf"));
+
+    if let Ok(entries) = std::fs::read_dir("/etc/containers/registries.conf.d") {
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "conf").unwrap_or(false))
+            .collect();
+        files.sort();
+        sources.extend(files);
+    }
+
+    for path in sources {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(list) = parse_unqualified_search_registries(&content) {
+                registries = list;
+            }
+        }
+    }
+
+    if registries.is_empty() {
+        registries.push("docker.io".to_string());
+    }
+
+    let _ = UNQUALIFIED_REGISTRIES.set(registries.clone());
+    registries
+}
+
+fn load_shortname_aliases() -> HashMap<String, String> {
+    if let Some(cached) = SHORTNAME_CACHE.get() {
+        return cached.clone();
+    }
+
+    let mut aliases = HashMap::new();
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+        sources.push(config_dir.join("containers").join("shortnames.conf"));
+    }
+    sources.push(std::path::PathBuf::from("/etc/containers/shortnames.conf"));
+
+    for path in sources {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let mut in_aliases = false;
+            for raw_line in content.lines() {
+                let line = raw_line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with('[') && line.ends_with(']') {
+                    let section = line.trim_matches(&['[', ']'][..]);
+                    in_aliases = section == "aliases" || section == "short-name-aliases";
+                    continue;
+                }
+                if in_aliases {
+                    if let Some((key, value)) = line.split_once('=') {
+                        let key = trim_quotes(key);
+                        let value = trim_quotes(value);
+                        if !key.is_empty() && !value.is_empty() {
+                            aliases.insert(key, value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = SHORTNAME_CACHE.set(aliases.clone());
+    aliases
+}
+
+fn resolve_image_reference(image_ref: &str) -> String {
+    if let Ok(parsed) = RegistryImage::parse(image_ref) {
+        if parsed.registry.is_some() {
+            return image_ref.to_string();
+        }
+    } else {
+        return image_ref.to_string();
+    }
+
+    let (name, tag) = split_image_and_tag(image_ref);
+    let has_explicit_tag = tag.is_some();
+
+    if let Some(alias) = load_shortname_aliases().get(&name) {
+        if has_explicit_tag {
+            let (alias_name, _) = split_image_and_tag(alias);
+            return format!("{}:{}", alias_name, tag.unwrap());
+        }
+        return alias.to_string();
+    }
+
+    let registries = load_unqualified_search_registries();
+    let registry = registries
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "docker.io".to_string());
+
+    if let Some(tag) = tag {
+        format!("{}/{}:{}", registry, name, tag)
+    } else {
+        format!("{}/{}", registry, name)
+    }
+}
+
 /// Cache for subuid/subgid mappings to avoid repeated file I/O
-use std::sync::OnceLock;
 static SUBID_CACHE: OnceLock<(Option<(u32, u32)>, Option<(u32, u32)>)> = OnceLock::new();
 
 /// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid (with caching)
@@ -2878,6 +3486,7 @@ fn generate_oci_config(
     env: Vec<String>,
     working_dir: String,
     add_network_ns: bool,
+    terminal: bool,
     volumes: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let uid = nix::unistd::getuid().as_raw();
@@ -2971,7 +3580,7 @@ fn generate_oci_config(
     let config = serde_json::json!({
         "ociVersion": "1.0.0",
         "process": {
-            "terminal": true,
+            "terminal": terminal,
             "user": {"uid": 0, "gid": 0},
             "args": command,
             "env": env,
@@ -3486,9 +4095,18 @@ mod tests {
 
     #[test]
     fn test_normalize_image_path() {
-        assert_eq!(normalize_image_path("alpine"), "library/alpine");
-        assert_eq!(normalize_image_path("library/nginx"), "library/nginx");
-        assert_eq!(normalize_image_path("myorg/myimg"), "myorg/myimg");
+        assert_eq!(
+            normalize_image_path("alpine", "docker.io"),
+            "library/alpine"
+        );
+        assert_eq!(
+            normalize_image_path("library/nginx", "docker.io"),
+            "library/nginx"
+        );
+        assert_eq!(
+            normalize_image_path("myorg/myimg", "quay.io"),
+            "myorg/myimg"
+        );
     }
 
     #[test]
@@ -3557,7 +4175,7 @@ pub async fn get_repo_auth_token(url: String) -> Result<String, Box<dyn std::err
 
     if let Some(auth_endpoint) = AUTHTOKENMAP.get(registry) {
         // Build the auth URL with query parameters
-        let image_path = normalize_image_path(&parsed_image.image);
+        let image_path = normalize_image_path(&parsed_image.image, registry);
         let scope = format!("repository:{}:pull", image_path);
 
         let auth_url = match registry {
@@ -3869,6 +4487,13 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
     if show_containers {
         // List all containers from storage
         let mut containers = Vec::new();
+        let runtime = match runtime_binary() {
+            Ok(bin) => Some(bin),
+            Err(e) => {
+                eprintln!("Warning: {}", e);
+                None
+            }
+        };
 
         if let Ok(entries) = std::fs::read_dir(storage.base.join("storage/overlay-containers")) {
             for entry in entries.flatten() {
@@ -3912,47 +4537,51 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     "Unknown".to_string()
                                 };
 
-                                // Check if container is actually running using runc state
+                                // Check if container is actually running using runtime state
                                 let actual_status = if status == "running"
                                     || status.starts_with("Up")
                                 {
-                                    // Query runc for actual state
-                                    let runc_root_path = get_runc_root();
+                                    if let Some(runtime) = runtime {
+                                        // Query runtime for actual state
+                                        let runc_root_path = get_runc_root();
 
-                                    let state_result = std::process::Command::new("runc")
-                                        .arg("--root")
-                                        .arg(&runc_root_path)
-                                        .arg("state")
-                                        .arg(&container_id)
-                                        .output();
+                                        let state_result = std::process::Command::new(runtime)
+                                            .arg("--root")
+                                            .arg(&runc_root_path)
+                                            .arg("state")
+                                            .arg(&container_id)
+                                            .output();
 
-                                    if let Ok(output) = state_result {
-                                        if output.status.success() {
-                                            if let Ok(state_json) = String::from_utf8(output.stdout)
-                                            {
-                                                if let Ok(state) =
-                                                    serde_json::from_str::<serde_json::Value>(
-                                                        &state_json,
-                                                    )
+                                        if let Ok(output) = state_result {
+                                            if output.status.success() {
+                                                if let Ok(state_json) = String::from_utf8(output.stdout)
                                                 {
-                                                    if let Some(runc_status) =
-                                                        state["status"].as_str()
+                                                    if let Ok(state) =
+                                                        serde_json::from_str::<serde_json::Value>(
+                                                            &state_json,
+                                                        )
                                                     {
-                                                        match runc_status {
-                                                            "running" => status,
-                                                            "stopped" | "created" => {
-                                                                // Update metadata to reflect stopped state
-                                                                let mut metadata_mut =
-                                                                    metadata.clone();
-                                                                metadata_mut["status"] =
-                                                                    serde_json::json!("exited");
-                                                                let _ = std::fs::write(
-                                                                    &metadata_path,
-                                                                    metadata_mut.to_string(),
-                                                                );
-                                                                "exited"
+                                                        if let Some(runc_status) =
+                                                            state["status"].as_str()
+                                                        {
+                                                            match runc_status {
+                                                                "running" => status,
+                                                                "stopped" | "created" => {
+                                                                    // Update metadata to reflect stopped state
+                                                                    let mut metadata_mut =
+                                                                        metadata.clone();
+                                                                    metadata_mut["status"] =
+                                                                        serde_json::json!("exited");
+                                                                    let _ = std::fs::write(
+                                                                        &metadata_path,
+                                                                        metadata_mut.to_string(),
+                                                                    );
+                                                                    "exited"
+                                                                }
+                                                                _ => "exited",
                                                             }
-                                                            _ => "exited",
+                                                        } else {
+                                                            status
                                                         }
                                                     } else {
                                                         status
@@ -3961,24 +4590,45 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                                     status
                                                 }
                                             } else {
-                                                status
+                                                // Container doesn't exist in runtime, mark as exited
+                                                let mut metadata_mut = metadata.clone();
+                                                metadata_mut["status"] = serde_json::json!("exited");
+                                                let _ = std::fs::write(
+                                                    &metadata_path,
+                                                    metadata_mut.to_string(),
+                                                );
+                                                "exited"
                                             }
                                         } else {
-                                            // Container doesn't exist in runc, mark as exited
-                                            let mut metadata_mut = metadata.clone();
-                                            metadata_mut["status"] = serde_json::json!("exited");
-                                            let _ = std::fs::write(
-                                                &metadata_path,
-                                                metadata_mut.to_string(),
-                                            );
-                                            "exited"
+                                            // Fallback: check PID file
+                                            let pid_file = entry.path().join("pid");
+                                            if pid_file.exists() {
+                                                if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+                                                {
+                                                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                                                        use nix::sys::signal::kill;
+                                                        use nix::unistd::Pid;
+
+                                                        if kill(Pid::from_raw(pid), None).is_ok() {
+                                                            status
+                                                        } else {
+                                                            "exited"
+                                                        }
+                                                    } else {
+                                                        "exited"
+                                                    }
+                                                } else {
+                                                    "exited"
+                                                }
+                                            } else {
+                                                "exited"
+                                            }
                                         }
                                     } else {
                                         // Fallback: check PID file
                                         let pid_file = entry.path().join("pid");
                                         if pid_file.exists() {
-                                            if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
-                                            {
+                                            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                                                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
                                                     use nix::sys::signal::kill;
                                                     use nix::unistd::Pid;
@@ -4343,6 +4993,108 @@ pub async fn remove_item(item: String, force: bool, interactive: bool) {
     }
 }
 
+pub async fn remove_all_images(force: bool, interactive: bool) {
+    // Initialize storage layout
+    let storage = match StorageLayout::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to initialize storage: {}", e);
+            return;
+        }
+    };
+
+    let images_dir = storage.base.join("storage/overlay-images");
+    if !images_dir.exists() {
+        println!("No images found");
+        return;
+    }
+
+    let mut removed_count = 0;
+    let mut failed_count = 0;
+    let mut skipped_count = 0;
+
+    let entries = match std::fs::read_dir(&images_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Failed to read images directory: {}", e);
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+
+        let metadata_path = entry.path();
+        let filename = entry.file_name().to_string_lossy().to_string();
+        let filename = filename.trim_end_matches(".json");
+
+        let (image, tag) = if let Some(last_underscore) = filename.rfind('_') {
+            let image = filename[..last_underscore].replace("_", "/");
+            let tag = filename[last_underscore + 1..].to_string();
+            (image, tag)
+        } else {
+            eprintln!("Skipping image metadata with unexpected name: {}", filename);
+            failed_count += 1;
+            continue;
+        };
+
+        let image_name = format!("{}:{}", image, tag);
+        if interactive && !confirm_removal("image", &image_name) {
+            skipped_count += 1;
+            continue;
+        }
+
+        let manifest_content = match std::fs::read_to_string(&metadata_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Failed to read metadata for {}: {}", image_name, e);
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        remove_image(&storage, &image, &tag, &manifest_content, force);
+
+        if metadata_path.exists() {
+            if force {
+                failed_count += 1;
+            } else {
+                skipped_count += 1;
+            }
+        } else {
+            removed_count += 1;
+        }
+    }
+
+    println!("\n=== Summary ===");
+    if removed_count > 0 {
+        println!(
+            "Removed {} image{}",
+            removed_count,
+            if removed_count == 1 { "" } else { "s" }
+        );
+    }
+    if skipped_count > 0 {
+        println!(
+            "Skipped {} image{}",
+            skipped_count,
+            if skipped_count == 1 { "" } else { "s" }
+        );
+    }
+    if failed_count > 0 {
+        println!(
+            "Failed to remove {} image{}",
+            failed_count,
+            if failed_count == 1 { "" } else { "s" }
+        );
+    }
+    if removed_count == 0 && skipped_count == 0 && failed_count == 0 {
+        println!("No images to remove");
+    }
+}
+
 pub async fn remove_all_stopped_containers(force: bool) {
     // Initialize storage layout
     let storage = match StorageLayout::new() {
@@ -4508,6 +5260,7 @@ pub async fn stop_container(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize storage layout
     let storage = StorageLayout::new()?;
+    let runtime = runtime_binary()?;
 
     // Find the container - support partial IDs
     let container_dir = find_container_by_id(&storage, &container_id)?;
@@ -4537,11 +5290,11 @@ pub async fn stop_container(
 
     println!("Stopping container {}...", short12(&full_container_id));
 
-    // Use runc to stop the container properly
+    // Use OCI runtime to stop the container properly
     let runc_root_path = get_runc_root();
 
-    // Check if container exists in runc
-    let state_result = Command::new("runc")
+    // Check if container exists in runtime
+    let state_result = Command::new(runtime)
         .arg("--root")
         .arg(&runc_root_path)
         .arg("state")
@@ -4553,10 +5306,10 @@ pub async fn stop_container(
         .unwrap_or(false);
 
     if container_in_runc {
-        // Use runc to stop the container
+        // Use runtime to stop the container
         if !force {
-            println!("Sending SIGTERM via runc...");
-            let kill_status = Command::new("runc")
+            println!("Sending SIGTERM via {}...", runtime);
+            let kill_status = Command::new(runtime)
                 .arg("--root")
                 .arg(&runc_root_path)
                 .arg("kill")
@@ -4570,7 +5323,7 @@ pub async fn stop_container(
                 let timeout_duration = std::time::Duration::from_secs(timeout);
 
                 while start.elapsed() < timeout_duration {
-                    let state = Command::new("runc")
+                    let state = Command::new(runtime)
                         .arg("--root")
                         .arg(&runc_root_path)
                         .arg("state")
@@ -4599,10 +5352,10 @@ pub async fn stop_container(
         if force {
             println!("Force killing container...");
         } else {
-            println!("Sending SIGKILL via runc...");
+            println!("Sending SIGKILL via {}...", runtime);
         }
 
-        let _ = Command::new("runc")
+        let _ = Command::new(runtime)
             .arg("--root")
             .arg(&runc_root_path)
             .arg("kill")
@@ -4610,9 +5363,9 @@ pub async fn stop_container(
             .arg("KILL")
             .status();
 
-        // Delete the container from runc
+        // Delete the container from runtime
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = Command::new("runc")
+        let _ = Command::new(runtime)
             .arg("--root")
             .arg(&runc_root_path)
             .arg("delete")

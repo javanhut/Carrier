@@ -8,8 +8,9 @@ mod storage;
 use cli::{Cli, Commands};
 use commands::{
     authenticate_registry, exec_in_container, list_items, pull_image,
-    remove_all_stopped_containers, remove_item, run_image, run_image_with_command,
-    show_container_info, show_container_logs, stop_container, verify_authentication,
+    remove_all_images, remove_all_stopped_containers, remove_item, run_image,
+    run_image_with_command, show_container_info, show_container_logs, stop_container,
+    verify_authentication,
 };
 use deps::run_doctor;
 
@@ -97,15 +98,21 @@ async fn main() {
         Commands::Remove {
             image,
             force,
+            all_images,
             all_containers,
             interactive,
         } => {
-            if all_containers {
+            if all_containers && all_images {
+                eprintln!("Error: Use --all-containers or --all, not both");
+                std::process::exit(1);
+            } else if all_containers {
                 remove_all_stopped_containers(force).await;
+            } else if all_images {
+                remove_all_images(force, interactive).await;
             } else if let Some(img) = image {
                 remove_item(img, force, interactive).await;
             } else {
-                eprintln!("Error: Either specify an image/container ID or use --all-containers");
+                eprintln!("Error: Either specify an image/container ID or use --all or --all-containers");
                 std::process::exit(1);
             }
         }

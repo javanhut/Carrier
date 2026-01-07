@@ -13,7 +13,9 @@ This script will automatically:
 2. Verify SHA256 checksum for security
 3. Install the binary to `/usr/local/bin`
 4. Install shell completions (bash, zsh, fish)
-5. Install runtime dependencies (runc, fuse-overlayfs, etc.)
+5. Install runtime dependencies (runc or crun, fuse-overlayfs, etc.)
+
+Carrier also performs dependency checks on first run and can install missing runtime/storage helpers automatically when allowed. Set `CARRIER_ALLOW_SYSTEM_CHANGES=0` to disable automatic changes and use the manual steps below.
 
 ## Installation Methods
 
@@ -163,7 +165,8 @@ The installation script will check for and help install these:
 
 #### Runtime Dependencies (Optional)
 - `nsenter` - For shell/exec functionality
-- `fuse-overlayfs` - For rootless overlay filesystem
+- `runc` or `crun` - OCI runtime (Carrier will install if missing when allowed)
+- `fuse-overlayfs` - For rootless overlay filesystem (Carrier will install if missing when allowed)
 - `slirp4netns` - For rootless networking
 
 ### Distribution-Specific Installation
@@ -174,8 +177,8 @@ The installation script will check for and help install these:
 sudo apt-get update
 sudo apt-get install -y git build-essential pkg-config
 
-# Install optional runtime dependencies
-sudo apt-get install -y nsenter fuse-overlayfs slirp4netns
+# Install optional runtime dependencies (only needed if automatic setup is disabled)
+sudo apt-get install -y nsenter fuse-overlayfs slirp4netns runc
 ```
 
 #### Fedora/RHEL/CentOS
@@ -183,8 +186,8 @@ sudo apt-get install -y nsenter fuse-overlayfs slirp4netns
 # Install build dependencies
 sudo dnf install -y git gcc pkg-config
 
-# Install optional runtime dependencies
-sudo dnf install -y util-linux fuse-overlayfs slirp4netns
+# Install optional runtime dependencies (only needed if automatic setup is disabled)
+sudo dnf install -y util-linux fuse-overlayfs slirp4netns runc
 ```
 
 #### Arch Linux
@@ -192,8 +195,8 @@ sudo dnf install -y util-linux fuse-overlayfs slirp4netns
 # Install build dependencies
 sudo pacman -S git base-devel pkg-config
 
-# Install optional runtime dependencies
-sudo pacman -S util-linux fuse-overlayfs slirp4netns
+# Install optional runtime dependencies (only needed if automatic setup is disabled)
+sudo pacman -S util-linux fuse-overlayfs slirp4netns runc
 ```
 
 #### Alpine Linux
@@ -201,9 +204,11 @@ sudo pacman -S util-linux fuse-overlayfs slirp4netns
 # Install build dependencies
 apk add git build-base pkgconfig
 
-# Install optional runtime dependencies
-apk add util-linux fuse-overlayfs slirp4netns
+# Install optional runtime dependencies (only needed if automatic setup is disabled)
+apk add util-linux fuse-overlayfs slirp4netns runc
 ```
+
+If your distribution packages `crun`, you can install it instead of `runc`.
 
 ## Installing Rust
 
@@ -272,7 +277,7 @@ carrier doctor --fix --dry-run --verbose
 The `carrier doctor` command verifies:
 
 **Essential Dependencies:**
-- `runc` - OCI container runtime
+- `runc` or `crun` - OCI container runtime
 - `fuse-overlayfs` - FUSE-based overlay filesystem
 - `/dev/fuse` - FUSE device
 - `fusermount3` - FUSE mount utility (with SUID bit)

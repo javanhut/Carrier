@@ -11,9 +11,9 @@ Carrier is optimized for speed with **sub-100ms container startup times**, makin
 
 See [Performance Guide](docs/performance.md) for benchmarks and optimization tips.
 
-## Rootless Containers - No sudo required!
+## Rootless Containers - No sudo required to run containers
 
-Carrier supports fully rootless container execution, similar to Podman. Regular users can create and manage containers without needing root privileges or sudo access. This provides better security isolation and makes containers accessible to all users.
+Carrier supports fully rootless container execution, similar to Podman. Regular users can create and manage containers without needing root privileges. Carrier may prompt for sudo to install missing dependencies or adjust kernel settings when allowed.
 
 See [Rootless Documentation](docs/rootless.md) for setup and usage details.
 
@@ -23,6 +23,7 @@ See [Rootless Documentation](docs/rootless.md) for setup and usage details.
 - **High Performance** - Sub-100ms container startup with intelligent storage driver selection
 - **Rootless by Design** - Run containers without root privileges using user namespaces
 - **Multi-Registry Support** - Pull from Docker Hub, Quay.io, GHCR, GCR, ECR, and more
+- **Podman-Compatible Short Names** - Resolve unqualified images using `/etc/containers/shortnames.conf`
 - **Container Lifecycle Management** - Run, stop, remove, and execute commands
 - **Multiple Execution Modes** - Interactive, detached, and exec into running containers
 - **Bulk Operations** - Clean up all stopped containers with one command
@@ -35,6 +36,7 @@ See [Rootless Documentation](docs/rootless.md) for setup and usage details.
 - **Cgroups v2** - Resource limits and accounting
 - **Security** - Capability dropping, seccomp filters, no-new-privileges
 - **Device Management** - Proper /dev mounting with automatic fallback from devtmpfs to tmpfs, ensuring correct device node permissions
+- **Automatic Dependencies** - Installs runtime and storage helpers when allowed (prompts for sudo)
 
 ## Quick Start
 
@@ -97,7 +99,10 @@ sudo cp target/release/carrier /usr/local/bin/
 - Linux kernel 4.18+ (5.14+ recommended)
 - Rust 1.70+
 - Optional: `nsenter` for shell/exec functionality
-- Optional: `fuse-overlayfs` for rootless overlay support
+- Optional: `runc` or `crun` for OCI execution (Carrier can install if missing)
+- Optional: `fuse-overlayfs` for rootless overlay support (Carrier can install if missing)
+
+By default, Carrier will attempt to install missing runtime/storage dependencies on first run and may prompt for sudo. Set `CARRIER_ALLOW_SYSTEM_CHANGES=0` to disable automatic changes and follow the docs for manual setup.
 
 ## Usage Examples
 

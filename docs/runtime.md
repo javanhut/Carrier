@@ -2,7 +2,7 @@
 
 ## Overview
 
-Carrier uses **runc** as its OCI-compliant container runtime for managing container execution and permissions. The runtime is designed specifically for rootless operation with comprehensive security features and automatic dependency management.
+Carrier uses an OCI-compliant runtime (**runc** or **crun**) for managing container execution and permissions. The runtime is designed specifically for rootless operation with comprehensive security features and automatic dependency management.
 
 ## Key Features
 
@@ -161,6 +161,7 @@ When you run `carrier run <image>`:
 - Suitable for shells and interactive programs
 - Process waits for container to exit
 - Automatically detected for bash/sh commands
+Carrier detects whether stdin is a TTY and will fall back to non-interactive mode when input is piped. Use `carrier terminal` to force a PTY.
 
 #### Detached Mode
 When you run `carrier run -d <image>`:
@@ -244,11 +245,11 @@ carrier rm -c
 
 ## Runtime Components
 
-### runc Integration
-Carrier uses **runc** for container lifecycle management:
-- **Container Creation**: OCI-compliant container initialization via `runc create`
-- **Container Execution**: Process execution with `runc exec`
-- **State Management**: Container state tracking via `runc state`
+### OCI Runtime Integration (runc/crun)
+Carrier uses **runc** when available and falls back to **crun** when `runc` is missing:
+- **Container Creation**: OCI-compliant container initialization via `runc create` or `crun create`
+- **Container Execution**: Process execution with `runc exec` or `crun exec`
+- **State Management**: Container state tracking via `runc state` or `crun state`
 - **Security**: Full namespace isolation and capability management
 - **Permissions**: User namespace mapping for rootless operation
 
@@ -273,11 +274,11 @@ The runtime works seamlessly with multiple storage drivers:
 - Linux kernel 4.18+ (5.14+ recommended)
 - User namespaces enabled
 - Cgroups v2 mounted at `/sys/fs/cgroup`
-- `runc` installed (automatically checked)
+- `runc` or `crun` installed (Carrier can install if missing when allowed)
 - `newuidmap` and `newgidmap` installed (uidmap package)
 - `slirp4netns` for networking
-- `fuse-overlayfs` (automatically installed if possible)
-- `fuse3` packages (automatically installed if possible)
+- `fuse-overlayfs` (Carrier can install if missing when allowed)
+- `fuse3` packages (Carrier can install if missing when allowed)
 
 ### Kernel Configuration
 Required kernel features:
@@ -314,6 +315,7 @@ Planned improvements:
 **"User namespaces not available"**
 - Check `/proc/sys/user/max_user_namespaces` > 0
 - Ensure kernel has `CONFIG_USER_NS=y`
+Carrier will attempt to enable common user namespace settings when allowed. Set `CARRIER_ALLOW_SYSTEM_CHANGES=0` to disable automatic changes and configure manually.
 
 **"slirp4netns not found"**
 - Install slirp4netns: `sudo apt install slirp4netns` or `sudo dnf install slirp4netns`

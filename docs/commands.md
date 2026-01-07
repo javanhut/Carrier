@@ -23,9 +23,9 @@ carrier sh <container-id>
 carrier stop <container-id>
 carrier rm -c  # Remove all stopped containers
 
-# Force specific storage driver (global flag, before subcommand)
+# Force specific storage driver (global flag)
 carrier --storage-driver overlay-fuse run alpine
-carrier --storage-driver vfs run debian
+carrier run --storage-driver vfs debian
 ```
 
 ## Commands
@@ -67,7 +67,9 @@ carrier [GLOBAL-OPTIONS] run [OPTIONS] <image|image-id> [COMMAND...]
 ```
 
 **Global Options:**
-- `--storage-driver <DRIVER>`: Force storage driver: overlay-fuse, overlay-native, or vfs
+- `--storage-driver <DRIVER>`: Force storage driver: auto, overlay-fuse, overlay-native, or vfs
+
+Omit `--storage-driver` or set it to `auto` to use automatic detection.
 
 **Run Options:**
 - `-d, --detach`: Run container in detached mode (background)
@@ -132,6 +134,7 @@ carrier run --name dev-db -d postgres:latest
 carrier --storage-driver overlay-fuse run alpine
 carrier --storage-driver vfs run debian
 carrier --storage-driver overlay-native run ubuntu:22.04
+carrier run --storage-driver vfs alpine
 
 # Run with custom command
 carrier run alpine echo "Hello World"
@@ -354,6 +357,7 @@ carrier rm [OPTIONS] [image|container-id]  # Alias
 **Options:**
 - `-f, --force`: Force removal even if container is running or image is in use
 - `-c, --all-containers`: Remove all stopped containers
+- `--all`: Remove all images
 
 **Examples:**
 ```bash
@@ -366,6 +370,9 @@ carrier remove abc123def456
 # Remove all stopped containers
 carrier rm -c
 carrier rm --all-containers
+
+# Remove all images
+carrier rmi --all
 
 # Force remove all containers (including running ones)
 carrier rm -c --force
@@ -381,6 +388,7 @@ carrier remove --force abc123def456
 - For individual containers: Unmounts overlay filesystem and removes all container data
 - For images: Removes metadata, extracted layers, and cached blobs
 - For `--all-containers`: Removes all non-running containers and their metadata
+- For `--all`: Removes all images not in use (use `--force` to override)
 - Prevents accidental removal of in-use resources unless forced
 - Cleans up both extracted layers and compressed blobs to free disk space
 - Provides summary of containers removed, skipped, and failed
@@ -614,7 +622,7 @@ carrier doctor --json
 **What It Checks:**
 
 Essential dependencies:
-- `runc` - OCI container runtime
+- `runc` or `crun` - OCI container runtime
 - `fuse-overlayfs` - FUSE-based overlay filesystem
 - `/dev/fuse` - FUSE device availability
 - `fusermount3` - FUSE mount utility with SUID bit
@@ -660,10 +668,12 @@ Recommended dependencies:
 ## Image Format
 
 Images can be specified in various formats:
-- `image` - Uses latest tag from Docker Hub
-- `image:tag` - Specific tag from Docker Hub
+- `image` - Unqualified name resolved using `/etc/containers/shortnames.conf` and `/etc/containers/registries.conf`
+- `image:tag` - Specific tag using short-name resolution
 - `registry/image` - Latest tag from specific registry
 - `registry/image:tag` - Specific tag from specific registry
+
+Carrier follows Podman-style short-name resolution. If no short-name mapping exists, it defaults to Docker Hub (`docker.io/library`).
 
 ## Supported Registries
 
@@ -675,6 +685,8 @@ The following registries are currently supported:
 - Amazon ECR Public (public.ecr.aws)
 - Oracle Container Registry
 - Red Hat Registry
+
+Carrier also honors `/etc/containers/registries.conf` and `/etc/containers/registries.conf.d/*.conf` for unqualified search registries and `/etc/containers/shortnames.conf` for short-name mappings.
 
 ## Storage Layout
 

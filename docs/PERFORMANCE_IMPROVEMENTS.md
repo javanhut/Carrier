@@ -10,7 +10,7 @@ Carrier's container startup performance has been optimized from ~1 second to ~50
 
 **Before**: Carrier attempted native overlayfs first, fell back to VFS (copying entire filesystem)
 
-**After**: Carrier now defaults to fuse-overlayfs, with intelligent fallback chain:
+**After**: Carrier now defaults to fuse-overlayfs (installed automatically when allowed), with intelligent fallback chain:
 1. fuse-overlayfs (preferred)
 2. native overlayfs (if supported)
 3. VFS (last resort)
@@ -99,7 +99,7 @@ Based on benchmark_results_20250930_091201.txt:
 
 ### For Best Performance
 
-1. **Install fuse-overlayfs** (if not already):
+1. **Install fuse-overlayfs** (only needed if automatic setup is disabled):
    ```bash
    # Ubuntu/Debian
    sudo apt install fuse-overlayfs

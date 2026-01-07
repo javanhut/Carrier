@@ -27,7 +27,7 @@ Carrier supports three storage drivers with different performance characteristic
 ### 1. OverlayFS (FUSE) - Default & Recommended
 
 **Performance**: Fastest (no file copying)
-**Requirements**: `fuse-overlayfs` package installed
+**Requirements**: `fuse-overlayfs` package installed (Carrier can install if allowed)
 
 ```bash
 carrier --storage-driver overlay-fuse run alpine:latest
@@ -86,7 +86,7 @@ carrier --storage-driver vfs run alpine:latest
 
 Carrier automatically selects the best available storage driver:
 
-1. **OverlayFS (FUSE)** - Preferred default (requires fuse-overlayfs)
+1. **OverlayFS (FUSE)** - Preferred default (Carrier installs if allowed)
 2. **OverlayFS (Native)** - If kernel supports it
 3. **VFS** - Last resort fallback
 
@@ -167,7 +167,7 @@ Falling back to vfs (copy) backend
 
 **Solutions**:
 
-1. Install fuse-overlayfs:
+1. Install fuse-overlayfs (only needed if automatic setup is disabled):
    ```bash
    # Ubuntu/Debian
    sudo apt install fuse-overlayfs
