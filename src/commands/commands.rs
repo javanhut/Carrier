@@ -2356,23 +2356,26 @@ async fn run_container_with_storage(
     // Set up essential directories and files
     setup_container_essential_files(&rootfs)?;
 
-    // Read image config to get command and env
+    // Read image config to get entrypoint, command, and env
     let config_blob_path = storage.blob_cache_path(&manifest.config.digest);
-    let mut command = vec!["/bin/sh".to_string()];
+    let mut entrypoint: Vec<String> = Vec::new();
+    let mut cmd: Vec<String> = Vec::new();
+    let mut command: Vec<String> = Vec::new();
     let mut env = vec![];
     let mut working_dir = "/".to_string();
 
     if config_blob_path.exists() {
         if let Ok(config_content) = std::fs::read_to_string(&config_blob_path) {
             if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_content) {
-                // Extract command
-                if let Some(cmd) = config_json["config"]["Cmd"].as_array() {
-                    command = cmd
+                if let Some(entrypoint_value) = config_json["config"]["Entrypoint"].as_array() {
+                    entrypoint = entrypoint_value
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                } else if let Some(entrypoint) = config_json["config"]["Entrypoint"].as_array() {
-                    command = entrypoint
+                }
+
+                if let Some(cmd_value) = config_json["config"]["Cmd"].as_array() {
+                    cmd = cmd_value
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
@@ -2401,11 +2404,26 @@ async fn run_container_with_storage(
         }
     }
 
-    // Apply command override if provided
-    if let Some(override_cmd) = command_override.clone() {
-        if !override_cmd.is_empty() {
-            command = override_cmd;
+    // Compose command from entrypoint, cmd, and any override
+    let override_cmd = command_override.as_ref().filter(|cmd| !cmd.is_empty());
+    if let Some(override_cmd) = override_cmd {
+        if !entrypoint.is_empty() {
+            command = entrypoint;
+            command.extend(override_cmd.iter().cloned());
+        } else {
+            command = override_cmd.clone();
         }
+    } else if !entrypoint.is_empty() {
+        command = entrypoint;
+        if !cmd.is_empty() {
+            command.extend(cmd);
+        }
+    } else {
+        command = cmd;
+    }
+
+    if command.is_empty() {
+        command = vec!["/bin/sh".to_string()];
     }
 
     // For detached containers with no explicit command or only a shell, use sleep infinity
@@ -2699,6 +2717,18 @@ async fn run_container_with_storage(
         return Err(format!("Failed to create container with {}", runtime).into());
     }
 
+    // Start the container (starts the pause process)
+    let start_status = Command::new(runtime)
+        .arg("--root")
+        .arg(&runc_root_path)
+        .arg("start")
+        .arg(&container_id)
+        .status()?;
+
+    if !start_status.success() {
+        return Err(format!("Failed to start container with {}", runtime).into());
+    }
+
     // Get container PID from runc state
     let state_output = Command::new(runtime)
         .arg("--root")
@@ -2726,18 +2756,6 @@ async fn run_container_with_storage(
                 }
             }
         }
-    }
-
-    // Start the container (starts the pause process)
-    let start_status = Command::new(runtime)
-        .arg("--root")
-        .arg(&runc_root_path)
-        .arg("start")
-        .arg(&container_id)
-        .status()?;
-
-    if !start_status.success() {
-        return Err(format!("Failed to start container with {}", runtime).into());
     }
 
     // Now exec the actual command with inherited stdio
@@ -2874,6 +2892,7 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 static RUNTIME_BIN: OnceLock<String> = OnceLock::new();
+static SLIRP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 static SHORTNAME_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
 static UNQUALIFIED_REGISTRIES: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -2967,6 +2986,73 @@ fn attempt_install_runtime(auto_yes: bool) -> Result<(), String> {
         InstallResult::Failed(reason) => Err(reason),
         InstallResult::DryRun(reason) => Err(reason),
     }
+}
+
+fn attempt_install_slirp4netns(auto_yes: bool) -> Result<(), String> {
+    use crate::deps::checker::{Category, DependencyCheck};
+    use crate::deps::installer::{
+        attempt_install, check_sudo_available, InstallOptions, InstallResult,
+    };
+    use crate::deps::platform::detect_platform;
+
+    check_sudo_available()?;
+
+    let platform = detect_platform();
+    let options = InstallOptions {
+        dry_run: false,
+        yes: auto_yes,
+        max_retries: 3,
+        verbose: false,
+    };
+
+    let slirp_check = DependencyCheck {
+        name: "slirp4netns",
+        category: Category::Recommended,
+        purpose: "Rootless container networking (slirp4netns)",
+        alternatives: vec!["pasta"],
+        install_packages: runtime_install_map("slirp4netns"),
+    };
+
+    match attempt_install(&slirp_check, &platform, &options) {
+        InstallResult::Success => Ok(()),
+        InstallResult::Skipped(reason) => Err(reason),
+        InstallResult::Failed(reason) => Err(reason),
+        InstallResult::DryRun(reason) => Err(reason),
+    }
+}
+
+fn ensure_slirp4netns_available(ports: &[String]) -> Result<bool, String> {
+    if let Some(available) = SLIRP_AVAILABLE.get() {
+        return Ok(*available);
+    }
+
+    if command_exists("slirp4netns") {
+        let _ = SLIRP_AVAILABLE.set(true);
+        return Ok(true);
+    }
+
+    let auto_install = allow_system_changes();
+    if auto_install {
+        eprintln!("Note: slirp4netns not found. Attempting to install...");
+        if let Err(e) = attempt_install_slirp4netns(auto_install) {
+            eprintln!("slirp4netns installation failed: {}", e);
+        }
+    }
+
+    let available = command_exists("slirp4netns");
+    let _ = SLIRP_AVAILABLE.set(available);
+
+    if !available {
+        if !ports.is_empty() {
+            return Err(
+                "Port mapping requires slirp4netns. Install it or run `carrier doctor --fix`."
+                    .to_string(),
+            );
+        }
+        eprintln!("Warning: slirp4netns not found; networking will be disabled.");
+    }
+
+    Ok(available)
 }
 
 fn runtime_binary() -> Result<&'static str, Box<dyn std::error::Error>> {
@@ -3630,6 +3716,10 @@ fn setup_container_network_with_ports(
     container_pid: nix::unistd::Pid,
     ports: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !ensure_slirp4netns_available(ports)? {
+        return Ok(());
+    }
+
     // Check if network is already set up by looking for network helper processes
     let pid_raw = container_pid.as_raw();
 
@@ -3680,13 +3770,38 @@ fn setup_container_network_with_ports(
         .stderr(std::process::Stdio::null());
 
     match slirp_cmd.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
+            if let Ok(Some(status)) = child.try_wait() {
+                let code = status.code().unwrap_or(-1);
+                if !ports.is_empty() {
+                    return Err(format!(
+                        "slirp4netns exited early (code {}). Port mapping unavailable.",
+                        code
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "Warning: slirp4netns exited early (code {}); networking may be unavailable.",
+                    code
+                );
+                return Ok(());
+            }
             // Store the slirp4netns PID for cleanup
             let slirp_pid = child.id();
             let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
         }
-        Err(_) => {
-            // Silent failure - slirp4netns not available, network will be limited but container can still run
+        Err(e) => {
+            if !ports.is_empty() {
+                return Err(format!(
+                    "Failed to start slirp4netns: {}. Port mapping unavailable.",
+                    e
+                )
+                .into());
+            }
+            eprintln!(
+                "Warning: failed to start slirp4netns: {}. Networking may be unavailable.",
+                e
+            );
         }
     }
 
