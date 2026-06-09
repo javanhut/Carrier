@@ -1,21 +1,29 @@
 use clap::{CommandFactory, Parser};
 
 mod cli;
+// The native container implementation is Linux-only; on other platforms the
+// engine layer substitutes a stub backend (see `engine::default_engine`).
+#[cfg(target_os = "linux")]
 mod commands;
 mod deps;
+mod engine;
 mod storage;
 
 use cli::{Cli, Commands};
-use commands::{
-    authenticate_registry, exec_in_container, list_items, pull_image,
-    remove_all_stopped_containers, remove_item, run_image, run_image_with_command,
-    show_container_info, show_container_logs, stop_container, verify_authentication,
-};
 use deps::run_doctor;
+use engine::{default_engine, ListFilter, LogOptions, RunSpec};
+
+/// Print an error and exit non-zero. Used for engine operations whose failure
+/// should surface to the shell.
+fn fail(context: &str, e: Box<dyn std::error::Error>) -> ! {
+    eprintln!("{}: {}", context, e);
+    std::process::exit(1);
+}
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let engine = default_engine();
 
     match cli.command {
         Commands::Run {
@@ -30,35 +38,21 @@ async fn main() {
             verbose,
             command,
         } => {
-            if command.is_empty() {
-                run_image(
-                    image,
-                    detach,
-                    name,
-                    elevated,
-                    volumes,
-                    ports,
-                    env,
-                    platform,
-                    cli.storage_driver.clone(),
-                    verbose,
-                )
-                .await;
-            } else {
-                run_image_with_command(
-                    image,
-                    detach,
-                    name,
-                    elevated,
-                    command,
-                    volumes,
-                    ports,
-                    env,
-                    platform,
-                    cli.storage_driver.clone(),
-                    verbose,
-                )
-                .await;
+            let spec = RunSpec {
+                image,
+                detach,
+                name,
+                elevated,
+                volumes,
+                ports,
+                env,
+                platform,
+                storage_driver: cli.storage_driver.clone(),
+                verbose,
+                command,
+            };
+            if let Err(e) = engine.run(spec).await {
+                fail("Failed to run container", e);
             }
         }
         Commands::Logs {
@@ -71,27 +65,32 @@ async fn main() {
             fuzzy,
             regex,
         } => {
-            if let Err(e) =
-                show_container_logs(image, follow, tail, timestamps, since, search, fuzzy, regex)
-                    .await
-            {
-                eprintln!("Failed to show logs: {}", e);
-                std::process::exit(1);
+            let opts = LogOptions {
+                follow,
+                tail,
+                timestamps,
+                since,
+                search,
+                fuzzy,
+                regex,
+            };
+            if let Err(e) = engine.logs(image, opts).await {
+                fail("Failed to show logs", e);
             }
         }
         Commands::Pull { image, platform } => {
-            pull_image(image, platform).await;
+            if let Err(e) = engine.pull(image, platform).await {
+                fail("Failed to pull image", e);
+            }
         }
         Commands::Auth { username, registry } => {
-            if let Err(e) = authenticate_registry(username, registry).await {
-                eprintln!("Failed to authenticate: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.authenticate(username, registry).await {
+                fail("Failed to authenticate", e);
             }
         }
         Commands::AuthVerify => {
-            if let Err(e) = verify_authentication().await {
-                eprintln!("Failed to verify authentication: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.verify_auth().await {
+                fail("Failed to verify authentication", e);
             }
         }
         Commands::Remove {
@@ -100,13 +99,8 @@ async fn main() {
             all_containers,
             interactive,
         } => {
-            if all_containers {
-                remove_all_stopped_containers(force).await;
-            } else if let Some(img) = image {
-                remove_item(img, force, interactive).await;
-            } else {
-                eprintln!("Error: Either specify an image/container ID or use --all-containers");
-                std::process::exit(1);
+            if let Err(e) = engine.remove(image, force, all_containers, interactive).await {
+                fail("Error", e);
             }
         }
         Commands::Build { image, url } => {
@@ -117,34 +111,37 @@ async fn main() {
             images,
             containers,
         } => {
-            list_items(all, images, containers).await;
+            let filter = ListFilter {
+                all,
+                images_only: images,
+                containers_only: containers,
+            };
+            if let Err(e) = engine.list(filter).await {
+                fail("Failed to list items", e);
+            }
         }
         Commands::Stop {
             container,
             force,
             timeout,
         } => {
-            if let Err(e) = stop_container(container, force, timeout).await {
-                eprintln!("Failed to stop container: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.stop(container, force, timeout).await {
+                fail("Failed to stop container", e);
             }
         }
         Commands::Shell { container, command } => {
-            if let Err(e) = exec_in_container(container, command, false).await {
-                eprintln!("Failed to execute command: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.exec(container, command, false).await {
+                fail("Failed to execute command", e);
             }
         }
         Commands::Terminal { container, command } => {
-            if let Err(e) = exec_in_container(container, command, true).await {
-                eprintln!("Failed to open terminal: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.exec(container, command, true).await {
+                fail("Failed to open terminal", e);
             }
         }
         Commands::Info { container } => {
-            if let Err(e) = show_container_info(container).await {
-                eprintln!("Failed to get container info: {}", e);
-                std::process::exit(1);
+            if let Err(e) = engine.info(container).await {
+                fail("Failed to get container info", e);
             }
         }
         Commands::Doctor { fix, json, all, dry_run, yes, verbose } => {
