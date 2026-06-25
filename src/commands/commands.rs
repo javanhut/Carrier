@@ -2144,7 +2144,7 @@ fn ensure_host_dev_null_ready() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let rdev = metadata.rdev();
+    let rdev = metadata.rdev() as libc::dev_t;
     let major = libc::major(rdev);
     let minor = libc::minor(rdev);
     if major != 1 || minor != 3 {

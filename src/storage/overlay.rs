@@ -1,5 +1,6 @@
+#[cfg(target_os = "linux")]
 use nix::mount::{MsFlags, mount};
-use nix::sys::stat::{Mode, SFlag, major, makedev, minor, mknod};
+use nix::sys::stat::{Mode, SFlag, mknod};
 use nix::unistd::mkfifo;
 use std::env;
 use std::fs;
@@ -308,15 +309,24 @@ impl ContainerStorage {
         );
 
         // This will only work on newer kernels with unprivileged overlay support
-        mount(
-            Some("overlay"),
-            merged,
-            Some("overlay"),
-            MsFlags::empty(),
-            Some(options.as_str()),
-        )?;
-
-        Ok(())
+        #[cfg(target_os = "linux")]
+        {
+            mount(
+                Some("overlay"),
+                merged,
+                Some("overlay"),
+                MsFlags::empty(),
+                Some(options.as_str()),
+            )?;
+            Ok(())
+        }
+        // ponytail: macOS never mounts overlayfs on the host — containers run in
+        // the Linux VM backend. This path is unreachable there; error if hit.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (lower, upper, work, merged, options);
+            Err("native overlayfs requires Linux (macOS uses the VM backend)".into())
+        }
     }
 
     pub fn last_driver(&self) -> StorageDriver {
@@ -452,18 +462,18 @@ impl ContainerStorage {
             {
                 let metadata = fs::metadata(&path)?;
                 let mode_bits = metadata.mode() & 0o7777;
-                let perm = Mode::from_bits_truncate(mode_bits as u32);
+                let perm = Mode::from_bits_truncate(mode_bits as libc::mode_t);
 
                 if ty.is_char_device() {
                     if target.exists() {
                         let _ = fs::remove_file(&target);
                     }
-                    let dev = metadata.rdev();
+                    let dev = metadata.rdev() as libc::dev_t;
                     let _ = mknod(
                         &target,
                         SFlag::S_IFCHR,
                         perm,
-                        makedev(major(dev), minor(dev)),
+                        libc::makedev(libc::major(dev), libc::minor(dev)),
                     );
                     continue;
                 }
@@ -472,12 +482,12 @@ impl ContainerStorage {
                     if target.exists() {
                         let _ = fs::remove_file(&target);
                     }
-                    let dev = metadata.rdev();
+                    let dev = metadata.rdev() as libc::dev_t;
                     let _ = mknod(
                         &target,
                         SFlag::S_IFBLK,
                         perm,
-                        makedev(major(dev), minor(dev)),
+                        libc::makedev(libc::major(dev), libc::minor(dev)),
                     );
                     continue;
                 }

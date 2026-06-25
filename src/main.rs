@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser};
 
+mod backend;
 mod cli;
 mod commands;
 mod deps;
@@ -16,6 +17,9 @@ use deps::run_doctor;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Runtime layer gate: on macOS, runtime commands need the Linux VM backend.
+    backend::guard(&cli.command);
 
     match cli.command {
         Commands::Run {
