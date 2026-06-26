@@ -390,7 +390,7 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
 /// `carrier run <image> [cmd]` on macOS: build the OCI bundle on the host (which
 /// already pulls/extracts images cross-platform), share it into the guest over
 /// virtiofs, boot, run it via the agent, and print the output.
-pub async fn run_in_vm(image: String, command: Vec<String>) {
+pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, tty: bool) {
     ensure_guest(); // self-install the embedded guest on first run
     if !is_provisioned() {
         eprintln!("carrier: VM not provisioned — run `carrier machine init` first");
@@ -400,9 +400,19 @@ pub async fn run_in_vm(image: String, command: Vec<String>) {
         eprintln!("carrier: {e}");
         std::process::exit(1);
     }
-    match boot_and_connect(1024, false) {
-        Ok(fd) => {
-            use std::io::{Read, Write};
+    let fd = match boot_and_connect(1024, false) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("carrier: {e}");
+            std::process::exit(1);
+        }
+    };
+    if interactive || tty {
+        interactive_session(fd, tty); // pumps stdin<->container, never returns
+    }
+    {
+        use std::io::{Read, Write};
+        {
             let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
             let _ = ch.set_read_timeout(Some(std::time::Duration::from_secs(30)));
             let _ = ch.write_all(b"run\n");
@@ -422,9 +432,68 @@ pub async fn run_in_vm(image: String, command: Vec<String>) {
             // The VM is leaked + running; exiting the process tears it down.
             std::process::exit(code);
         }
-        Err(e) => {
-            eprintln!("carrier: {e}");
-            std::process::exit(1);
+    }
+}
+
+/// Interactive session: forward host stdin to the container and stream its
+/// output back over the same vsock channel. Never returns — exits when the
+/// container closes the channel.
+///
+/// `tty`: with -t the guest runs the container on a real PTY, so we put the host
+/// terminal in raw mode (the guest PTY does echo/line-editing/prompts). Without
+/// -t (plain -i) it's cooked line mode — the host terminal echoes and full lines
+/// go to the shell.
+fn interactive_session(fd: RawFd, tty: bool) -> ! {
+    use std::io::{Read, Write};
+    let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let _ = ch.write_all(if tty { b"run-t\n" } else { b"run-i\n" });
+
+    let orig = if tty { set_raw_mode() } else { None };
+    // Host stdin -> container, in a thread (read blocks).
+    if let Ok(mut ch_in) = ch.try_clone() {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut ch_in);
+            let _ = ch_in.shutdown(std::net::Shutdown::Write); // EOF to the guest
+        });
+    }
+    // Container -> host stdout, until the channel closes (container exit).
+    let mut out = std::io::stdout();
+    let mut buf = [0u8; 4096];
+    loop {
+        match ch.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+            }
+        }
+    }
+    restore_raw_mode(orig);
+    std::process::exit(0);
+}
+
+/// Put stdin in raw mode (only if it's a TTY) so keystrokes pass straight to the
+/// container's PTY. Returns the original termios to restore.
+fn set_raw_mode() -> Option<libc::termios> {
+    unsafe {
+        if libc::isatty(0) == 0 {
+            return None;
+        }
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) != 0 {
+            return None;
+        }
+        let orig = t;
+        libc::cfmakeraw(&mut t);
+        libc::tcsetattr(0, libc::TCSANOW, &t);
+        Some(orig)
+    }
+}
+
+fn restore_raw_mode(orig: Option<libc::termios>) {
+    if let Some(t) = orig {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &t);
         }
     }
 }
@@ -488,6 +557,9 @@ async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
     let mut env = strs(&icfg["Env"]);
     if env.is_empty() {
         env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    }
+    if !env.iter().any(|e| e.starts_with("TERM=")) {
+        env.push("TERM=xterm".into()); // so clear/ncurses work under the PTY
     }
     let cwd = icfg["WorkingDir"].as_str().filter(|s| !s.is_empty()).unwrap_or("/");
     std::fs::write(vm_dir().join("bundle/config.json"), bundle_config(&args, &env, cwd))

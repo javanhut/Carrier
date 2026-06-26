@@ -56,6 +56,14 @@ pub enum Commands {
         #[arg(short = 'd', long = "detach")]
         detach: bool,
 
+        /// Keep STDIN open — forward your input to the container (interactive)
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
+
+        /// Allocate a TTY (implies interactive; raw terminal)
+        #[arg(short = 't', long = "tty")]
+        tty: bool,
+
         /// Custom name for the container
         #[arg(long = "name")]
         name: Option<String>,

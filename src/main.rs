@@ -31,6 +31,8 @@ async fn main() {
         Commands::Run {
             image,
             detach,
+            interactive,
+            tty,
             name,
             elevated,
             volumes,
@@ -45,8 +47,10 @@ async fn main() {
             #[cfg(target_os = "macos")]
             {
                 let _ = (detach, name, elevated, volumes, ports, env, platform, verbose);
-                backend::run_in_vm(image, command).await;
+                backend::run_in_vm(image, command, interactive, tty).await;
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (interactive, tty);
             #[cfg(not(target_os = "macos"))]
             if command.is_empty() {
                 run_image(

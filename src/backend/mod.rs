@@ -35,8 +35,8 @@ pub fn needs_linux_runtime(cmd: &Commands) -> bool {
 /// macOS: run a container via the bundled VM (host builds the bundle, guest runs
 /// it). On Linux this is never called — `carrier run` uses the native runc path.
 #[cfg(target_os = "macos")]
-pub async fn run_in_vm(image: String, command: Vec<String>) {
-    vm::run_in_vm(image, command).await;
+pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, tty: bool) {
+    vm::run_in_vm(image, command, interactive, tty).await;
 }
 
 /// Handle `carrier machine <action>`. macOS drives the bundled VM; on Linux
@@ -64,15 +64,13 @@ pub fn guard(cmd: &Commands) {
     if !needs_linux_runtime(cmd) {
         return;
     }
-    // ponytail: macOS arm only — the VM driver replaces this exit in Phase 2.
     #[cfg(target_os = "macos")]
     {
         eprintln!(
-            "carrier: this command needs a Linux container runtime, which macOS \
-             cannot run natively.\n\
-             The bundled Linux VM backend is not provisioned yet \
-             (`carrier machine init`, coming in a later build).\n\
-             Available now on macOS: pull, list, auth, remove, doctor, completions."
+            "carrier: `stop`/`sh`/`terminal`/`logs`/`info` operate on a running \
+             container, which the macOS VM backend doesn't keep yet — each \
+             `carrier run` is ephemeral.\n\
+             For a shell, run interactively: `carrier run -i <image> /bin/bash`."
         );
         std::process::exit(1);
     }
