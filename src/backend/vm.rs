@@ -333,16 +333,15 @@ pub fn machine(action: crate::cli::MachineCmd) {
                 // ponytail: UnixStream is just a SOCK_STREAM wrapper — fine over a
                 // vsock fd; read()/write() don't care about the address family.
                 let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                let _ = ch.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-                let _ = ch.write_all(b"ping\n"); // exercise the agent's line protocol
-                let mut buf = [0u8; 512];
-                match ch.read(&mut buf) {
-                    Ok(n) if n > 0 => eprintln!(
-                        "[carrier] guest agent replied:\n{}",
-                        String::from_utf8_lossy(&buf[..n]).trim_end()
-                    ),
-                    _ => eprintln!("[carrier] agent channel open but no reply"),
-                }
+                let _ = ch.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+                let _ = ch.write_all(b"run\n"); // ask the agent to runc-run the baked bundle
+                // Agent writes its reply then closes, so read to EOF.
+                let mut reply = Vec::new();
+                let _ = ch.read_to_end(&mut reply);
+                eprintln!(
+                    "[carrier] guest agent replied:\n{}",
+                    String::from_utf8_lossy(&reply).trim_end()
+                );
                 eprintln!("[carrier] Ctrl-C to stop.");
                 // Keep `ch` (and the VM, on its queue) alive by parking.
                 loop {

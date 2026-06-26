@@ -6,3 +6,8 @@ AGENTS.md
 *.claude/
 .claude/*
 target/
+/vmagent/target
+vmagent/target/
+/vmagent/build
+vmagent/build/
+.DS_Store
