@@ -11,3 +11,5 @@ vmagent/target/
 /vmagent/build
 vmagent/build/
 .DS_Store
+/vmagent/artifacts
+vmagent/artifacts/

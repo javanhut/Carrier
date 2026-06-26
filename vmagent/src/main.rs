@@ -27,6 +27,8 @@ fn main() -> ! {
     mount(c"sysfs", "/sys", c"sysfs");
     mount(c"cgroup2", "/sys/fs/cgroup", c"cgroup2");
     mount(c"devtmpfs", "/dev", c"devtmpfs");
+    // virtiofs: the host shares the OCI bundle in under tag "carrierbundle".
+    mount(c"carrierbundle", "/bundle", c"virtiofs");
     unsafe { libc::mkdir(c"/run".as_ptr(), 0o755) };
     eprintln!("carrier-agent: up, listening on vsock port {AGENT_PORT}");
 

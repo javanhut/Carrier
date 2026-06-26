@@ -1,3 +1,7 @@
+// On macOS the native Linux runtime path (runc/storage/cgroups) is unreachable —
+// `carrier run` routes to the VM — so it's intentionally dead here; used on Linux.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use clap::{CommandFactory, Parser};
 
 mod backend;
@@ -7,6 +11,8 @@ mod deps;
 mod storage;
 
 use cli::{Cli, Commands};
+// run_image* are only used on the native (Linux) path; macOS routes Run to the VM.
+#[cfg_attr(target_os = "macos", allow(unused_imports))]
 use commands::{
     authenticate_registry, exec_in_container, list_items, pull_image,
     remove_all_stopped_containers, remove_item, run_image, run_image_with_command,
@@ -34,6 +40,14 @@ async fn main() {
             verbose,
             command,
         } => {
+            // macOS has no native runtime — route to the bundled VM. ponytail:
+            // detach/name/volumes/ports/env aren't plumbed into the VM yet.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (detach, name, elevated, volumes, ports, env, platform, verbose);
+                backend::run_in_vm(image, command).await;
+            }
+            #[cfg(not(target_os = "macos"))]
             if command.is_empty() {
                 run_image(
                     image,

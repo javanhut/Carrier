@@ -27,8 +27,9 @@ use objc2::AllocAnyThread;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZLinuxBootLoader, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZLinuxBootLoader, VZSharedDirectory, VZSingleDirectoryShare,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
@@ -127,50 +128,85 @@ pub fn is_provisioned() -> bool {
     kernel_path().exists() && initrd_path().exists()
 }
 
-// Day-1 guest: PUI PUI Linux — a tiny arm64 kernel + initramfs purpose-built for
-// Virtualization.framework testing. Swap for a Kata/own kernel when runc needs
-// more (cgroups v2, overlayfs, full namespaces).
-const GUEST_URL: &str =
-    "https://github.com/Code-Hex/puipui-linux/releases/download/v1.0.3/puipui_linux_v1.0.3_aarch64.tar.gz";
+/// OCI/Kata/runc architecture name ("arm64"/"amd64") for this binary. macOS VZ
+/// runs a *same-arch* Linux guest, so the host binary's arch is the guest arch.
+fn guest_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        _ => "arm64", // aarch64
+    }
+}
 
-/// Download + unpack the guest kernel + initramfs into `vm_dir()`. The tarball
-/// holds `Image.gz` + `initramfs.cpio.gz`; VZ needs the kernel *uncompressed*,
-/// so we gunzip it. Initramfs stays gzipped (the kernel decompresses it).
+// Kata Containers kernel: raw arm64, with the cgroups/namespaces/vsock/virtiofs
+// runc needs (PUI PUI's minimal kernel lacks cgroups). Pinned to a release.
+// ponytail: 664MB bundle streamed to extract one 18MB kernel — wasteful, but the
+// only public source. Upgrade path: host the extracted vmlinux and fetch that.
+const KATA_VER: &str = "3.32.0";
+const KATA_KERNEL: &str = "./opt/kata/share/kata-containers/vmlinux-6.18.35-197";
+
+/// Write the compiled-in guest (kernel + agent initramfs) to vm_dir if missing.
+/// When the artifacts are embedded (carrier_embedded), the VM self-installs on
+/// first run — no download, no toolchain. Otherwise a no-op; provision()
+/// downloads.
+fn ensure_guest() {
+    #[cfg(carrier_embedded)]
+    {
+        const KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Image"));
+        const INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/initramfs.cpio.gz"));
+        let _ = std::fs::create_dir_all(vm_dir());
+        if !kernel_path().exists() {
+            let _ = std::fs::write(kernel_path(), KERNEL);
+        }
+        if !initrd_path().exists() {
+            let _ = std::fs::write(initrd_path(), INITRD);
+        }
+    }
+}
+
+/// Fetch the runc-capable guest kernel into `vm_dir()`. The agent initramfs is a
+/// build artifact (`vmagent/build.sh`), reported if missing.
 fn provision() -> Result<(), String> {
     std::fs::create_dir_all(vm_dir()).map_err(|e| format!("mkdir {}: {e}", vm_dir().display()))?;
 
-    eprintln!("downloading guest (PUI PUI Linux v1.0.3, ~5MB)...");
-    let body = reqwest::blocking::get(GUEST_URL)
-        .and_then(|r| r.error_for_status())
-        .and_then(|r| r.bytes())
-        .map_err(|e| format!("download {GUEST_URL}: {e}"))?;
+    ensure_guest(); // instant if the guest is embedded in the binary
+    if is_provisioned() {
+        eprintln!("guest ready (embedded).");
+        return Ok(());
+    }
 
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&body[..]));
-    let (mut got_kernel, mut got_initrd) = (false, false);
-    for entry in archive.entries().map_err(|e| e.to_string())? {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = entry
-            .path()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_owned()))
-            .unwrap_or_default();
-        match name.to_str() {
-            Some("Image.gz") => {
-                let mut out = std::fs::File::create(kernel_path()).map_err(|e| e.to_string())?;
-                std::io::copy(&mut flate2::read::GzDecoder::new(&mut entry), &mut out)
-                    .map_err(|e| format!("decompress kernel: {e}"))?;
-                got_kernel = true;
-            }
-            Some("initramfs.cpio.gz") => {
-                let mut out = std::fs::File::create(initrd_path()).map_err(|e| e.to_string())?;
-                std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-                got_initrd = true;
-            }
-            _ => {}
+    if kernel_path().exists() {
+        eprintln!("kernel already present.");
+    } else {
+        eprintln!("downloading container kernel (Kata {KATA_VER}, ~664MB one-time, keeps 18MB)...");
+        let url = format!(
+            "https://github.com/kata-containers/kata-containers/releases/download/{KATA_VER}/kata-static-{KATA_VER}-{arch}.tar.zst",
+            arch = guest_arch()
+        );
+        // Stream the bundle, write only the kernel member (tar -O). Needs curl +
+        // a zstd-capable tar — both ship with macOS.
+        let pipe = format!(
+            "curl -fL '{url}' | tar --zstd -xO -f - '{KATA_KERNEL}' > '{}'",
+            kernel_path().display()
+        );
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&pipe)
+            .status()
+            .map_err(|e| format!("spawn download: {e}"))?
+            .success();
+        // tar -O can write a partial file on failure; verify a real kernel landed.
+        let size = std::fs::metadata(kernel_path()).map(|m| m.len()).unwrap_or(0);
+        if !ok || size < 1_000_000 {
+            let _ = std::fs::remove_file(kernel_path());
+            return Err("kernel download/extract failed (need curl + zstd-capable tar)".into());
         }
     }
-    if !got_kernel || !got_initrd {
-        return Err("guest tarball missing Image.gz or initramfs.cpio.gz".into());
+
+    if !initrd_path().exists() {
+        return Err(format!(
+            "kernel ready. Build the guest agent initramfs to finish: run `vmagent/build.sh` \
+             (one-time first: `rustup target add aarch64-unknown-linux-musl`)."
+        ));
     }
     Ok(())
 }
@@ -188,6 +224,7 @@ fn boot_and_connect(port: u32) -> Result<RawFd, String> {
     }
     let kernel = kernel_path();
     let initrd = initrd_path();
+    let bundle = vm_dir().join("bundle"); // host-prepared OCI bundle, shared via virtiofs
     let queue = DispatchQueue::new("dev.carrier.vm", None); // None attr => serial
 
     // Stage 1: build + start the VM; report its leaked pointer once started.
@@ -223,6 +260,27 @@ fn boot_and_connect(port: u32) -> Result<RawFd, String> {
             cfg.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(
                 VZVirtioSocketDeviceConfiguration::new(),
             )]));
+            // virtiofs: share the host-prepared OCI bundle into the guest (tag
+            // "carrierbundle"). Read-only — alpine's rootfs dirs already exist, so
+            // runc only mounts onto them. ponytail: writable overlay when the
+            // container needs to write to its rootfs.
+            let shared = VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &file_url(&bundle),
+                true,
+            );
+            let share = VZSingleDirectoryShare::initWithDirectory(
+                VZSingleDirectoryShare::alloc(),
+                &shared,
+            );
+            let fsdev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("carrierbundle"),
+            );
+            fsdev.setShare(Some(&*share));
+            cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
+                Retained::into_super(fsdev),
+            ]));
             cfg.validateWithError()
                 .map_err(|e| format!("invalid VM config: {e:?}"))?;
 
@@ -296,6 +354,111 @@ fn boot_and_connect(port: u32) -> Result<RawFd, String> {
     fd_rx
         .recv()
         .map_err(|_| "vsock connect: channel closed".to_string())?
+}
+
+/// `carrier run <image> [cmd]` on macOS: build the OCI bundle on the host (which
+/// already pulls/extracts images cross-platform), share it into the guest over
+/// virtiofs, boot, run it via the agent, and print the output.
+pub async fn run_in_vm(image: String, command: Vec<String>) {
+    ensure_guest(); // self-install the embedded guest on first run
+    if !is_provisioned() {
+        eprintln!("carrier: VM not provisioned — run `carrier machine init` first");
+        std::process::exit(1);
+    }
+    if let Err(e) = prepare_bundle(&image, &command).await {
+        eprintln!("carrier: {e}");
+        std::process::exit(1);
+    }
+    match boot_and_connect(1024) {
+        Ok(fd) => {
+            use std::io::{Read, Write};
+            let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            let _ = ch.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            let _ = ch.write_all(b"run\n");
+            let mut out = Vec::new();
+            let _ = ch.read_to_end(&mut out);
+            print!("{}", String::from_utf8_lossy(&out));
+            // The VM is leaked + running; exiting the process tears it down.
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("carrier: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Pull `image` (reusing carrier's cross-platform pull), merge its layers into a
+/// rootfs, and write an OCI config running `command` — all under vm_dir/bundle,
+/// which boot_and_connect shares into the guest via virtiofs.
+async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
+    use crate::cli::RegistryImage;
+    use crate::storage::{extract_layer_rootless, StorageLayout};
+
+    // 1. Pull into the shared blob cache (guest matches the host arch).
+    crate::commands::pull_image(image.to_string(), Some(format!("linux/{}", guest_arch()))).await;
+
+    // 2. Read the manifest's ordered layer digests.
+    let parsed = RegistryImage::parse(image)?;
+    let layout = StorageLayout::new().map_err(|e| e.to_string())?;
+    let meta = layout.image_metadata_path(&parsed.image, &parsed.tag);
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&meta).map_err(|e| format!("read manifest {}: {e}", meta.display()))?,
+    )
+    .map_err(|e| format!("parse manifest: {e}"))?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or("manifest has no layers")?;
+
+    // 3. Merge layers (in order) into one rootfs. ponytail: sequential extract =
+    // VFS merge; no whiteout handling yet (fine for single-layer images).
+    let rootfs = vm_dir().join("bundle/rootfs");
+    let _ = std::fs::remove_dir_all(&rootfs);
+    std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+    for layer in layers {
+        let digest = layer["digest"].as_str().ok_or("layer missing digest")?;
+        extract_layer_rootless(&layout.blob_cache_path(digest), &rootfs)
+            .map_err(|e| format!("extract {digest}: {e}"))?;
+    }
+
+    // 4. Write the OCI config with the requested command.
+    let args: Vec<String> = if command.is_empty() {
+        vec!["/bin/sh".into()]
+    } else {
+        command.to_vec()
+    };
+    std::fs::write(vm_dir().join("bundle/config.json"), bundle_config(&args))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Minimal OCI runtime spec. rootfs is read-only (shared via virtiofs RO).
+fn bundle_config(args: &[String]) -> String {
+    serde_json::json!({
+        "ociVersion": "1.0.2",
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": args,
+            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "TERM=xterm"],
+            "cwd": "/",
+            "capabilities": {
+                "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
+                "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
+                "permitted": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
+            },
+            "noNewPrivileges": true
+        },
+        "root": { "path": "rootfs", "readonly": true },
+        "hostname": "carrier",
+        "mounts": [
+            { "destination": "/proc", "type": "proc", "source": "proc" },
+            { "destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
+            { "destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid", "noexec", "nodev", "ro"] }
+        ],
+        "linux": { "namespaces": [ {"type":"pid"}, {"type":"ipc"}, {"type":"uts"}, {"type":"mount"} ] }
+    })
+    .to_string()
 }
 
 /// Handle `carrier machine <action>`. `status` is fully live; `init`/`start`/
