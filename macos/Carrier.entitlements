@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required to use Apple's Virtualization.framework. Without this
+	     entitlement (and a codesigned binary), constructing a VZVirtualMachine
+	     throws at runtime. Building/validating a VZVirtualMachineConfiguration
+	     does NOT need it — only actually running a VM does. -->
+	<key>com.apple.security.virtualization</key>
+	<true/>
+</dict>
+</plist>

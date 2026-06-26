@@ -219,6 +219,25 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+
+    /// Manage the bundled Linux VM backend (macOS only)
+    Machine {
+        #[command(subcommand)]
+        action: MachineCmd,
+    },
+}
+
+/// Lifecycle of the macOS Linux micro-VM that runs containers.
+#[derive(Subcommand, Clone)]
+pub enum MachineCmd {
+    /// Download the VM artifacts (kernel + rootfs) into ~/.local/share/carrier/vm
+    Init,
+    /// Boot the VM
+    Start,
+    /// Stop the VM
+    Stop,
+    /// Show provisioning / run status
+    Status,
 }
 
 #[derive(Debug, PartialEq, Clone)]
