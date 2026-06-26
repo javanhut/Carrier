@@ -261,13 +261,13 @@ fn boot_and_connect(port: u32) -> Result<RawFd, String> {
                 VZVirtioSocketDeviceConfiguration::new(),
             )]));
             // virtiofs: share the host-prepared OCI bundle into the guest (tag
-            // "carrierbundle"). Read-only — alpine's rootfs dirs already exist, so
-            // runc only mounts onto them. ponytail: writable overlay when the
-            // container needs to write to its rootfs.
+            // "carrierbundle"), read-write so runc can create mountpoints and the
+            // container can write to its rootfs. prepare_bundle recreates the
+            // bundle each run, so host-side mutation is ephemeral.
             let shared = VZSharedDirectory::initWithURL_readOnly(
                 VZSharedDirectory::alloc(),
                 &file_url(&bundle),
-                true,
+                false,
             );
             let share = VZSingleDirectoryShare::initWithDirectory(
                 VZSingleDirectoryShare::alloc(),
@@ -421,27 +421,49 @@ async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
             .map_err(|e| format!("extract {digest}: {e}"))?;
     }
 
-    // 4. Write the OCI config with the requested command.
-    let args: Vec<String> = if command.is_empty() {
-        vec!["/bin/sh".into()]
-    } else {
-        command.to_vec()
+    // 4. Take the image's default entrypoint/cmd/env/cwd from its config blob, so
+    // `carrier run <image>` (no command) runs the image as built. A user command
+    // replaces Cmd (Docker semantics: Entrypoint is kept).
+    let icfg = manifest["config"]["digest"]
+        .as_str()
+        .and_then(|d| std::fs::read_to_string(layout.blob_cache_path(d)).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|j| j["config"].clone())
+        .unwrap_or(serde_json::Value::Null);
+    let strs = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
     };
-    std::fs::write(vm_dir().join("bundle/config.json"), bundle_config(&args))
+    let entrypoint = strs(&icfg["Entrypoint"]);
+    let args: Vec<String> = if command.is_empty() {
+        [entrypoint, strs(&icfg["Cmd"])].concat()
+    } else {
+        [entrypoint, command.to_vec()].concat()
+    };
+    if args.is_empty() {
+        return Err("image has no default command — pass one: `carrier run <image> <cmd>`".into());
+    }
+    let mut env = strs(&icfg["Env"]);
+    if env.is_empty() {
+        env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    }
+    let cwd = icfg["WorkingDir"].as_str().filter(|s| !s.is_empty()).unwrap_or("/");
+    std::fs::write(vm_dir().join("bundle/config.json"), bundle_config(&args, &env, cwd))
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Minimal OCI runtime spec. rootfs is read-only (shared via virtiofs RO).
-fn bundle_config(args: &[String]) -> String {
+fn bundle_config(args: &[String], env: &[String], cwd: &str) -> String {
     serde_json::json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
             "user": { "uid": 0, "gid": 0 },
             "args": args,
-            "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "TERM=xterm"],
-            "cwd": "/",
+            "env": env,
+            "cwd": cwd,
             "capabilities": {
                 "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
                 "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
@@ -449,7 +471,7 @@ fn bundle_config(args: &[String]) -> String {
             },
             "noNewPrivileges": true
         },
-        "root": { "path": "rootfs", "readonly": true },
+        "root": { "path": "rootfs", "readonly": false },
         "hostname": "carrier",
         "mounts": [
             { "destination": "/proc", "type": "proc", "source": "proc" },
