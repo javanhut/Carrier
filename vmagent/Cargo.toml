@@ -1,0 +1,17 @@
+# Guest-side agent. Built ONLY for aarch64-unknown-linux-musl (it runs inside the
+# VM as PID 1), never for macOS. Cross-compiled from the host with rust-lld — no
+# external toolchain. See build.sh. Kept out of the carrier workspace on purpose:
+# different target, no shared code.
+[package]
+name = "vmagent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

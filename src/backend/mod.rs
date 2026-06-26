@@ -31,6 +31,24 @@ pub fn needs_linux_runtime(cmd: &Commands) -> bool {
     )
 }
 
+/// Handle `carrier machine <action>`. macOS drives the bundled VM; on Linux
+/// there is no VM (containers run natively), so it's a no-op with a clear note.
+pub fn machine(action: crate::cli::MachineCmd) {
+    #[cfg(target_os = "macos")]
+    {
+        vm::machine(action);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = action;
+        eprintln!(
+            "carrier machine is macOS-only — on Linux, containers run natively \
+             (no VM needed)."
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Gate the runtime commands per platform. Linux: no-op (the runc path handles
 /// it). macOS: until the VM backend is provisioned, exit with a clear,
 /// actionable message rather than a confusing low-level error.

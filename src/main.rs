@@ -201,5 +201,8 @@ async fn main() {
                 &mut std::io::stdout(),
             );
         }
+        Commands::Machine { action } => {
+            backend::machine(action);
+        }
     }
 }
