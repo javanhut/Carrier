@@ -17,7 +17,7 @@
 // until then so the warning doesn't mask real ones.
 #![allow(dead_code)]
 
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use block2::RcBlock;
@@ -154,11 +154,15 @@ fn ensure_guest() {
         const KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Image"));
         const INITRD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/initramfs.cpio.gz"));
         let _ = std::fs::create_dir_all(vm_dir());
-        if !kernel_path().exists() {
+        // Refresh when the embedded guest changes (new carrier build) so an
+        // upgrade doesn't keep booting a stale on-disk guest. Length tag is a
+        // cheap content marker.
+        let ver = vm_dir().join("guest.version");
+        let tag = format!("{}-{}", KERNEL.len(), INITRD.len());
+        if std::fs::read_to_string(&ver).unwrap_or_default() != tag {
             let _ = std::fs::write(kernel_path(), KERNEL);
-        }
-        if !initrd_path().exists() {
             let _ = std::fs::write(initrd_path(), INITRD);
+            let _ = std::fs::write(&ver, &tag);
         }
     }
 }
@@ -218,7 +222,7 @@ fn provision() -> Result<(), String> {
 /// wired to our stdin/stdout so the boot is visible. The VM keeps running on the
 /// queue, so the caller must keep the process alive. Needs the virtualization
 /// entitlement (macos/sign.sh) — VZVirtualMachine throws without it.
-fn boot_and_connect(port: u32) -> Result<RawFd, String> {
+fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
     if !is_provisioned() {
         return Err("not provisioned — run `carrier machine init` first".into());
     }
@@ -238,20 +242,47 @@ fn boot_and_connect(port: u32) -> Result<RawFd, String> {
             boot.setInitialRamdiskURL(Some(&file_url(&initrd)));
             boot.setCommandLine(&NSString::from_str("console=hvc0"));
 
-            // Guest serial console <-> our stdin/stdout.
-            let attach =
-                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                    VZFileHandleSerialPortAttachment::alloc(),
-                    Some(&NSFileHandle::fileHandleWithStandardInput()),
-                    Some(&NSFileHandle::fileHandleWithStandardOutput()),
-                );
-            let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-            serial.setAttachment(Some(&*attach));
-
             let cfg = VZVirtualMachineConfiguration::new();
             cfg.setCPUCount(2);
             cfg.setMemorySize(512 * 1024 * 1024);
             cfg.setBootLoader(Some(&*boot));
+            // Serial console: always present so the kernel's `console=hvc0` has a
+            // device (dropping it disturbs boot). Write to our stdout only for
+            // machine start; `carrier run` sends it to the null device — clean
+            // terminal, container output comes over vsock. Never read host stdin:
+            // it hijacks and closes the terminal.
+            // VZ wants real fds (the null-device handle throws). Read from
+            // /dev/null (never host stdin — it hijacks the terminal). Write to our
+            // stdout for `machine start`, or to console.log for `carrier run`
+            // (clean terminal; container output comes over vsock). closeOnDealloc
+            // owns the fd (into_raw_fd hands it over, no double close).
+            let null_in = std::fs::File::open("/dev/null")
+                .map_err(|e| e.to_string())?
+                .into_raw_fd();
+            let reader = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                null_in,
+                true,
+            );
+            let writer = if console {
+                NSFileHandle::fileHandleWithStandardOutput()
+            } else {
+                let log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(vm_dir().join("console.log"))
+                    .map_err(|e| e.to_string())?
+                    .into_raw_fd();
+                NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), log, true)
+            };
+            let attach = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&reader),
+                Some(&writer),
+            );
+            let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+            serial.setAttachment(Some(&*attach));
             cfg.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(serial)]));
             cfg.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
                 VZVirtioEntropyDeviceConfiguration::new(),
@@ -369,7 +400,7 @@ pub async fn run_in_vm(image: String, command: Vec<String>) {
         eprintln!("carrier: {e}");
         std::process::exit(1);
     }
-    match boot_and_connect(1024) {
+    match boot_and_connect(1024, false) {
         Ok(fd) => {
             use std::io::{Read, Write};
             let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
@@ -377,9 +408,19 @@ pub async fn run_in_vm(image: String, command: Vec<String>) {
             let _ = ch.write_all(b"run\n");
             let mut out = Vec::new();
             let _ = ch.read_to_end(&mut out);
-            print!("{}", String::from_utf8_lossy(&out));
+            // Agent replies "EXIT <code>\n<raw container output>".
+            let text = String::from_utf8_lossy(&out);
+            let (code, body) = match text.strip_prefix("EXIT ") {
+                Some(rest) => {
+                    let (c, b) = rest.split_once('\n').unwrap_or((rest, ""));
+                    (c.trim().parse().unwrap_or(1), b.to_string())
+                }
+                None => (1, text.to_string()),
+            };
+            print!("{body}");
+            let _ = std::io::stdout().flush();
             // The VM is leaked + running; exiting the process tears it down.
-            std::process::exit(0);
+            std::process::exit(code);
         }
         Err(e) => {
             eprintln!("carrier: {e}");
@@ -512,21 +553,28 @@ pub fn machine(action: crate::cli::MachineCmd) {
                 std::process::exit(1);
             }
         },
-        MachineCmd::Start => match boot_and_connect(1024) {
+        MachineCmd::Start => match boot_and_connect(1024, true) {
             Ok(fd) => {
                 use std::io::{Read, Write};
                 // ponytail: UnixStream is just a SOCK_STREAM wrapper — fine over a
                 // vsock fd; read()/write() don't care about the address family.
                 let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
                 let _ = ch.set_read_timeout(Some(std::time::Duration::from_secs(20)));
-                let _ = ch.write_all(b"run\n"); // ask the agent to runc-run the baked bundle
-                // Agent writes its reply then closes, so read to EOF.
+                let _ = ch.write_all(b"run\n"); // ask the agent to runc-run the bundle
+                // Agent writes "EXIT <code>\n<raw output>" then closes.
                 let mut reply = Vec::new();
                 let _ = ch.read_to_end(&mut reply);
-                eprintln!(
-                    "[carrier] guest agent replied:\n{}",
-                    String::from_utf8_lossy(&reply).trim_end()
-                );
+                let text = String::from_utf8_lossy(&reply);
+                let (code, body) = match text.strip_prefix("EXIT ") {
+                    Some(rest) => {
+                        let (c, b) = rest.split_once('\n').unwrap_or((rest, ""));
+                        (c.trim().parse().unwrap_or(1), b.to_string())
+                    }
+                    None => (1, text.to_string()),
+                };
+                print!("{body}");
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
                 eprintln!("[carrier] Ctrl-C to stop.");
                 // Keep `ch` (and the VM, on its queue) alive by parking.
                 loop {

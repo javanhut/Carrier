@@ -98,12 +98,14 @@ fn run_container() -> String {
         .args(["--root", "/run/runc", "run", "--no-pivot", "--bundle", "/bundle", "carrier-test"])
         .output()
     {
+        // First line is the exit marker the host strips; the rest is raw
+        // container output (stdout then stderr).
         Ok(o) => format!(
-            "runc exit={}\n--- stdout ---\n{}--- stderr ---\n{}",
+            "EXIT {}\n{}{}",
             o.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr),
         ),
-        Err(e) => format!("failed to exec runc: {e}"),
+        Err(e) => format!("EXIT 127\nfailed to exec runc: {e}\n"),
     }
 }
