@@ -27,11 +27,16 @@ fn validate_entry(
     if kind.is_block_special() || kind.is_character_special() || kind.is_fifo() {
         return Err(format!("unsafe special file in layer: {}", path.display()).into());
     }
+    // Symlink targets are plain strings resolved inside the container root at
+    // runtime, so absolute targets are safe (and ubiquitous, e.g.
+    // /etc/alternatives). Hardlink targets resolve on the host at extraction
+    // time, so only those must stay inside the destination.
     if let Some(target) = entry.link_name()? {
-        if target.is_absolute()
-            || target
-                .components()
-                .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+        if kind.is_hard_link()
+            && (target.is_absolute()
+                || target
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_))))
         {
             return Err(format!(
                 "unsafe link target in layer: {} -> {}",
@@ -239,6 +244,58 @@ mod tests {
         let error = extract_layer_rootless(&archive_path, &output).unwrap_err();
 
         assert!(error.to_string().contains("unsafe special file"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn allows_symlinks_with_absolute_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("layer.tar.gz");
+        let encoder = GzEncoder::new(
+            std::fs::File::create(&archive_path).unwrap(),
+            Compression::default(),
+        );
+        let mut archive = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        archive
+            .append_link(&mut header, "etc/alternatives/awk", "/usr/bin/mawk")
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let output = dir.path().join("layer");
+        extract_layer_rootless(&archive_path, &output).unwrap();
+
+        let target = std::fs::read_link(output.join("etc/alternatives/awk")).unwrap();
+        assert_eq!(target, Path::new("/usr/bin/mawk"));
+    }
+
+    #[test]
+    fn rejects_hardlinks_with_absolute_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("layer.tar.gz");
+        let encoder = GzEncoder::new(
+            std::fs::File::create(&archive_path).unwrap(),
+            Compression::default(),
+        );
+        let mut archive = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_link(&mut header, "evil", "/etc/passwd")
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let output = dir.path().join("layer");
+        let error = extract_layer_rootless(&archive_path, &output).unwrap_err();
+
+        assert!(error.to_string().contains("unsafe link target"));
         assert!(!output.exists());
     }
 

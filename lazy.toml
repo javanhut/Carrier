@@ -36,13 +36,27 @@ run = ["echo Hello from imlazy!"]
 # run.darwin = ["go build -o app"]
 # run.windows = ["go build -o app.exe"]
 
+[commands.update]
+desc = "Updates the dependencies"
+run = ["cargo update"]
+
 [commands.check]
+desc = "Checks the formatting in the files"
 run = ["cargo fmt --check"]
 
+[commands.install]
+desc = "Installs the package"
+run = ["cargo build --release", "sudo mv ./target/release/carrier /usr/local/bin/"]
+
+[commands.uninstall]
+desc = "Uninstalls the package"
+run = ["sudo rm -rf /usr/local/bin/carrier"]
 
 [commands.format]
+desc = "Runs the format command"
 alias = ["fmt"]
 run = ["cargo fmt"]
 
 [commands.test]
+desc = "Runs the cargo tests"
 run  = ["cargo test"]
