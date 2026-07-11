@@ -130,10 +130,28 @@ fn supervise(mut conn: UnixStream) {
 
 fn supervisor_request(request: &str) -> Vec<u8> {
     if request == "detach" {
-        let output = Command::new("/bin/runc")
+        // Stdio to a file, not pipes: the detached container inherits runc's
+        // stdio, so piped .output() would block until the container exits.
+        let (out, err) = match std::fs::File::create("/run/container.log")
+            .and_then(|f| Ok((f.try_clone()?, f)))
+        {
+            Ok(pair) => pair,
+            Err(e) => return format!("EXIT 127\n{e}\n").into_bytes(),
+        };
+        let status = Command::new("/bin/runc")
             .args(["--root", "/run/runc", "run", "-d", "--no-pivot", "--bundle", bundle_dir(), "carrier-test"])
-            .output();
-        return command_result(output);
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .status();
+        return match status {
+            Ok(s) => {
+                let mut r = format!("EXIT {}\n", s.code().unwrap_or(-1)).into_bytes();
+                r.extend(std::fs::read("/run/container.log").unwrap_or_default());
+                r
+            }
+            Err(e) => format!("EXIT 127\n{e}\n").into_bytes(),
+        };
     }
     if request == "stop" {
         let output = Command::new("/bin/runc")

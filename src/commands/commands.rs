@@ -4266,8 +4266,23 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     "Unknown".to_string()
                                 };
 
+                                // VM containers: the supervisor daemon owns the
+                                // status; host runc doesn't know them. Liveness =
+                                // its control socket still exists.
+                                #[cfg(target_os = "macos")]
+                                let vm_backend = metadata["backend"].as_str() == Some("macos-vm");
+                                #[cfg(not(target_os = "macos"))]
+                                let vm_backend = false;
                                 // Check if container is actually running using runc state
-                                let actual_status = if status == "running"
+                                let actual_status = if vm_backend {
+                                    #[cfg(target_os = "macos")]
+                                    let up = status == "running"
+                                        && crate::backend::vm::control_socket(&container_id)
+                                            .is_ok_and(|s| s.exists());
+                                    #[cfg(not(target_os = "macos"))]
+                                    let up = false;
+                                    if up { status } else { "exited" }
+                                } else if status == "running"
                                     || status.starts_with("Up")
                                 {
                                     // Query runc for actual state
@@ -4421,12 +4436,26 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
             const CMD_WIDTH: usize = 9;
             const CREATED_WIDTH: usize = 12;
             const STATUS_WIDTH: usize = 11;
-            const NAME_WIDTH: usize = 8;
+            // NAMES never truncates: size to the longest name (generated names
+            // are "car_" + 6 id chars = 10).
+            #[allow(non_snake_case)]
+            let NAME_WIDTH: usize = containers
+                .iter()
+                .map(|c| {
+                    if c.6.is_empty() {
+                        4 + 6.min(c.0.len())
+                    } else {
+                        c.6.len()
+                    }
+                })
+                .max()
+                .unwrap_or(8)
+                .max("NAMES".len());
 
-            // Total: 12+20+9+12+11+8 = 72 columns
-            // Plus: 6 columns means 5 × " │ " = 15, plus "║ " and " ║" = 4
-            // Total = 72 + 19 = 91 (matches images)
-            const TOTAL_WIDTH: usize = 91;
+            // 6 columns means 5 × " │ " = 15, plus "║ " and " ║" = 4
+            #[allow(non_snake_case)]
+            let TOTAL_WIDTH: usize =
+                ID_WIDTH + IMAGE_WIDTH + CMD_WIDTH + CREATED_WIDTH + STATUS_WIDTH + NAME_WIDTH + 19;
 
             // Print top border
             println!("╔{}╗", "═".repeat(TOTAL_WIDTH - 2));
@@ -4515,14 +4544,7 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                     };
 
                     let name_display = if name.is_empty() {
-                        let generated = format!("car_{}", &id[..6.min(id.len())]);
-                        if generated.len() > NAME_WIDTH {
-                            format!("{}...", &generated[..NAME_WIDTH - 3])
-                        } else {
-                            generated
-                        }
-                    } else if name.len() > NAME_WIDTH {
-                        format!("{}...", &name[..NAME_WIDTH - 3])
+                        format!("car_{}", &id[..6.min(id.len())])
                     } else {
                         name.clone()
                     };

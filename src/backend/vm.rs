@@ -470,8 +470,11 @@ fn container_dir(id: &str) -> Result<PathBuf, String> {
     Ok(layout.container_path(id))
 }
 
-fn control_socket(id: &str) -> Result<PathBuf, String> {
-    Ok(container_dir(id)?.join("vm.sock"))
+pub fn control_socket(id: &str) -> Result<PathBuf, String> {
+    // In run/, not the container dir: the deep overlay-containers path exceeds
+    // SUN_LEN (~104 bytes) and unix-socket bind fails.
+    let layout = crate::storage::StorageLayout::new().map_err(|e| e.to_string())?;
+    Ok(layout.base.join("run").join(format!("{id}.sock")))
 }
 
 fn start_detached(image: &str, command: &[String], name: Option<String>) -> ! {
@@ -524,7 +527,16 @@ fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> Result<Vec<u8>, St
     use std::io::Read;
     let mut size = [0u8; 8];
     stream.read_exact(&mut size).map_err(|e| e.to_string())?;
-    let mut data = vec![0; u64::from_be_bytes(size) as usize];
+    let len = u64::from_be_bytes(size);
+    // ponytail: 64MiB cap — a text reply here means the guest agent is stale
+    // (predates framing) and would otherwise parse as an exabyte allocation.
+    if len > 64 << 20 {
+        return Err(format!(
+            "guest sent an unframed reply (stale agent initramfs? re-run vmagent/build.sh): {:?}",
+            String::from_utf8_lossy(&size)
+        ));
+    }
+    let mut data = vec![0; len as usize];
     stream.read_exact(&mut data).map_err(|e| e.to_string())?;
     Ok(data)
 }
@@ -617,8 +629,8 @@ pub fn control(container: &str, request: &str) -> Result<Vec<u8>, String> {
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
-    let (_, dir) = find_vm_container(container)?;
-    let mut stream = UnixStream::connect(dir.join("vm.sock"))
+    let (id, _) = find_vm_container(container)?;
+    let mut stream = UnixStream::connect(control_socket(&id)?)
         .map_err(|e| format!("container is not running: {e}"))?;
     stream
         .write_all(request.as_bytes())

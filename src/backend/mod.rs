@@ -76,15 +76,6 @@ pub fn guard(cmd: &Commands) {
         // Persistent VM containers have host-side metadata and a supervisor
         // control socket, so these commands are routed in main.
         let _ = cmd;
-        return;
-        #[allow(unreachable_code)]
-        eprintln!(
-            "carrier: `stop`/`sh`/`terminal`/`logs`/`info` operate on a running \
-             container, which the macOS VM backend doesn't keep yet — each \
-             `carrier run` is ephemeral.\n\
-             For a shell, run interactively: `carrier run -i <image> /bin/bash`."
-        );
-        std::process::exit(1);
     }
 }
 
