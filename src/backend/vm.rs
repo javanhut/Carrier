@@ -438,6 +438,11 @@ pub async fn run_in_vm(
         }
     };
     if interactive || tty {
+        use std::io::IsTerminal;
+        if tty && std::io::stdout().is_terminal() {
+            // Embedded terminal pane (ratatui + vt100). Never returns.
+            super::vm_tui::session(fd, &image);
+        }
         interactive_session(fd, tty); // pumps stdin<->container, never returns
     }
     {
@@ -676,6 +681,17 @@ fn interactive_session(fd: RawFd, tty: bool) -> ! {
     use std::io::{Read, Write};
     let mut ch = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
     let _ = ch.write_all(if tty { b"run-t\n" } else { b"run-i\n" });
+    if tty {
+        // The agent expects a "cols rows" size line after run-t; zeros = skip.
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
+        let _ = ch.write_all(format!("{} {}\n", ws.ws_col, ws.ws_row).as_bytes());
+    }
 
     let orig = if tty { set_raw_mode() } else { None };
     // Host stdin -> container, in a thread (read blocks).

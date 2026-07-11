@@ -32,6 +32,9 @@ portable-pty = "0.8"
 scopeguard = "1.2"
 rpassword = "7.0"
 base64 = "0.22"
+ratatui = "0.30.2"
+vt100 = "0.16.2"
+tui-term = "0.3.4"
 
 # Linux-only runtime bits. The nix `mount` feature only compiles on Linux, so it
 # lives here; Cargo unions it with the cross-platform nix features above when

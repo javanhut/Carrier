@@ -4022,6 +4022,11 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
     let show_images = !containers_only;
     let show_containers = !images_only;
 
+    // TTY: colored ratatui tables. Piped: the plain box output below.
+    use std::io::IsTerminal;
+    let fancy = std::io::stdout().is_terminal();
+    let mut tui_sections: Vec<super::tui::Section> = Vec::new();
+
     if show_images {
         // Collect all images first
         let mut images = Vec::new();
@@ -4089,8 +4094,35 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
             }
         }
 
-        // Print images in box format with fixed alignment
-        if !images.is_empty() || (show_images && !show_containers) {
+        // TTY: queue the colored ratatui section; piped: box format below.
+        if fancy {
+            if !images.is_empty() || !show_containers {
+                use ratatui::style::Color;
+                let rows = images
+                    .iter()
+                    .map(|(full_name, id, created, size)| {
+                        let (repository, tag) = match full_name.rfind('/') {
+                            Some(i) => (full_name[..i].to_string(), full_name[i + 1..].to_string()),
+                            None => (full_name.clone(), "latest".to_string()),
+                        };
+                        vec![repository, tag, id.clone(), created.clone(), size.clone()]
+                    })
+                    .collect();
+                tui_sections.push(super::tui::Section {
+                    title: "IMAGES",
+                    headers: &["REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"],
+                    colors: &[
+                        Color::Cyan,
+                        Color::Green,
+                        Color::DarkGray,
+                        Color::DarkGray,
+                        Color::Yellow,
+                    ],
+                    rows,
+                    empty_msg: "No images found",
+                });
+            }
+        } else if !images.is_empty() || (show_images && !show_containers) {
             // Fixed column widths for consistent alignment
             const REPO_WIDTH: usize = 30;
             const TAG_WIDTH: usize = 10;
@@ -4215,7 +4247,7 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
             }
         }
 
-        if show_containers && show_images {
+        if !fancy && show_containers && show_images {
             println!(); // Spacing between sections
         }
     }
@@ -4427,8 +4459,45 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
         // Sort by creation time (newest first)
         containers.sort_by(|a, b| b.7.cmp(&a.7));
 
-        // Print containers in box format with fixed alignment
-        if show_containers {
+        if fancy && show_containers {
+            use ratatui::style::Color;
+            let rows = containers
+                .iter()
+                .map(|c| {
+                    let name = if c.6.is_empty() {
+                        format!("car_{}", &c.0[..6.min(c.0.len())])
+                    } else {
+                        c.6.clone()
+                    };
+                    let cmd = if c.2.is_empty() {
+                        "-".to_string()
+                    } else if c.2.len() > 30 {
+                        format!("{}...", &c.2[..27])
+                    } else {
+                        c.2.clone()
+                    };
+                    vec![c.0.clone(), c.1.clone(), cmd, c.3.clone(), c.4.clone(), name]
+                })
+                .collect();
+            tui_sections.push(super::tui::Section {
+                title: "CONTAINERS",
+                headers: &["ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "NAMES"],
+                colors: &[
+                    Color::Yellow,
+                    Color::Cyan,
+                    Color::DarkGray,
+                    Color::DarkGray,
+                    Color::White, // STATUS re-colored per row (green Up / red Exited)
+                    Color::Magenta,
+                ],
+                rows,
+                empty_msg: if all {
+                    "No containers found"
+                } else {
+                    "No running containers (use -a to show all)"
+                },
+            });
+        } else if show_containers {
             // Fixed column widths - adjusted to match images total width of 91
             // Need 72 total column width for 6 columns (91 - 19 for separators/borders)
             const ID_WIDTH: usize = 12;
@@ -4577,6 +4646,12 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                     "═".repeat(NAME_WIDTH + 2)
                 );
             }
+        }
+    }
+
+    if !tui_sections.is_empty() {
+        if let Err(e) = super::tui::render(tui_sections) {
+            eprintln!("carrier: render failed: {e}");
         }
     }
 }

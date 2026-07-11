@@ -212,7 +212,14 @@ fn read_line(conn: &mut UnixStream) -> String {
 /// container's controlling terminal, and passes its master back over a console
 /// socket. We receive that master fd and bridge it to the vsock connection, so
 /// `carrier run -it` gets a real interactive terminal (prompt, echo, colors).
-fn run_container_tty(conn: UnixStream) {
+fn run_container_tty(mut conn: UnixStream) {
+    // Host sends the pane size as one "cols rows" line before raw bytes flow.
+    // Applied to the PTY master below; unparsable = keep the PTY default.
+    let size_line = read_line(&mut conn);
+    let mut size = size_line
+        .split_whitespace()
+        .filter_map(|v| v.parse::<u16>().ok().filter(|v| *v > 0));
+    let winsize = size.next().zip(size.next());
     let vsock: RawFd = conn.into_raw_fd();
     let sock = "/run/console.sock";
     let _ = std::fs::remove_file(sock);
@@ -243,6 +250,15 @@ fn run_container_tty(conn: UnixStream) {
     if master < 0 {
         unsafe { libc::close(vsock) };
         return;
+    }
+    if let Some((cols, rows)) = winsize {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
     }
     // Bridge: share the fds (full-duplex, no dup). Host->PTY in a thread; PTY->
     // host on this thread, which ends when the container exits (master EOF). Then

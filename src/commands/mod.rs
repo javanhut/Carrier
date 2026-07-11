@@ -1,4 +1,5 @@
 mod commands;
+mod tui;
 
 pub use commands::{
     authenticate_registry, exec_in_container, list_items, pull_image,

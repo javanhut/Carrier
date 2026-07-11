@@ -15,6 +15,8 @@ use crate::cli::Commands;
 // macOS: the bundled Linux micro-VM driver (Virtualization.framework, pure Rust).
 #[cfg(target_os = "macos")]
 pub mod vm;
+#[cfg(target_os = "macos")]
+mod vm_tui;
 
 /// Does this subcommand need a real Linux container runtime (runc, namespaces,
 /// overlayfs)? Those can't run on the macOS host; on macOS they route through
