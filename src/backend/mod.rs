@@ -35,8 +35,15 @@ pub fn needs_linux_runtime(cmd: &Commands) -> bool {
 /// macOS: run a container via the bundled VM (host builds the bundle, guest runs
 /// it). On Linux this is never called — `carrier run` uses the native runc path.
 #[cfg(target_os = "macos")]
-pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, tty: bool) {
-    vm::run_in_vm(image, command, interactive, tty).await;
+pub async fn run_in_vm(
+    image: String,
+    command: Vec<String>,
+    interactive: bool,
+    tty: bool,
+    detach: bool,
+    name: Option<String>,
+) {
+    vm::run_in_vm(image, command, interactive, tty, detach, name).await;
 }
 
 /// Handle `carrier machine <action>`. macOS drives the bundled VM; on Linux
@@ -66,6 +73,11 @@ pub fn guard(cmd: &Commands) {
     }
     #[cfg(target_os = "macos")]
     {
+        // Persistent VM containers have host-side metadata and a supervisor
+        // control socket, so these commands are routed in main.
+        let _ = cmd;
+        return;
+        #[allow(unreachable_code)]
         eprintln!(
             "carrier: `stop`/`sh`/`terminal`/`logs`/`info` operate on a running \
              container, which the macOS VM backend doesn't keep yet — each \

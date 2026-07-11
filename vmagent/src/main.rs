@@ -102,12 +102,80 @@ fn main() -> ! {
         match cmd.trim() {
             "run-t" => run_container_tty(conn),
             "run-i" => run_container_interactive(conn),
+            "supervise" => supervise(conn),
             other => {
                 let _ = conn.write_all(handle(other).as_bytes());
             }
         }
         // conn drops -> closes the connection.
     }
+}
+
+/// Keep one host connection open for the lifetime of a detached VM. Each
+/// newline-delimited request receives an eight-byte big-endian length followed
+/// by the response, allowing command output to contain arbitrary newlines.
+fn supervise(mut conn: UnixStream) {
+    loop {
+        let request = read_line(&mut conn);
+        if request.is_empty() {
+            break;
+        }
+        let response = supervisor_request(request.trim());
+        let len = (response.len() as u64).to_be_bytes();
+        if conn.write_all(&len).is_err() || conn.write_all(&response).is_err() {
+            break;
+        }
+    }
+}
+
+fn supervisor_request(request: &str) -> Vec<u8> {
+    if request == "detach" {
+        let output = Command::new("/bin/runc")
+            .args(["--root", "/run/runc", "run", "-d", "--no-pivot", "--bundle", bundle_dir(), "carrier-test"])
+            .output();
+        return command_result(output);
+    }
+    if request == "stop" {
+        let output = Command::new("/bin/runc")
+            .args(["--root", "/run/runc", "kill", "carrier-test", "TERM"])
+            .output();
+        return command_result(output);
+    }
+    if request == "state" {
+        let output = Command::new("/bin/runc")
+            .args(["--root", "/run/runc", "state", "carrier-test"])
+            .output();
+        return command_result(output);
+    }
+    if let Some(encoded) = request.strip_prefix("exec ") {
+        let args: Option<Vec<String>> = encoded.split(' ').map(decode_hex).collect();
+        let Some(args) = args else { return b"EXIT 2\ninvalid exec request\n".to_vec() };
+        if args.is_empty() { return b"EXIT 2\nempty command\n".to_vec() }
+        let mut command = Command::new("/bin/runc");
+        command.args(["--root", "/run/runc", "exec", "carrier-test"]);
+        command.args(args);
+        return command_result(command.output());
+    }
+    b"EXIT 2\nunknown supervisor request\n".to_vec()
+}
+
+fn command_result(output: std::io::Result<std::process::Output>) -> Vec<u8> {
+    match output {
+        Ok(output) => {
+            let mut result = format!("EXIT {}\n", output.status.code().unwrap_or(-1)).into_bytes();
+            result.extend(output.stdout);
+            result.extend(output.stderr);
+            result
+        }
+        Err(error) => format!("EXIT 127\n{error}\n").into_bytes(),
+    }
+}
+
+fn decode_hex(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 { return None; }
+    let bytes: Option<Vec<u8>> = (0..value.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok()).collect();
+    String::from_utf8(bytes?).ok()
 }
 
 fn read_line(conn: &mut UnixStream) -> String {

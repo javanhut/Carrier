@@ -36,6 +36,10 @@ impl StorageDriverChoice {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Internal macOS VM supervisor entry point.
+    #[command(name = "__vm-daemon", hide = true)]
+    VmDaemon { container: String },
+
     /// Show container logs
     Logs {
         /// Container ID or name

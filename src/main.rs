@@ -49,14 +49,11 @@ async fn main() {
             verbose,
             command,
         } => {
-            // macOS has no native runtime — route to the bundled VM. ponytail:
-            // detach/name/volumes/ports/env aren't plumbed into the VM yet.
+            // macOS has no native runtime — route to the bundled VM.
             #[cfg(target_os = "macos")]
             {
-                let _ = (
-                    detach, name, elevated, volumes, ports, env, platform, verbose,
-                );
-                backend::run_in_vm(image, command, interactive, tty).await;
+                let _ = (elevated, volumes, ports, env, platform, verbose);
+                backend::run_in_vm(image, command, interactive, tty, detach, name).await;
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (interactive, tty);
@@ -155,18 +152,43 @@ async fn main() {
             force,
             timeout,
         } => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (force, timeout);
+                if let Err(e) = backend::vm::control(&container, "stop") {
+                    eprintln!("Failed to stop container: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
             if let Err(e) = stop_container(container, force, timeout).await {
                 eprintln!("Failed to stop container: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::Shell { container, command } => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) = backend::vm::exec(&container, command) {
+                    eprintln!("Failed to execute command: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
             if let Err(e) = exec_in_container(container, command, false).await {
                 eprintln!("Failed to execute command: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::Terminal { container, command } => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) = backend::vm::exec(&container, command) {
+                    eprintln!("Failed to open terminal: {e}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
             if let Err(e) = exec_in_container(container, command, true).await {
                 eprintln!("Failed to open terminal: {}", e);
                 std::process::exit(1);
@@ -239,6 +261,12 @@ async fn main() {
         }
         Commands::Machine { action } => {
             backend::machine(action);
+        }
+        Commands::VmDaemon { container } => {
+            #[cfg(target_os = "macos")]
+            backend::vm::daemon(container);
+            #[cfg(not(target_os = "macos"))]
+            let _ = container;
         }
     }
 }

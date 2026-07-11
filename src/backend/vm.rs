@@ -403,15 +403,32 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
 /// `carrier run <image> [cmd]` on macOS: build the OCI bundle on the host (which
 /// already pulls/extracts images cross-platform), share it into the guest over
 /// virtiofs, boot, run it via the agent, and print the output.
-pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, tty: bool) {
+pub async fn run_in_vm(
+    image: String,
+    mut command: Vec<String>,
+    interactive: bool,
+    tty: bool,
+    detach: bool,
+    name: Option<String>,
+) {
     ensure_guest(); // self-install the embedded guest on first run
     if !is_provisioned() {
         eprintln!("carrier: VM not provisioned — run `carrier machine init` first");
         std::process::exit(1);
     }
+    if detach
+        && (command.is_empty()
+            || (command.len() == 1
+                && matches!(command[0].as_str(), "sh" | "bash" | "/bin/sh" | "/bin/bash")))
+    {
+        command = vec!["sleep".into(), "infinity".into()];
+    }
     if let Err(e) = prepare_bundle(&image, &command, tty).await {
         eprintln!("carrier: {e}");
         std::process::exit(1);
+    }
+    if detach {
+        start_detached(&image, &command, name);
     }
     let fd = match boot_and_connect(1024, false) {
         Ok(fd) => fd,
@@ -446,6 +463,193 @@ pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, t
             std::process::exit(code);
         }
     }
+}
+
+fn container_dir(id: &str) -> Result<PathBuf, String> {
+    let layout = crate::storage::StorageLayout::new().map_err(|e| e.to_string())?;
+    Ok(layout.container_path(id))
+}
+
+fn control_socket(id: &str) -> Result<PathBuf, String> {
+    Ok(container_dir(id)?.join("vm.sock"))
+}
+
+fn start_detached(image: &str, command: &[String], name: Option<String>) -> ! {
+    use std::process::{Command, Stdio};
+    let id = crate::storage::generate_container_id();
+    let dir = container_dir(&id).unwrap_or_else(|e| fatal(&e));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| fatal(&e.to_string()));
+    let metadata = serde_json::json!({
+        "id": id,
+        "name": name.unwrap_or_else(|| format!("car_{}", &id[..6])),
+        "image": image,
+        "created": chrono::Utc::now().to_rfc3339(),
+        "rootfs": vm_dir().join("bundle/rootfs"),
+        "command": command,
+        "status": "starting",
+        "backend": "macos-vm"
+    });
+    crate::storage::atomic_write(&dir.join("metadata.json"), metadata.to_string().as_bytes())
+        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("container.log"))
+        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let log_err = log.try_clone().unwrap_or_else(|e| fatal(&e.to_string()));
+    Command::new(std::env::current_exe().unwrap_or_else(|e| fatal(&e.to_string())))
+        .args(["__vm-daemon", &id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .unwrap_or_else(|e| fatal(&format!("start VM supervisor: {e}")));
+    let socket = control_socket(&id).unwrap_or_else(|e| fatal(&e));
+    for _ in 0..200 {
+        if socket.exists() {
+            println!("{id}");
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    fatal("VM supervisor did not become ready; see the container log")
+}
+
+fn fatal(message: &str) -> ! {
+    eprintln!("carrier: {message}");
+    std::process::exit(1)
+}
+
+fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut size = [0u8; 8];
+    stream.read_exact(&mut size).map_err(|e| e.to_string())?;
+    let mut data = vec![0; u64::from_be_bytes(size) as usize];
+    stream.read_exact(&mut data).map_err(|e| e.to_string())?;
+    Ok(data)
+}
+
+/// Hidden background process that owns the VZ VM and proxies local requests to
+/// the long-lived guest-agent connection.
+pub fn daemon(container: String) {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let fd = boot_and_connect(1024, false).unwrap_or_else(|e| fatal(&e));
+    let mut guest = unsafe { UnixStream::from_raw_fd(fd) };
+    guest
+        .write_all(b"supervise\n")
+        .unwrap_or_else(|e| fatal(&e.to_string()));
+    guest
+        .write_all(b"detach\n")
+        .unwrap_or_else(|e| fatal(&e.to_string()));
+    let reply = read_frame(&mut guest).unwrap_or_else(|e| fatal(&e));
+    if !reply.starts_with(b"EXIT 0\n") {
+        fatal(&String::from_utf8_lossy(&reply));
+    }
+    set_vm_status(&container, "running");
+    let socket = control_socket(&container).unwrap_or_else(|e| fatal(&e));
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).unwrap_or_else(|e| fatal(&e.to_string()));
+    for client in listener.incoming() {
+        let Ok(mut client) = client else { continue };
+        let mut request = String::new();
+        if client.read_to_string(&mut request).is_err() {
+            continue;
+        }
+        if guest.write_all(request.trim_end().as_bytes()).is_err()
+            || guest.write_all(b"\n").is_err()
+        {
+            break;
+        }
+        let response = match read_frame(&mut guest) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let _ = client.write_all(&response);
+        if request.trim() == "stop" {
+            set_vm_status(&container, "exited");
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(socket);
+    set_vm_status(&container, "exited");
+}
+
+fn set_vm_status(id: &str, status: &str) {
+    let Ok(dir) = container_dir(id) else { return };
+    let path = dir.join("metadata.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    metadata["status"] = serde_json::json!(status);
+    let _ = crate::storage::atomic_write(&path, metadata.to_string().as_bytes());
+}
+
+fn find_vm_container(query: &str) -> Result<(String, PathBuf), String> {
+    let layout = crate::storage::StorageLayout::new().map_err(|e| e.to_string())?;
+    let root = layout.base.join("storage/overlay-containers");
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let metadata =
+            std::fs::read_to_string(entry.path().join("metadata.json")).unwrap_or_default();
+        let name_matches = serde_json::from_str::<serde_json::Value>(&metadata)
+            .ok()
+            .and_then(|m| m["name"].as_str().map(|n| n == query))
+            .unwrap_or(false);
+        if id.starts_with(query) || name_matches {
+            matches.push((id, entry.path()));
+        }
+    }
+    match matches.len() {
+        0 => Err(format!("container {query} not found")),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!("container identifier {query} is ambiguous")),
+    }
+}
+
+pub fn control(container: &str, request: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let (_, dir) = find_vm_container(container)?;
+    let mut stream = UnixStream::connect(dir.join("vm.sock"))
+        .map_err(|e| format!("container is not running: {e}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| e.to_string())?;
+    if !response.starts_with(b"EXIT 0\n") {
+        return Err(String::from_utf8_lossy(&response).trim().to_string());
+    }
+    Ok(response[7..].to_vec())
+}
+
+pub fn exec(container: &str, mut command: Vec<String>) -> Result<(), String> {
+    use std::io::Write;
+    if command.is_empty() {
+        command.push("/bin/sh".into());
+    }
+    let encoded = command
+        .iter()
+        .map(|arg| hex::encode(arg.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = control(container, &format!("exec {encoded}"))?;
+    std::io::stdout()
+        .write_all(&output)
+        .map_err(|e| e.to_string())
 }
 
 /// Interactive session: forward host stdin to the container and stream its
