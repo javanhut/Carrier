@@ -45,8 +45,27 @@ desc = "Checks the formatting in the files"
 run = ["cargo fmt --check"]
 
 [commands.install]
-desc = "Installs the package"
-run = ["cargo build --release", "sudo mv ./target/release/carrier /usr/local/bin/"]
+desc = "Installs the release build, signed with the Virtualization entitlement"
+run.darwin = [
+  "cargo build --release",
+  "bash macos/sign.sh target/release/carrier",
+  "sudo mv ./target/release/carrier /usr/local/bin/",
+]
+
+run.linux = [
+  "cargo build --release",
+  "sudo mv ./target/release/carrier /usr/local/bin/",
+]
+
+
+[commands.install-debug]
+desc = "Installs a debug build, signed with the Virtualization entitlement"
+alias = ["dev"]
+run = [
+  "cargo build",
+  "bash macos/sign.sh target/debug/carrier",
+  "sudo mv ./target/debug/carrier /usr/local/bin/",
+]
 
 [commands.uninstall]
 desc = "Uninstalls the package"
