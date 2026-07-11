@@ -101,11 +101,17 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), Box<dyn s
     let tmp_path = loop {
         let candidate = parent.join(format!(
             ".{}.tmp-{}-{}",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("carrier"),
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("carrier"),
             std::process::id(),
             attempt
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(mut file) => {
                 if let Err(error) = (|| -> std::io::Result<()> {
                     file.write_all(data)?;

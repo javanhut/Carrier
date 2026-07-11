@@ -22,17 +22,16 @@ use std::path::{Path, PathBuf};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
 use objc2::AllocAnyThread;
+use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSharedDirectory,
-    VZSingleDirectoryShare, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration,
+    VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment, VZLinuxBootLoader,
+    VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
 /// What to boot. Paths point at host files; the rootfs is a raw disk image
@@ -54,9 +53,7 @@ fn file_url(p: &Path) -> Retained<NSURL> {
 /// Build a `VZVirtualMachineConfiguration` for a Linux guest from `spec`.
 /// Touches the filesystem only to open the rootfs disk image (via the disk
 /// attachment); the kernel/initrd URLs are validated at boot, not here.
-pub fn build_config(
-    spec: &VmSpec,
-) -> Result<Retained<VZVirtualMachineConfiguration>, String> {
+pub fn build_config(spec: &VmSpec) -> Result<Retained<VZVirtualMachineConfiguration>, String> {
     // SAFETY: every call below is a plain Objective-C message send to a freshly
     // allocated, owned object; objc2 enforces the type signatures.
     unsafe {
@@ -84,9 +81,13 @@ pub fn build_config(
         cfg.setBootLoader(Some(&*boot)); // VZLinuxBootLoader derefs to VZBootLoader
 
         // Upcast the concrete configs to the abstract array element types.
-        cfg.setStorageDevices(&NSArray::from_retained_slice(&[Retained::into_super(block)]));
+        cfg.setStorageDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            block,
+        )]));
         let entropy = VZVirtioEntropyDeviceConfiguration::new();
-        cfg.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(entropy)]));
+        cfg.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            entropy,
+        )]));
 
         Ok(cfg)
     }
@@ -97,8 +98,7 @@ pub fn build_config(
 pub fn validate(spec: &VmSpec) -> Result<(), String> {
     let cfg = build_config(spec)?;
     // SAFETY: validateWithError: only reads the config; no preconditions.
-    unsafe { cfg.validateWithError() }
-        .map_err(|e| format!("invalid VM configuration: {e:?}"))
+    unsafe { cfg.validateWithError() }.map_err(|e| format!("invalid VM configuration: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +199,9 @@ fn provision() -> Result<(), String> {
             .map_err(|e| format!("spawn download: {e}"))?
             .success();
         // tar -O can write a partial file on failure; verify a real kernel landed.
-        let size = std::fs::metadata(kernel_path()).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(kernel_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         if !ok || size < 1_000_000 {
             let _ = std::fs::remove_file(kernel_path());
             return Err("kernel download/extract failed (need curl + zstd-capable tar)".into());
@@ -274,16 +276,23 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
                     .open(vm_dir().join("console.log"))
                     .map_err(|e| e.to_string())?
                     .into_raw_fd();
-                NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), log, true)
+                NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    log,
+                    true,
+                )
             };
-            let attach = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                VZFileHandleSerialPortAttachment::alloc(),
-                Some(&reader),
-                Some(&writer),
-            );
+            let attach =
+                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                    VZFileHandleSerialPortAttachment::alloc(),
+                    Some(&reader),
+                    Some(&writer),
+                );
             let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             serial.setAttachment(Some(&*attach));
-            cfg.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(serial)]));
+            cfg.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(
+                serial,
+            )]));
             cfg.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
                 VZVirtioEntropyDeviceConfiguration::new(),
             )]));
@@ -300,18 +309,16 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
                 &file_url(&bundle),
                 false,
             );
-            let share = VZSingleDirectoryShare::initWithDirectory(
-                VZSingleDirectoryShare::alloc(),
-                &shared,
-            );
+            let share =
+                VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
             let fsdev = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
                 &NSString::from_str("carrierbundle"),
             );
             fsdev.setShare(Some(&*share));
-            cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
-                Retained::into_super(fsdev),
-            ]));
+            cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+                fsdev,
+            )]));
             // NAT networking so the guest (and the container, which shares its
             // netns) can reach the internet (apt/curl/etc.).
             let net = VZVirtioNetworkDeviceConfiguration::new();
@@ -320,11 +327,8 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
             cfg.validateWithError()
                 .map_err(|e| format!("invalid VM config: {e:?}"))?;
 
-            let vm = VZVirtualMachine::initWithConfiguration_queue(
-                VZVirtualMachine::alloc(),
-                &cfg,
-                &q1,
-            );
+            let vm =
+                VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &cfg, &q1);
             let ptr = Retained::into_raw(vm) as usize; // leak: VM lives for the process
             let vm_ref = &*(ptr as *const VZVirtualMachine);
             let tx = start_tx.clone();
@@ -370,10 +374,13 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
             }
         };
         let tx = fd_tx.clone();
-        let handler =
-            RcBlock::new(move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+        let handler = RcBlock::new(
+            move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
                 if !err.is_null() {
-                    let _ = tx.send(Err(format!("vsock connect to port {port} failed: {:?}", &*err)));
+                    let _ = tx.send(Err(format!(
+                        "vsock connect to port {port} failed: {:?}",
+                        &*err
+                    )));
                     return;
                 }
                 // dup so the fd outlives the connection object.
@@ -383,7 +390,8 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
                 } else {
                     Err("dup vsock fd failed".into())
                 });
-            });
+            },
+        );
         dev.connectToPort_completionHandler(port, &handler);
     });
 
@@ -508,7 +516,7 @@ fn restore_raw_mode(orig: Option<libc::termios>) {
 /// which boot_and_connect shares into the guest via virtiofs.
 async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<(), String> {
     use crate::cli::RegistryImage;
-    use crate::storage::{apply_layer_rootless, atomic_write, StorageLayout};
+    use crate::storage::{StorageLayout, apply_layer_rootless, atomic_write};
 
     // 1. Pull into the shared blob cache (guest matches the host arch).
     crate::commands::pull_image(image.to_string(), Some(format!("linux/{}", guest_arch()))).await;
@@ -518,7 +526,8 @@ async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<()
     let layout = StorageLayout::new().map_err(|e| e.to_string())?;
     let meta = layout.image_metadata_path(&parsed.image, &parsed.tag);
     let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&meta).map_err(|e| format!("read manifest {}: {e}", meta.display()))?,
+        &std::fs::read_to_string(&meta)
+            .map_err(|e| format!("read manifest {}: {e}", meta.display()))?,
     )
     .map_err(|e| format!("parse manifest: {e}"))?;
     let layers = manifest["layers"]
@@ -551,7 +560,11 @@ async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<()
         .unwrap_or(serde_json::Value::Null);
     let strs = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let entrypoint = strs(&icfg["Entrypoint"]);
@@ -571,7 +584,10 @@ async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<()
     if !env.iter().any(|e| e.starts_with("TERM=")) {
         env.push("TERM=xterm".into()); // so clear/ncurses work under the PTY
     }
-    let cwd = icfg["WorkingDir"].as_str().filter(|s| !s.is_empty()).unwrap_or("/");
+    let cwd = icfg["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
     let config = bundle_config(&args, &env, cwd, tty);
 
     // Commit rootfs and config together with rollback to the previous rootfs if
@@ -600,9 +616,20 @@ async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<()
 
 /// Docker's default container capabilities.
 const DEFAULT_CAPS: [&str; 14] = [
-    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD",
-    "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP",
-    "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FSETID",
+    "CAP_FOWNER",
+    "CAP_MKNOD",
+    "CAP_NET_RAW",
+    "CAP_SETGID",
+    "CAP_SETUID",
+    "CAP_SETFCAP",
+    "CAP_SETPCAP",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SYS_CHROOT",
+    "CAP_KILL",
+    "CAP_AUDIT_WRITE",
 ];
 
 /// Minimal OCI runtime spec. `terminal` true makes runc allocate a PTY (for -it).
@@ -700,7 +727,9 @@ pub fn machine(action: crate::cli::MachineCmd) {
         // ponytail: foreground start forgets the VM handle, so there's nothing to
         // signal yet. Graceful stop arrives with the daemon/proxy (Phase 4).
         MachineCmd::Stop => {
-            eprintln!("carrier: stop the foreground `machine start` with Ctrl-C (daemon stop is Phase 4).");
+            eprintln!(
+                "carrier: stop the foreground `machine start` with Ctrl-C (daemon stop is Phase 4)."
+            );
             std::process::exit(1);
         }
     }
@@ -717,7 +746,6 @@ mod tests {
         assert!(kernel_path().starts_with(&dir));
         assert!(initrd_path().starts_with(&dir));
     }
-
 
     // Deterministic: proves the objc2-virtualization FFI path works end to end
     // (alloc, setters, return-value reads) with no files and no entitlement.

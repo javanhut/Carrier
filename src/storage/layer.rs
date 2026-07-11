@@ -12,10 +12,14 @@ fn open_archive(path: &Path) -> Result<Archive<GzDecoder<fs::File>>, Box<dyn std
     Ok(archive)
 }
 
-fn validate_entry(entry: &mut tar::Entry<'_, GzDecoder<fs::File>>) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_entry(
+    entry: &mut tar::Entry<'_, GzDecoder<fs::File>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = entry.path()?;
     if path.is_absolute()
-        || path.components().any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
     {
         return Err(format!("layer entry escapes destination: {}", path.display()).into());
     }
@@ -25,9 +29,16 @@ fn validate_entry(entry: &mut tar::Entry<'_, GzDecoder<fs::File>>) -> Result<(),
     }
     if let Some(target) = entry.link_name()? {
         if target.is_absolute()
-            || target.components().any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+            || target
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
         {
-            return Err(format!("unsafe link target in layer: {} -> {}", path.display(), target.display()).into());
+            return Err(format!(
+                "unsafe link target in layer: {} -> {}",
+                path.display(),
+                target.display()
+            )
+            .into());
         }
     }
     Ok(())
@@ -47,7 +58,9 @@ fn whiteout_target(path: &Path) -> Option<(bool, std::path::PathBuf)> {
 
 fn remove_path(path: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => fs::remove_dir_all(path),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)
+        }
         Ok(_) => fs::remove_file(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -56,7 +69,10 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 
 /// Apply an OCI layer on top of an existing root filesystem. Whiteout markers
 /// remove lower-layer paths and are never materialized in the result.
-pub fn apply_layer_rootless(tar_gz_path: &Path, rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn apply_layer_rootless(
+    tar_gz_path: &Path,
+    rootfs: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(rootfs)?;
 
     // Whiteouts must be processed before additions, independent of tar order.
@@ -87,19 +103,30 @@ pub fn apply_layer_rootless(tar_gz_path: &Path, rootfs: &Path) -> Result<(), Box
             continue;
         }
         if !entry.unpack_in(rootfs)? {
-            return Err(format!("layer entry escapes destination: {}", entry.path()?.display()).into());
+            return Err(format!(
+                "layer entry escapes destination: {}",
+                entry.path()?.display()
+            )
+            .into());
         }
     }
     Ok(())
 }
 
-fn extract_archive_rootless(tar_gz_path: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_archive_rootless(
+    tar_gz_path: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut archive = open_archive(tar_gz_path)?;
     for entry in archive.entries()? {
         let mut entry = entry?;
         validate_entry(&mut entry)?;
         if !entry.unpack_in(output)? {
-            return Err(format!("layer entry escapes destination: {}", entry.path()?.display()).into());
+            return Err(format!(
+                "layer entry escapes destination: {}",
+                entry.path()?.display()
+            )
+            .into());
         }
     }
     Ok(())
@@ -109,14 +136,19 @@ pub fn extract_layer_rootless(
     tar_gz_path: &Path,
     output_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parent = output_dir.parent().ok_or("layer output has no parent directory")?;
+    let parent = output_dir
+        .parent()
+        .ok_or("layer output has no parent directory")?;
     fs::create_dir_all(parent)?;
 
     // Extract beside the final directory and publish only after every entry has
     // succeeded. A failed extraction can never look like a cached layer.
     let temp_dir = parent.join(format!(
         ".{}.extracting-{}-{}",
-        output_dir.file_name().and_then(|n| n.to_str()).unwrap_or("layer"),
+        output_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("layer"),
         std::process::id(),
         rand::random::<u64>()
     ));
@@ -164,13 +196,18 @@ mod tests {
     fn extracts_regular_files_transactionally() {
         let dir = tempfile::tempdir().unwrap();
         let archive_path = dir.path().join("layer.tar.gz");
-        let encoder = GzEncoder::new(std::fs::File::create(&archive_path).unwrap(), Compression::default());
+        let encoder = GzEncoder::new(
+            std::fs::File::create(&archive_path).unwrap(),
+            Compression::default(),
+        );
         let mut archive = Builder::new(encoder);
         let mut header = Header::new_gnu();
         header.set_size(5);
         header.set_mode(0o644);
         header.set_cksum();
-        archive.append_data(&mut header, "hello.txt", &b"hello"[..]).unwrap();
+        archive
+            .append_data(&mut header, "hello.txt", &b"hello"[..])
+            .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
 
         let output = dir.path().join("layer");
@@ -183,14 +220,19 @@ mod tests {
     fn rejects_special_files_without_publishing_layer() {
         let dir = tempfile::tempdir().unwrap();
         let archive_path = dir.path().join("layer.tar.gz");
-        let encoder = GzEncoder::new(std::fs::File::create(&archive_path).unwrap(), Compression::default());
+        let encoder = GzEncoder::new(
+            std::fs::File::create(&archive_path).unwrap(),
+            Compression::default(),
+        );
         let mut archive = Builder::new(encoder);
         let mut header = Header::new_gnu();
         header.set_entry_type(EntryType::Fifo);
         header.set_size(0);
         header.set_mode(0o644);
         header.set_cksum();
-        archive.append_data(&mut header, "unsafe-fifo", std::io::empty()).unwrap();
+        archive
+            .append_data(&mut header, "unsafe-fifo", std::io::empty())
+            .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
 
         let output = dir.path().join("layer");
@@ -206,14 +248,22 @@ mod tests {
         let base = dir.path().join("base.tar.gz");
         archive_with_files(
             &base,
-            &[("remove-me", b"old"), ("etc/old", b"old"), ("etc/also-old", b"old")],
+            &[
+                ("remove-me", b"old"),
+                ("etc/old", b"old"),
+                ("etc/also-old", b"old"),
+            ],
         );
         let upper = dir.path().join("upper.tar.gz");
         // Put the opaque marker after the addition to verify tar ordering does
         // not cause the new file to be deleted.
         archive_with_files(
             &upper,
-            &[("etc/new", b"new"), (".wh.remove-me", b""), ("etc/.wh..wh..opq", b"")],
+            &[
+                ("etc/new", b"new"),
+                (".wh.remove-me", b""),
+                ("etc/.wh..wh..opq", b""),
+            ],
         );
 
         let rootfs = dir.path().join("rootfs");

@@ -53,7 +53,9 @@ async fn main() {
             // detach/name/volumes/ports/env aren't plumbed into the VM yet.
             #[cfg(target_os = "macos")]
             {
-                let _ = (detach, name, elevated, volumes, ports, env, platform, verbose);
+                let _ = (
+                    detach, name, elevated, volumes, ports, env, platform, verbose,
+                );
                 backend::run_in_vm(image, command, interactive, tty).await;
             }
             #[cfg(not(target_os = "macos"))]
@@ -176,8 +178,17 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Doctor { fix, json, all, dry_run, yes, verbose } => {
-            use deps::installer::{install_all, install_missing, print_install_summary, InstallOptions};
+        Commands::Doctor {
+            fix,
+            json,
+            all,
+            dry_run,
+            yes,
+            verbose,
+        } => {
+            use deps::installer::{
+                InstallOptions, install_all, install_missing, print_install_summary,
+            };
             use deps::platform::detect_platform;
 
             let platform = detect_platform();

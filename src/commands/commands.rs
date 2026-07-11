@@ -1,6 +1,8 @@
 use crate::cli::RegistryImage;
 use crate::storage::StorageLayout;
-use crate::storage::{atomic_write, ContainerStorage, extract_layer_rootless, generate_container_id};
+use crate::storage::{
+    ContainerStorage, atomic_write, extract_layer_rootless, generate_container_id,
+};
 use std::io::{self, Write};
 
 fn get_runc_root() -> String {
@@ -130,7 +132,11 @@ fn validate_digest(digest: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 fn validate_manifest(manifest: ManifestV2) -> Result<ManifestV2, Box<dyn std::error::Error>> {
     if manifest.schema_version != 2 {
-        return Err(format!("Unsupported manifest schema version {}", manifest.schema_version).into());
+        return Err(format!(
+            "Unsupported manifest schema version {}",
+            manifest.schema_version
+        )
+        .into());
     }
     if manifest.config.size < 0 || manifest.layers.iter().any(|layer| layer.size < 0) {
         return Err("Manifest contains a negative blob size".into());
@@ -359,16 +365,21 @@ pub async fn run_image(
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to parse manifest: {}", e);
-                return;
-            }
-        };
+    let manifest = match parse_and_get_manifest(
+        &manifest_json,
+        &parsed_image,
+        &token,
+        platform.as_deref(),
+        verbose,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to parse manifest: {}", e);
+            return;
+        }
+    };
 
     // Save the actual manifest (not the manifest list) as metadata
     // Calculate and cache total image size for faster listing
@@ -384,10 +395,13 @@ pub async fn run_image(
     if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
         map.insert("cached_size".to_string(), serde_json::json!(cached_size));
     }
-    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
+    let manifest_to_save =
+        serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose)
+            .await
+        {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -628,16 +642,21 @@ pub async fn run_image_with_command(
     };
 
     // Parse manifest - handle both manifest list and single manifest
-    let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), verbose)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to parse manifest: {}", e);
-                return;
-            }
-        };
+    let manifest = match parse_and_get_manifest(
+        &manifest_json,
+        &parsed_image,
+        &token,
+        platform.as_deref(),
+        verbose,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to parse manifest: {}", e);
+            return;
+        }
+    };
 
     // Prepare metadata, but publish it only after every layer is complete.
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
@@ -645,7 +664,9 @@ pub async fn run_image_with_command(
 
     // Download layers with progress using storage
     let layer_paths =
-        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
+        match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose)
+            .await
+        {
             Ok(paths) => paths,
             Err(e) => {
                 eprintln!("Failed to download layers: {}", e);
@@ -757,11 +778,19 @@ async fn exec_elevated_container(
                         .stderr(Stdio::inherit())
                         .spawn()
                         .map_err(|error| {
-                            format!("PTY execution failed ({pty_error}); fallback spawn failed: {error}")
+                            format!(
+                                "PTY execution failed ({pty_error}); fallback spawn failed: {error}"
+                            )
                         })?;
-                    child.wait().map_err(|error| {
-                        format!("PTY execution failed ({pty_error}); fallback wait failed: {error}")
-                    })?.code().unwrap_or(1)
+                    child
+                        .wait()
+                        .map_err(|error| {
+                            format!(
+                                "PTY execution failed ({pty_error}); fallback wait failed: {error}"
+                            )
+                        })?
+                        .code()
+                        .unwrap_or(1)
                 }
             };
 
@@ -1636,16 +1665,21 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
 
     // Parse manifest - handle both manifest list and single manifest
     // Pull always shows verbose output since user explicitly requested pull
-    let manifest =
-        match parse_and_get_manifest(&manifest_json, &parsed_image, &token, platform.as_deref(), true)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to parse manifest: {}", e);
-                return;
-            }
-        };
+    let manifest = match parse_and_get_manifest(
+        &manifest_json,
+        &parsed_image,
+        &token,
+        platform.as_deref(),
+        true,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to parse manifest: {}", e);
+            return;
+        }
+    };
 
     // Save the actual manifest (not the manifest list) as metadata
     // Calculate and cache total image size for faster listing
@@ -1661,9 +1695,12 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
     if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
         map.insert("cached_size".to_string(), serde_json::json!(cached_size));
     }
-    let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
+    let manifest_to_save =
+        serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
     // Download layers with progress using storage - always verbose for explicit pull
-    if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage, true).await {
+    if let Err(e) =
+        download_layers_with_storage(&manifest, &parsed_image, &token, &storage, true).await
+    {
         eprintln!("Failed to download layers: {}", e);
         return;
     }
@@ -1739,7 +1776,9 @@ async fn parse_and_get_manifest(
             .manifests
             .iter()
             .find(|m| m.platform.os == want_os && m.platform.architecture == want_arch)
-            .ok_or_else(|| format!("Image does not provide requested platform {want_os}/{want_arch}"))?;
+            .ok_or_else(|| {
+                format!("Image does not provide requested platform {want_os}/{want_arch}")
+            })?;
         validate_digest(&selected_manifest.digest)?;
 
         if verbose {
@@ -1895,7 +1934,9 @@ async fn download_layers_with_storage(
                 let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer_digest);
 
                 let clean_digest = layer_digest.replace(":", "_");
-                let blob_cache = storage_base.join("cache/blobs").join(format!("{}.tar.gz", &clean_digest));
+                let blob_cache = storage_base
+                    .join("cache/blobs")
+                    .join(format!("{}.tar.gz", &clean_digest));
                 if let Err(e) = download_blob_with_progress(
                     &client,
                     &blob_url,
@@ -1952,7 +1993,10 @@ async fn download_layers_with_storage(
     if !layers_needing_extraction.is_empty() {
         let total_layers = manifest.layers.len();
         if verbose {
-            println!("Extracting {} layers in parallel...", layers_needing_extraction.len());
+            println!(
+                "Extracting {} layers in parallel...",
+                layers_needing_extraction.len()
+            );
         }
 
         let mut extraction_handles = Vec::new();
@@ -1979,11 +2023,7 @@ async fn download_layers_with_storage(
             match handle.await {
                 Ok(Ok((idx, _))) => {
                     if verbose {
-                        println!(
-                            "Extracted layer {}/{}",
-                            idx + 1,
-                            total_layers
-                        );
+                        println!("Extracted layer {}/{}", idx + 1, total_layers);
                     }
                 }
                 Ok(Err(e)) => {
@@ -2064,11 +2104,16 @@ async fn download_blob_with_progress(
             }
         }
 
-        let parent = destination.parent().ok_or("blob destination has no parent")?;
+        let parent = destination
+            .parent()
+            .ok_or("blob destination has no parent")?;
         tokio::fs::create_dir_all(parent).await?;
         let temporary = parent.join(format!(
             ".{}.download-{}-{}",
-            destination.file_name().and_then(|name| name.to_str()).unwrap_or("blob"),
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("blob"),
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -2088,7 +2133,9 @@ async fn download_blob_with_progress(
                     return Err(error.into());
                 }
             };
-            downloaded = downloaded.checked_add(chunk.len() as u64).ok_or("blob size overflow")?;
+            downloaded = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or("blob size overflow")?;
             if expected_size > 0 && downloaded > expected_size {
                 let _ = tokio::fs::remove_file(&temporary).await;
                 return Err(format!("Blob exceeded declared size of {expected_size} bytes").into());
@@ -2118,7 +2165,10 @@ async fn download_blob_with_progress(
 
         if expected_size > 0 && downloaded != expected_size {
             let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(format!("Blob size mismatch: expected {expected_size}, received {downloaded}").into());
+            return Err(format!(
+                "Blob size mismatch: expected {expected_size}, received {downloaded}"
+            )
+            .into());
         }
 
         // Verify digest if provided as sha256
@@ -2127,7 +2177,10 @@ async fn download_blob_with_progress(
             let actual_hex = hex::encode(actual);
             if actual_hex != hex_expected {
                 if let Some(ref pb) = pb {
-                    pb.finish_with_message(format!("[FAILED] digest mismatch for {}", &digest[..12]));
+                    pb.finish_with_message(format!(
+                        "[FAILED] digest mismatch for {}",
+                        &digest[..12]
+                    ));
                 }
                 attempt += 1;
                 if attempt >= max_attempts {
@@ -2380,7 +2433,9 @@ async fn run_container_with_storage(
                     || command[0] == "bash")))
     {
         if verbose {
-            println!("No persistent command specified for detached container, using 'sleep infinity'");
+            println!(
+                "No persistent command specified for detached container, using 'sleep infinity'"
+            );
         }
         command = vec!["sleep".to_string(), "infinity".to_string()];
     }
@@ -2471,8 +2526,12 @@ async fn run_container_with_storage(
 
     // Wait for both to complete
     let (meta_result, dirs_result) = tokio::join!(meta_task, dirs_task);
-    meta_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-    dirs_result.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    meta_result
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    dirs_result
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     // Execute in container environment with proper isolation
     if verbose {
@@ -2537,8 +2596,12 @@ async fn run_container_with_storage(
             wd_clone,
             !elevated,
             &volumes_clone,
-        ).map_err(|e| e.to_string())
-    }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
 
     if detach {
         // Detached mode: runc create + start
@@ -2722,7 +2785,11 @@ async fn run_container_with_storage(
         let result = exec_cmd.status();
 
         // If TTY allocation failed, retry without -t
-        if result.as_ref().map(|s| s.code() == Some(255)).unwrap_or(false) {
+        if result
+            .as_ref()
+            .map(|s| s.code() == Some(255))
+            .unwrap_or(false)
+        {
             eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
             let mut retry_cmd = Command::new("runc");
             retry_cmd
@@ -2887,7 +2954,10 @@ use std::sync::OnceLock;
 static SUBID_CACHE: OnceLock<(Option<(u32, u32)>, Option<(u32, u32)>)> = OnceLock::new();
 
 /// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid (with caching)
-fn read_subid_mappings(file_path: &str, username: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+fn read_subid_mappings(
+    file_path: &str,
+    username: &str,
+) -> Result<(u32, u32), Box<dyn std::error::Error>> {
     use std::fs;
 
     let content = fs::read_to_string(file_path)?;
@@ -2962,7 +3032,9 @@ fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_jso
 fn validate_container_path(path: &str, field: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(path);
     if !path.is_absolute()
-        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
     {
         return Err(format!("{field} must be an absolute container path without '..'").into());
     }
@@ -2972,7 +3044,9 @@ fn validate_container_path(path: &str, field: &str) -> Result<(), Box<dyn std::e
 fn parse_volume_spec(spec: &str) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = spec.split(':').collect();
     if !(2..=3).contains(&parts.len()) || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(format!("Invalid volume '{spec}'; expected HOST_PATH:CONTAINER_PATH[:ro|rw]").into());
+        return Err(
+            format!("Invalid volume '{spec}'; expected HOST_PATH:CONTAINER_PATH[:ro|rw]").into(),
+        );
     }
     let host_path = parts[0].to_string();
     let container_path = parts[1].to_string();
@@ -2987,22 +3061,35 @@ fn parse_volume_spec(spec: &str) -> Result<(String, String, bool), Box<dyn std::
 
 /// Parse a port mapping specification (host_port:container_port or host_port:container_port/protocol)
 fn parse_port_spec(spec: &str) -> Result<(u16, u16, String), Box<dyn std::error::Error>> {
-    let (host, container) = spec
-        .split_once(':')
-        .ok_or_else(|| format!("Invalid port mapping '{spec}'; expected HOST_PORT:CONTAINER_PORT[/tcp]"))?;
+    let (host, container) = spec.split_once(':').ok_or_else(|| {
+        format!("Invalid port mapping '{spec}'; expected HOST_PORT:CONTAINER_PORT[/tcp]")
+    })?;
     if container.contains(':') {
         return Err(format!("Invalid port mapping '{spec}'; too many ':' separators").into());
     }
-    let host_port: u16 = host.parse().map_err(|_| format!("Invalid host port in '{spec}'"))?;
+    let host_port: u16 = host
+        .parse()
+        .map_err(|_| format!("Invalid host port in '{spec}'"))?;
 
     // Check for protocol specification (e.g., 80/tcp)
     let (container_port, protocol) = if let Some((port, protocol)) = container.split_once('/') {
         if protocol != "tcp" {
-            return Err(format!("Unsupported port protocol '{protocol}'; only tcp is supported").into());
+            return Err(
+                format!("Unsupported port protocol '{protocol}'; only tcp is supported").into(),
+            );
         }
-        (port.parse().map_err(|_| format!("Invalid container port in '{spec}'"))?, protocol.to_string())
+        (
+            port.parse()
+                .map_err(|_| format!("Invalid container port in '{spec}'"))?,
+            protocol.to_string(),
+        )
     } else {
-        (container.parse().map_err(|_| format!("Invalid container port in '{spec}'"))?, "tcp".to_string())
+        (
+            container
+                .parse()
+                .map_err(|_| format!("Invalid container port in '{spec}'"))?,
+            "tcp".to_string(),
+        )
     };
     if host_port == 0 || container_port == 0 {
         return Err("Port zero is not valid for an explicit mapping".into());
@@ -3011,9 +3098,13 @@ fn parse_port_spec(spec: &str) -> Result<(u16, u16, String), Box<dyn std::error:
 }
 
 fn validate_environment_spec(spec: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (key, _) = spec.split_once('=').ok_or_else(|| format!("Invalid environment value '{spec}'; expected KEY=VALUE"))?;
+    let (key, _) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("Invalid environment value '{spec}'; expected KEY=VALUE"))?;
     let mut chars = key.chars();
-    if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+    if !chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
         || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
         return Err(format!("Invalid environment variable name '{key}'").into());
@@ -3021,7 +3112,11 @@ fn validate_environment_spec(spec: &str) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn validate_runtime_inputs(volumes: &[String], ports: &[String], env: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_runtime_inputs(
+    volumes: &[String],
+    ports: &[String],
+    env: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     for volume in volumes {
         let (source, _, _) = parse_volume_spec(volume)?;
         let source = if Path::new(&source).is_absolute() {
@@ -3116,28 +3211,28 @@ fn generate_oci_config(
     // Add user-specified volume mounts
     for vol_spec in volumes {
         let (host_path, container_path, readonly) = parse_volume_spec(vol_spec)?;
-            // Resolve to absolute path
-            let abs_host_path = if host_path.starts_with('/') {
-                PathBuf::from(&host_path)
-            } else {
-                std::env::current_dir()?.join(&host_path)
-            };
+        // Resolve to absolute path
+        let abs_host_path = if host_path.starts_with('/') {
+            PathBuf::from(&host_path)
+        } else {
+            std::env::current_dir()?.join(&host_path)
+        };
 
-            let abs_host_path = abs_host_path.canonicalize()?;
+        let abs_host_path = abs_host_path.canonicalize()?;
 
-            let mut options = vec!["rbind".to_string()];
-            if readonly {
-                options.push("ro".to_string());
-            } else {
-                options.push("rw".to_string());
-            }
+        let mut options = vec!["rbind".to_string()];
+        if readonly {
+            options.push("ro".to_string());
+        } else {
+            options.push("rw".to_string());
+        }
 
-            mounts.push(serde_json::json!({
-                "destination": container_path,
-                "type": "bind",
-                "source": abs_host_path.to_string_lossy(),
-                "options": options
-            }));
+        mounts.push(serde_json::json!({
+            "destination": container_path,
+            "type": "bind",
+            "source": abs_host_path.to_string_lossy(),
+            "options": options
+        }));
     }
 
     let config = serde_json::json!({
@@ -3172,10 +3267,12 @@ fn generate_oci_config(
         }
     });
 
-    atomic_write(config_path, serde_json::to_string_pretty(&config)?.as_bytes())?;
+    atomic_write(
+        config_path,
+        serde_json::to_string_pretty(&config)?.as_bytes(),
+    )?;
     Ok(())
 }
-
 
 /// Set up network for an existing container if not already configured
 fn setup_container_network_if_needed(
@@ -3229,9 +3326,11 @@ fn setup_container_network_with_ports(
     // Add port forwards
     for port_spec in ports {
         let (host_port, container_port, _protocol) = parse_port_spec(port_spec)?;
-            // slirp4netns uses format: host_port:guest_port
-            slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
-            println!("Port mapping: {} -> {}", host_port, container_port);
+        // slirp4netns uses format: host_port:guest_port
+        slirp_cmd
+            .arg("-p")
+            .arg(format!("{}:{}", host_port, container_port));
+        println!("Port mapping: {} -> {}", host_port, container_port);
     }
 
     slirp_cmd
@@ -3248,7 +3347,9 @@ fn setup_container_network_with_ports(
             let _ = atomic_write(&network_pid_file, slirp_pid.to_string().as_bytes());
         }
         Err(error) => {
-            eprintln!("Warning: failed to start slirp4netns: {error}; container networking is unavailable");
+            eprintln!(
+                "Warning: failed to start slirp4netns: {error}; container networking is unavailable"
+            );
         }
     }
 
@@ -3702,7 +3803,10 @@ mod tests {
             assert!(validate_container_name(valid).is_ok());
         }
         for invalid in ["", "../escape", ".hidden", "name/child", "has space"] {
-            assert!(validate_container_name(invalid).is_err(), "accepted {invalid}");
+            assert!(
+                validate_container_name(invalid).is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 
@@ -3716,7 +3820,10 @@ mod tests {
         assert!(parse_volume_spec("./data:/srv/../escape").is_err());
         assert!(parse_volume_spec("./data:/srv:cached").is_err());
 
-        assert_eq!(parse_port_spec("8080:80/tcp").unwrap(), (8080, 80, "tcp".into()));
+        assert_eq!(
+            parse_port_spec("8080:80/tcp").unwrap(),
+            (8080, 80, "tcp".into())
+        );
         for invalid in ["80", "0:80", "8080:0", "8080:80/udp", "a:80", "80:81:82"] {
             assert!(parse_port_spec(invalid).is_err(), "accepted {invalid}");
         }
@@ -3725,7 +3832,10 @@ mod tests {
             assert!(validate_environment_spec(valid).is_ok());
         }
         for invalid in ["KEY", "1KEY=value", "BAD-NAME=value", "=value"] {
-            assert!(validate_environment_spec(invalid).is_err(), "accepted {invalid}");
+            assert!(
+                validate_environment_spec(invalid).is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 

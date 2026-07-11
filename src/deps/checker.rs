@@ -1,5 +1,7 @@
-use crate::deps::installer::{attempt_install, InstallOptions};
-use crate::deps::platform::{command_exists, detect_platform, get_command_version, PackageManager, Platform};
+use crate::deps::installer::{InstallOptions, attempt_install};
+use crate::deps::platform::{
+    PackageManager, Platform, command_exists, detect_platform, get_command_version,
+};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -35,11 +37,25 @@ impl CheckResult {
     }
 
     pub fn is_error(&self) -> bool {
-        matches!(self, CheckResult::Missing { .. } | CheckResult::Unavailable { reason: _, alternative: None })
+        matches!(
+            self,
+            CheckResult::Missing { .. }
+                | CheckResult::Unavailable {
+                    reason: _,
+                    alternative: None
+                }
+        )
     }
 
     pub fn is_warning(&self) -> bool {
-        matches!(self, CheckResult::Misconfigured { .. } | CheckResult::Unavailable { reason: _, alternative: Some(_) })
+        matches!(
+            self,
+            CheckResult::Misconfigured { .. }
+                | CheckResult::Unavailable {
+                    reason: _,
+                    alternative: Some(_)
+                }
+        )
     }
 }
 
@@ -72,7 +88,9 @@ impl DependencyCheck {
     }
 }
 
-fn create_install_map(entries: &[(&[PackageManager], &[&'static str])]) -> HashMap<PackageManager, Vec<&'static str>> {
+fn create_install_map(
+    entries: &[(&[PackageManager], &[&'static str])],
+) -> HashMap<PackageManager, Vec<&'static str>> {
     let mut map = HashMap::new();
     for (pms, packages) in entries {
         for pm in *pms {
@@ -111,7 +129,10 @@ pub fn get_all_checks() -> Vec<(DependencyCheck, Box<dyn Fn(&Platform) -> CheckR
                 alternatives: vec!["native overlay (kernel 5.11+)", "VFS (slower)"],
                 install_packages: create_install_map(&[
                     (&[PackageManager::Apt], &["fuse-overlayfs"]),
-                    (&[PackageManager::Dnf, PackageManager::Yum], &["fuse-overlayfs"]),
+                    (
+                        &[PackageManager::Dnf, PackageManager::Yum],
+                        &["fuse-overlayfs"],
+                    ),
                     (&[PackageManager::Pacman], &["fuse-overlayfs"]),
                     (&[PackageManager::Zypper], &["fuse-overlayfs"]),
                     (&[PackageManager::Apk], &["fuse-overlayfs"]),
@@ -178,7 +199,10 @@ pub fn get_all_checks() -> Vec<(DependencyCheck, Box<dyn Fn(&Platform) -> CheckR
                 alternatives: vec!["pasta"],
                 install_packages: create_install_map(&[
                     (&[PackageManager::Apt], &["slirp4netns"]),
-                    (&[PackageManager::Dnf, PackageManager::Yum], &["slirp4netns"]),
+                    (
+                        &[PackageManager::Dnf, PackageManager::Yum],
+                        &["slirp4netns"],
+                    ),
                     (&[PackageManager::Pacman], &["slirp4netns"]),
                     (&[PackageManager::Zypper], &["slirp4netns"]),
                     (&[PackageManager::Apk], &["slirp4netns"]),
@@ -214,7 +238,10 @@ pub fn get_all_checks() -> Vec<(DependencyCheck, Box<dyn Fn(&Platform) -> CheckR
                 alternatives: vec!["single-UID mode (limited functionality)"],
                 install_packages: create_install_map(&[
                     (&[PackageManager::Apt], &["uidmap"]),
-                    (&[PackageManager::Dnf, PackageManager::Yum], &["shadow-utils"]),
+                    (
+                        &[PackageManager::Dnf, PackageManager::Yum],
+                        &["shadow-utils"],
+                    ),
                     (&[PackageManager::Pacman], &["shadow"]),
                     (&[PackageManager::Zypper], &["shadow"]),
                     (&[PackageManager::Apk], &["shadow"]),
@@ -322,7 +349,12 @@ fn check_dev_fuse(platform: &Platform) -> CheckResult {
 }
 
 fn check_fusermount3() -> CheckResult {
-    let paths = ["/usr/bin/fusermount3", "/usr/bin/fusermount", "/bin/fusermount3", "/bin/fusermount"];
+    let paths = [
+        "/usr/bin/fusermount3",
+        "/usr/bin/fusermount",
+        "/bin/fusermount3",
+        "/bin/fusermount",
+    ];
 
     for path in &paths {
         if Path::new(path).exists() {
@@ -450,7 +482,8 @@ fn check_user_namespaces() -> CheckResult {
         Ok(output) if output.status.success() => CheckResult::Ok { version: None },
         _ => CheckResult::Misconfigured {
             issue: "Cannot create user namespaces".to_string(),
-            fix: "Enable CONFIG_USER_NS in kernel or sysctl kernel.unprivileged_userns_clone=1".to_string(),
+            fix: "Enable CONFIG_USER_NS in kernel or sysctl kernel.unprivileged_userns_clone=1"
+                .to_string(),
         },
     }
 }
@@ -466,11 +499,19 @@ fn check_subuid() -> CheckResult {
                 if parts.len() >= 3 {
                     if let Ok(count) = parts[2].parse::<u32>() {
                         if count >= 65536 {
-                            return CheckResult::Ok { version: Some(format!("{} UIDs", count)) };
+                            return CheckResult::Ok {
+                                version: Some(format!("{} UIDs", count)),
+                            };
                         } else {
                             return CheckResult::Misconfigured {
-                                issue: format!("Only {} subordinate UIDs configured (65536 recommended)", count),
-                                fix: format!("sudo usermod --add-subuids 100000-165535 {}", username),
+                                issue: format!(
+                                    "Only {} subordinate UIDs configured (65536 recommended)",
+                                    count
+                                ),
+                                fix: format!(
+                                    "sudo usermod --add-subuids 100000-165535 {}",
+                                    username
+                                ),
                             };
                         }
                     }
@@ -499,11 +540,19 @@ fn check_subgid() -> CheckResult {
                 if parts.len() >= 3 {
                     if let Ok(count) = parts[2].parse::<u32>() {
                         if count >= 65536 {
-                            return CheckResult::Ok { version: Some(format!("{} GIDs", count)) };
+                            return CheckResult::Ok {
+                                version: Some(format!("{} GIDs", count)),
+                            };
                         } else {
                             return CheckResult::Misconfigured {
-                                issue: format!("Only {} subordinate GIDs configured (65536 recommended)", count),
-                                fix: format!("sudo usermod --add-subgids 100000-165535 {}", username),
+                                issue: format!(
+                                    "Only {} subordinate GIDs configured (65536 recommended)",
+                                    count
+                                ),
+                                fix: format!(
+                                    "sudo usermod --add-subgids 100000-165535 {}",
+                                    username
+                                ),
                             };
                         }
                     }
@@ -561,8 +610,15 @@ pub async fn run_doctor(fix: bool, json: bool) {
         // Count results
         match &result {
             CheckResult::Ok { .. } => passed += 1,
-            CheckResult::Misconfigured { .. } | CheckResult::Unavailable { alternative: Some(_), .. } => warnings += 1,
-            CheckResult::Missing { .. } | CheckResult::Unavailable { alternative: None, .. } => errors += 1,
+            CheckResult::Misconfigured { .. }
+            | CheckResult::Unavailable {
+                alternative: Some(_),
+                ..
+            } => warnings += 1,
+            CheckResult::Missing { .. }
+            | CheckResult::Unavailable {
+                alternative: None, ..
+            } => errors += 1,
         }
 
         // Attempt fix if requested
@@ -610,7 +666,10 @@ fn print_human_report(
     for (name, _category, result, fix_result) in results {
         let status = match result {
             CheckResult::Ok { version } => {
-                let ver_str = version.as_ref().map(|v| format!(" ({})", v)).unwrap_or_default();
+                let ver_str = version
+                    .as_ref()
+                    .map(|v| format!(" ({})", v))
+                    .unwrap_or_default();
                 format!("[OK] {}{}", name, ver_str)
             }
             CheckResult::Missing { suggestion } => {
@@ -619,8 +678,12 @@ fn print_human_report(
             CheckResult::Misconfigured { issue, fix } => {
                 format!("[WARN] {} - {}\n       Fix: {}", name, issue, fix)
             }
-            CheckResult::Unavailable { reason, alternative } => {
-                let alt_str = alternative.as_ref()
+            CheckResult::Unavailable {
+                reason,
+                alternative,
+            } => {
+                let alt_str = alternative
+                    .as_ref()
                     .map(|a| format!("\n       Alternative: {}", a))
                     .unwrap_or_default();
                 format!("[WARN] {} - {}{}", name, reason, alt_str)
@@ -646,7 +709,10 @@ fn print_human_report(
 
     // Summary
     println!("\n------------------------");
-    println!("Summary: {} passed, {} warnings, {} errors", passed, warnings, errors);
+    println!(
+        "Summary: {} passed, {} warnings, {} errors",
+        passed, warnings, errors
+    );
 
     if errors > 0 || warnings > 0 {
         println!("\nRun 'carrier doctor --fix' to attempt automatic fixes.");
@@ -700,5 +766,8 @@ fn print_json_report(
         }
     });
 
-    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
 }

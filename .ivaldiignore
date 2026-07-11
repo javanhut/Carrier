@@ -13,3 +13,4 @@ vmagent/build/
 .DS_Store
 /vmagent/artifacts
 vmagent/artifacts/
+.lazy/

@@ -35,3 +35,14 @@ run = ["echo Hello from imlazy!"]
 # run.linux = ["go build -o app"]
 # run.darwin = ["go build -o app"]
 # run.windows = ["go build -o app.exe"]
+
+[commands.check]
+run = ["cargo fmt --check"]
+
+
+[commands.format]
+alias = ["fmt"]
+run = ["cargo fmt"]
+
+[commands.test]
+run  = ["cargo test"]

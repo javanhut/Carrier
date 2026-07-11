@@ -107,8 +107,14 @@ impl ContainerStorage {
         image_layers: Vec<PathBuf>,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // Use overlay-containers to match StorageLayout paths used by commands
-        let persist_container = self.persistent_dir.join("overlay-containers").join(container_id);
-        let run_container = self.runtime_dir.join("overlay-containers").join(container_id);
+        let persist_container = self
+            .persistent_dir
+            .join("overlay-containers")
+            .join(container_id);
+        let run_container = self
+            .runtime_dir
+            .join("overlay-containers")
+            .join(container_id);
         let upper_dir = persist_container.join("upper");
         let work_dir = persist_container.join("work");
         let merged_dir = run_container.join("merged");
@@ -422,7 +428,6 @@ impl ContainerStorage {
         Ok(())
     }
 
-
     fn copy_recursive(&self, src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::copy;
 
@@ -576,7 +581,14 @@ fn try_install_fuse3() -> Result<(), Box<dyn std::error::Error>> {
     } else if Path::new("/usr/bin/pacman").exists() {
         // Arch Linux
         let install = Command::new("sudo")
-            .args(&["-n", "pacman", "-S", "--noconfirm", "fuse3", "fuse-overlayfs"])
+            .args(&[
+                "-n",
+                "pacman",
+                "-S",
+                "--noconfirm",
+                "fuse3",
+                "fuse-overlayfs",
+            ])
             .status();
 
         if install.is_ok() && install.unwrap().success() {
@@ -627,9 +639,7 @@ pub fn preflight_rootless_checks() {
         use std::os::unix::fs::MetadataExt;
         let mode = meta.mode();
         if mode & 0o4000 == 0 {
-            eprintln!(
-                "Warning: fusermount3 is not setuid. Rootless FUSE may fail."
-            );
+            eprintln!("Warning: fusermount3 is not setuid. Rootless FUSE may fail.");
             eprintln!("Attempting to set setuid bit...");
 
             let status = Command::new("sudo")

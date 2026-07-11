@@ -1,4 +1,4 @@
-use clap::{error::Result, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum, error::Result};
 pub use clap_complete::Shell;
 
 #[derive(Parser)]
@@ -307,14 +307,15 @@ impl RegistryImage {
         // Split image and tag
         let last_slash = image_and_tag.rfind('/');
         let last_colon = image_and_tag.rfind(':');
-        let (image, tag) = if last_colon.is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash)) {
-            let colon = last_colon.unwrap();
-            let (img, tagged) = image_and_tag.split_at(colon);
-            let t = &tagged[1..];
-            (img.to_string(), t.to_string())
-        } else {
-            (image_and_tag.to_string(), "latest".to_string())
-        };
+        let (image, tag) =
+            if last_colon.is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash)) {
+                let colon = last_colon.unwrap();
+                let (img, tagged) = image_and_tag.split_at(colon);
+                let t = &tagged[1..];
+                (img.to_string(), t.to_string())
+            } else {
+                (image_and_tag.to_string(), "latest".to_string())
+            };
 
         // Validate image name
         if image.is_empty() {
@@ -324,9 +325,7 @@ impl RegistryImage {
             return Err("Image tag must contain between 1 and 128 characters".to_string());
         }
         if !tag.chars().enumerate().all(|(index, ch)| {
-            ch.is_ascii_alphanumeric()
-                || ch == '_'
-                || ((ch == '-' || ch == '.') && index > 0)
+            ch.is_ascii_alphanumeric() || ch == '_' || ((ch == '-' || ch == '.') && index > 0)
         }) {
             return Err("Image tag contains invalid characters".to_string());
         }
@@ -334,7 +333,9 @@ impl RegistryImage {
             part.is_empty()
                 || part.starts_with(['.', '-'])
                 || part.ends_with(['.', '-'])
-                || !part.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+                || !part.chars().all(|ch| {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+                })
         }) {
             return Err("Image name contains an invalid repository component".to_string());
         }
@@ -393,8 +394,18 @@ mod tests {
 
     #[test]
     fn rejects_malformed_image_references() {
-        for reference in ["UPPER/image", "image:", "image:-bad", "owner//image", "image@sha256:abc", "bad image"] {
-            assert!(RegistryImage::parse(reference).is_err(), "accepted {reference}");
+        for reference in [
+            "UPPER/image",
+            "image:",
+            "image:-bad",
+            "owner//image",
+            "image@sha256:abc",
+            "bad image",
+        ] {
+            assert!(
+                RegistryImage::parse(reference).is_err(),
+                "accepted {reference}"
+            );
         }
     }
 

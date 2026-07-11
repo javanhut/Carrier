@@ -3,8 +3,8 @@ mod layout;
 mod overlay;
 
 pub use layer::{apply_layer_rootless, extract_layer_rootless};
-pub use layout::{atomic_write, StorageLayout};
-pub use overlay::{preflight_rootless_checks, ContainerStorage, StorageDriver};
+pub use layout::{StorageLayout, atomic_write};
+pub use overlay::{ContainerStorage, StorageDriver, preflight_rootless_checks};
 
 // Helper function for generating container IDs
 pub fn generate_container_id() -> String {

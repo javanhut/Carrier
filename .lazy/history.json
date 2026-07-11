@@ -1,0 +1,26 @@
+[
+  {
+    "command": "format",
+    "args": null,
+    "timestamp": "2026-07-11T15:53:32.131604-03:00",
+    "exit_code": 1
+  },
+  {
+    "command": "format",
+    "args": null,
+    "timestamp": "2026-07-11T15:53:55.263326-03:00",
+    "exit_code": 1
+  },
+  {
+    "command": "format",
+    "args": null,
+    "timestamp": "2026-07-11T15:55:34.184346-03:00",
+    "exit_code": 0
+  },
+  {
+    "command": "check",
+    "args": null,
+    "timestamp": "2026-07-11T15:55:42.964109-03:00",
+    "exit_code": 0
+  }
+]

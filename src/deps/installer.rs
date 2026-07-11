@@ -1,9 +1,9 @@
 use crate::deps::checker::{CheckResult, DependencyCheck, get_all_checks};
-use crate::deps::platform::{command_exists, PackageManager, Platform};
+use crate::deps::platform::{PackageManager, Platform, command_exists};
 use std::io::{self, Write};
 use std::process::Command;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 /// ANSI color codes for terminal output
 struct Colors;
@@ -52,16 +52,17 @@ pub fn check_sudo_available() -> Result<(), String> {
     }
 
     // Check if sudo works (cached credentials or NOPASSWD)
-    let status = Command::new("sudo")
-        .args(["-n", "true"])
-        .status();
+    let status = Command::new("sudo").args(["-n", "true"]).status();
 
     match status {
         Ok(s) if s.success() => Ok(()),
         _ => {
             // Sudo exists but needs password - that's fine
-            println!("{}Note:{} Some operations may require your password.",
-                Colors::YELLOW, Colors::RESET);
+            println!(
+                "{}Note:{} Some operations may require your password.",
+                Colors::YELLOW,
+                Colors::RESET
+            );
             Ok(())
         }
     }
@@ -75,15 +76,9 @@ fn check_package_manager_lock(pm: &PackageManager) -> Result<(), String> {
             "/var/lib/dpkg/lock-frontend",
             "/var/lib/apt/lists/lock",
         ],
-        PackageManager::Dnf | PackageManager::Yum => vec![
-            "/var/run/yum.pid",
-        ],
-        PackageManager::Pacman => vec![
-            "/var/lib/pacman/db.lck",
-        ],
-        PackageManager::Zypper => vec![
-            "/var/run/zypp.pid",
-        ],
+        PackageManager::Dnf | PackageManager::Yum => vec!["/var/run/yum.pid"],
+        PackageManager::Pacman => vec!["/var/lib/pacman/db.lck"],
+        PackageManager::Zypper => vec!["/var/run/zypp.pid"],
         _ => vec![],
     };
 
@@ -96,7 +91,8 @@ fn check_package_manager_lock(pm: &PackageManager) -> Result<(), String> {
                     if std::path::Path::new(&proc_path).exists() {
                         return Err(format!(
                             "Package manager is locked by another process (PID {}). \
-                            Please wait or terminate the other process.", pid
+                            Please wait or terminate the other process.",
+                            pid
                         ));
                     }
                 }
@@ -141,7 +137,12 @@ fn update_package_cache(pm: &PackageManager, options: &InstallOptions) -> Result
 
     if let Some(cmd) = update_cmd {
         if options.dry_run {
-            println!("{}[DRY RUN]{} Would run: {}", Colors::BLUE, Colors::RESET, cmd);
+            println!(
+                "{}[DRY RUN]{} Would run: {}",
+                Colors::BLUE,
+                Colors::RESET,
+                cmd
+            );
             return Ok(());
         }
 
@@ -163,8 +164,11 @@ fn update_package_cache(pm: &PackageManager, options: &InstallOptions) -> Result
 
         // Don't fail on update issues - we can still try to install
         if !status.success() && options.verbose {
-            println!("{}Warning:{} Package cache update had issues, continuing anyway.",
-                Colors::YELLOW, Colors::RESET);
+            println!(
+                "{}Warning:{} Package cache update had issues, continuing anyway.",
+                Colors::YELLOW,
+                Colors::RESET
+            );
         }
     }
     Ok(())
@@ -177,7 +181,11 @@ fn execute_with_retry(
     options: &InstallOptions,
 ) -> Result<(), String> {
     let mut last_error = String::new();
-    let max_attempts = if options.max_retries > 0 { options.max_retries } else { 3 };
+    let max_attempts = if options.max_retries > 0 {
+        options.max_retries
+    } else {
+        3
+    };
 
     for attempt in 1..=max_attempts {
         // Wait for package manager if locked
@@ -189,15 +197,21 @@ fn execute_with_retry(
                 last_error = e.clone();
 
                 // Check if error is retryable
-                let retryable = e.contains("Could not get lock") ||
-                    e.contains("temporarily unavailable") ||
-                    e.contains("Connection") ||
-                    e.contains("timeout");
+                let retryable = e.contains("Could not get lock")
+                    || e.contains("temporarily unavailable")
+                    || e.contains("Connection")
+                    || e.contains("timeout");
 
                 if retryable && attempt < max_attempts {
                     let wait_secs = 2_u64.pow(attempt);
-                    println!("{}Retry:{} Attempt {}/{} failed, retrying in {}s...",
-                        Colors::YELLOW, Colors::RESET, attempt, max_attempts, wait_secs);
+                    println!(
+                        "{}Retry:{} Attempt {}/{} failed, retrying in {}s...",
+                        Colors::YELLOW,
+                        Colors::RESET,
+                        attempt,
+                        max_attempts,
+                        wait_secs
+                    );
                     thread::sleep(Duration::from_secs(wait_secs));
                 } else if !retryable {
                     return Err(e);
@@ -256,7 +270,12 @@ pub fn attempt_install(
 
     // Ask for confirmation unless --yes
     if !options.yes {
-        print!("{}Install {}?{} [y/N] ", Colors::BOLD, check.name, Colors::RESET);
+        print!(
+            "{}Install {}?{} [y/N] ",
+            Colors::BOLD,
+            check.name,
+            Colors::RESET
+        );
         io::stdout().flush().ok();
 
         let mut input = String::new();
@@ -269,7 +288,12 @@ pub fn attempt_install(
         }
     }
 
-    println!("{}Installing:{} {}", Colors::BLUE, Colors::RESET, check.name);
+    println!(
+        "{}Installing:{} {}",
+        Colors::BLUE,
+        Colors::RESET,
+        check.name
+    );
     if options.verbose {
         println!("  Command: {}", install_cmd);
     }
@@ -279,18 +303,30 @@ pub fn attempt_install(
         Ok(()) => {
             // Post-install verification and fixes
             if let Err(e) = post_install_fixes(&platform.package_manager) {
-                println!("{}Warning:{} Post-install fixes failed: {}",
-                    Colors::YELLOW, Colors::RESET, e);
+                println!(
+                    "{}Warning:{} Post-install fixes failed: {}",
+                    Colors::YELLOW,
+                    Colors::RESET,
+                    e
+                );
             }
 
             // Verify installation
             if verify_installation(check) {
-                println!("{}Success:{} {} installed and verified",
-                    Colors::GREEN, Colors::RESET, check.name);
+                println!(
+                    "{}Success:{} {} installed and verified",
+                    Colors::GREEN,
+                    Colors::RESET,
+                    check.name
+                );
                 InstallResult::Success
             } else {
-                println!("{}Warning:{} {} installed but verification failed",
-                    Colors::YELLOW, Colors::RESET, check.name);
+                println!(
+                    "{}Warning:{} {} installed but verification failed",
+                    Colors::YELLOW,
+                    Colors::RESET,
+                    check.name
+                );
                 InstallResult::Success // Still count as success since package was installed
             }
         }
@@ -329,9 +365,7 @@ fn post_install_fixes(pm: &PackageManager) -> Result<(), String> {
     // 2. Set SUID bits on fusermount3
 
     // Try to load fuse module (ignore errors - might already be loaded)
-    let _ = Command::new("sudo")
-        .args(["modprobe", "fuse"])
-        .status();
+    let _ = Command::new("sudo").args(["modprobe", "fuse"]).status();
 
     // Check and fix fusermount3 SUID
     let fusermount_paths = [
@@ -349,19 +383,14 @@ fn post_install_fixes(pm: &PackageManager) -> Result<(), String> {
                 if mode & 0o4000 == 0 {
                     // Missing SUID bit, try to set it
                     println!("Setting SUID bit on {}", path);
-                    let _ = Command::new("sudo")
-                        .args(["chmod", "u+s", path])
-                        .status();
+                    let _ = Command::new("sudo").args(["chmod", "u+s", path]).status();
                 }
             }
         }
     }
 
     // Check and fix newuidmap/newgidmap SUID
-    let uidmap_paths = [
-        "/usr/bin/newuidmap",
-        "/usr/bin/newgidmap",
-    ];
+    let uidmap_paths = ["/usr/bin/newuidmap", "/usr/bin/newgidmap"];
 
     for path in &uidmap_paths {
         if std::path::Path::new(path).exists() {
@@ -370,9 +399,7 @@ fn post_install_fixes(pm: &PackageManager) -> Result<(), String> {
                 let mode = metadata.permissions().mode();
                 if mode & 0o4000 == 0 {
                     println!("Setting SUID bit on {}", path);
-                    let _ = Command::new("sudo")
-                        .args(["chmod", "u+s", path])
-                        .status();
+                    let _ = Command::new("sudo").args(["chmod", "u+s", path]).status();
                 }
             }
         }
@@ -438,11 +465,7 @@ pub fn get_all_packages(pm: &PackageManager) -> Vec<&'static str> {
             "shadow",
             "util-linux",
         ],
-        PackageManager::Brew => vec![
-            "lima",
-            "passt",
-            "util-linux",
-        ],
+        PackageManager::Brew => vec!["lima", "passt", "util-linux"],
         _ => vec![],
     }
 }
@@ -482,13 +505,25 @@ pub fn install_all(platform: &Platform, options: &InstallOptions) -> Result<(), 
     let install_cmd = get_full_install_command(&platform.package_manager)
         .ok_or_else(|| "No package manager detected".to_string())?;
 
-    println!("{}Installing all Carrier dependencies...{}", Colors::BOLD, Colors::RESET);
+    println!(
+        "{}Installing all Carrier dependencies...{}",
+        Colors::BOLD,
+        Colors::RESET
+    );
     println!("Command: {}", install_cmd);
 
     // Dry run mode
     if options.dry_run {
-        println!("\n{}[DRY RUN]{} Would execute the above command.", Colors::BLUE, Colors::RESET);
-        println!("{}[DRY RUN]{} Would setup subuid/subgid if needed.", Colors::BLUE, Colors::RESET);
+        println!(
+            "\n{}[DRY RUN]{} Would execute the above command.",
+            Colors::BLUE,
+            Colors::RESET
+        );
+        println!(
+            "{}[DRY RUN]{} Would setup subuid/subgid if needed.",
+            Colors::BLUE,
+            Colors::RESET
+        );
         return Ok(());
     }
 
@@ -498,7 +533,9 @@ pub fn install_all(platform: &Platform, options: &InstallOptions) -> Result<(), 
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
 
         if !input.trim().eq_ignore_ascii_case("y") {
             return Err("Cancelled by user".to_string());
@@ -514,14 +551,21 @@ pub fn install_all(platform: &Platform, options: &InstallOptions) -> Result<(), 
     // Setup subuid/subgid if needed
     setup_subuid_subgid()?;
 
-    println!("\n{}All dependencies installed successfully!{}", Colors::GREEN, Colors::RESET);
+    println!(
+        "\n{}All dependencies installed successfully!{}",
+        Colors::GREEN,
+        Colors::RESET
+    );
     println!("Run 'carrier doctor' to verify the installation.");
 
     Ok(())
 }
 
 /// Install only missing dependencies
-pub fn install_missing(platform: &Platform, options: &InstallOptions) -> Result<(usize, usize), String> {
+pub fn install_missing(
+    platform: &Platform,
+    options: &InstallOptions,
+) -> Result<(usize, usize), String> {
     // Check sudo availability first
     check_sudo_available()?;
 
@@ -535,7 +579,11 @@ pub fn install_missing(platform: &Platform, options: &InstallOptions) -> Result<
     let mut installed = 0;
     let mut failed = 0;
 
-    println!("{}Checking dependencies...{}\n", Colors::BOLD, Colors::RESET);
+    println!(
+        "{}Checking dependencies...{}\n",
+        Colors::BOLD,
+        Colors::RESET
+    );
 
     for (check, check_fn) in &checks {
         let result = check_fn(platform);
@@ -558,7 +606,13 @@ pub fn install_missing(platform: &Platform, options: &InstallOptions) -> Result<
                     }
                 }
                 InstallResult::Failed(e) => {
-                    println!("{}Failed:{} {}: {}", Colors::RED, Colors::RESET, check.name, e);
+                    println!(
+                        "{}Failed:{} {}: {}",
+                        Colors::RED,
+                        Colors::RESET,
+                        check.name,
+                        e
+                    );
                     failed += 1;
                 }
             }
@@ -566,10 +620,25 @@ pub fn install_missing(platform: &Platform, options: &InstallOptions) -> Result<
             match result {
                 CheckResult::Ok { version } => {
                     let ver_str = version.map(|v| format!(" ({})", v)).unwrap_or_default();
-                    println!("{}OK:{} {}{}", Colors::GREEN, Colors::RESET, check.name, ver_str);
+                    println!(
+                        "{}OK:{} {}{}",
+                        Colors::GREEN,
+                        Colors::RESET,
+                        check.name,
+                        ver_str
+                    );
                 }
-                CheckResult::Unavailable { alternative: Some(alt), .. } => {
-                    println!("{}Skip:{} {} - using {}", Colors::YELLOW, Colors::RESET, check.name, alt);
+                CheckResult::Unavailable {
+                    alternative: Some(alt),
+                    ..
+                } => {
+                    println!(
+                        "{}Skip:{} {} - using {}",
+                        Colors::YELLOW,
+                        Colors::RESET,
+                        check.name,
+                        alt
+                    );
                 }
                 _ => {}
             }
@@ -579,13 +648,22 @@ pub fn install_missing(platform: &Platform, options: &InstallOptions) -> Result<
     // Setup subuid/subgid if needed
     if !options.dry_run {
         if let Err(e) = setup_subuid_subgid() {
-            println!("{}Warning:{} Could not setup subuid/subgid: {}",
-                Colors::YELLOW, Colors::RESET, e);
+            println!(
+                "{}Warning:{} Could not setup subuid/subgid: {}",
+                Colors::YELLOW,
+                Colors::RESET,
+                e
+            );
         }
     }
 
-    println!("\n{}Summary:{} {} installed, {} failed",
-        Colors::BOLD, Colors::RESET, installed, failed);
+    println!(
+        "\n{}Summary:{} {} installed, {} failed",
+        Colors::BOLD,
+        Colors::RESET,
+        installed,
+        failed
+    );
 
     Ok((installed, failed))
 }
@@ -644,7 +722,11 @@ fn setup_subuid_subgid() -> Result<(), String> {
 
 /// Print a summary of what would be installed (for --dry-run with --all)
 pub fn print_install_summary(platform: &Platform) {
-    println!("{}Carrier Dependency Installation Summary{}", Colors::BOLD, Colors::RESET);
+    println!(
+        "{}Carrier Dependency Installation Summary{}",
+        Colors::BOLD,
+        Colors::RESET
+    );
     println!("======================================\n");
 
     println!("Platform: {:?}", platform.os);
@@ -670,12 +752,20 @@ pub fn print_install_summary(platform: &Platform) {
     }
 
     if missing.is_empty() && misconfigured.is_empty() {
-        println!("{}All dependencies are already installed!{}", Colors::GREEN, Colors::RESET);
+        println!(
+            "{}All dependencies are already installed!{}",
+            Colors::GREEN,
+            Colors::RESET
+        );
         return;
     }
 
     if !missing.is_empty() {
-        println!("{}Missing packages to install:{}", Colors::YELLOW, Colors::RESET);
+        println!(
+            "{}Missing packages to install:{}",
+            Colors::YELLOW,
+            Colors::RESET
+        );
         for (name, cmd) in &missing {
             println!("  - {}: {}", name, cmd);
         }
