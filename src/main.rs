@@ -23,6 +23,13 @@ use deps::run_doctor;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let global_verbose = cli.verbose > 0;
+    #[cfg(not(target_os = "macos"))]
+    let storage_driver = cli
+        .storage_driver
+        .and_then(|driver| driver.forced_name().map(str::to_owned));
+    #[cfg(target_os = "macos")]
+    let _ = cli.storage_driver;
 
     // Runtime layer gate: on macOS, runtime commands need the Linux VM backend.
     backend::guard(&cli.command);
@@ -62,8 +69,8 @@ async fn main() {
                     ports,
                     env,
                     platform,
-                    cli.storage_driver.clone(),
-                    verbose,
+                    storage_driver.clone(),
+                    verbose || global_verbose,
                 )
                 .await;
             } else {
@@ -77,8 +84,8 @@ async fn main() {
                     ports,
                     env,
                     platform,
-                    cli.storage_driver.clone(),
-                    verbose,
+                    storage_driver.clone(),
+                    verbose || global_verbose,
                 )
                 .await;
             }
@@ -178,7 +185,7 @@ async fn main() {
                 dry_run,
                 yes,
                 max_retries: 3,
-                verbose,
+                verbose: verbose || global_verbose,
             };
 
             if dry_run && !fix && !all {

@@ -2,8 +2,8 @@ mod layer;
 mod layout;
 mod overlay;
 
-pub use layer::extract_layer_rootless;
-pub use layout::StorageLayout;
+pub use layer::{apply_layer_rootless, extract_layer_rootless};
+pub use layout::{atomic_write, StorageLayout};
 pub use overlay::{preflight_rootless_checks, ContainerStorage, StorageDriver};
 
 // Helper function for generating container IDs

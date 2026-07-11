@@ -1,21 +1,37 @@
-use clap::{error::Result, Parser, Subcommand};
+use clap::{error::Result, Parser, Subcommand, ValueEnum};
 pub use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(name = "carrier", version, about, long_about = None)]
 pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
-
-    #[arg(short, long, default_value = "carrier_config.toml")]
-    config: String,
+    pub verbose: u8,
 
     /// Force storage driver: auto, overlay-fuse, overlay-native, or vfs
     #[arg(long = "storage-driver")]
-    pub storage_driver: Option<String>,
+    pub storage_driver: Option<StorageDriverChoice>,
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum StorageDriverChoice {
+    Auto,
+    OverlayFuse,
+    OverlayNative,
+    Vfs,
+}
+
+impl StorageDriverChoice {
+    pub fn forced_name(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::OverlayFuse => Some("overlay-fuse"),
+            Self::OverlayNative => Some("overlay-native"),
+            Self::Vfs => Some("vfs"),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -260,6 +276,12 @@ impl RegistryImage {
         if image_ref.is_empty() {
             return Err("Image reference cannot be empty".to_string());
         }
+        if image_ref.contains(char::is_whitespace) {
+            return Err("Image reference cannot contain whitespace".to_string());
+        }
+        if image_ref.contains('@') {
+            return Err("Digest image references are not supported yet; use a tag".to_string());
+        }
 
         // Split registry from image path
         let (registry, image_and_tag) = if let Some(slash_idx) = image_ref.find('/') {
@@ -283,7 +305,12 @@ impl RegistryImage {
         };
 
         // Split image and tag
-        let (image, tag) = if let Some((img, t)) = image_and_tag.split_once(':') {
+        let last_slash = image_and_tag.rfind('/');
+        let last_colon = image_and_tag.rfind(':');
+        let (image, tag) = if last_colon.is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash)) {
+            let colon = last_colon.unwrap();
+            let (img, tagged) = image_and_tag.split_at(colon);
+            let t = &tagged[1..];
             (img.to_string(), t.to_string())
         } else {
             (image_and_tag.to_string(), "latest".to_string())
@@ -292,6 +319,24 @@ impl RegistryImage {
         // Validate image name
         if image.is_empty() {
             return Err("Image name cannot be empty".to_string());
+        }
+        if tag.is_empty() || tag.len() > 128 {
+            return Err("Image tag must contain between 1 and 128 characters".to_string());
+        }
+        if !tag.chars().enumerate().all(|(index, ch)| {
+            ch.is_ascii_alphanumeric()
+                || ch == '_'
+                || ((ch == '-' || ch == '.') && index > 0)
+        }) {
+            return Err("Image tag contains invalid characters".to_string());
+        }
+        if image.split('/').any(|part| {
+            part.is_empty()
+                || part.starts_with(['.', '-'])
+                || part.ends_with(['.', '-'])
+                || !part.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+        }) {
+            return Err("Image name contains an invalid repository component".to_string());
         }
 
         Ok(RegistryImage {
@@ -312,7 +357,8 @@ impl RegistryImage {
 
 #[cfg(test)]
 mod tests {
-    use super::RegistryImage;
+    use super::{Cli, RegistryImage, StorageDriverChoice};
+    use clap::Parser;
 
     #[test]
     fn parse_simple_image() {
@@ -343,5 +389,19 @@ mod tests {
         assert_eq!(img.registry.as_deref(), Some("localhost:5000"));
         assert_eq!(img.image, "my/app");
         assert_eq!(img.tag, "dev");
+    }
+
+    #[test]
+    fn rejects_malformed_image_references() {
+        for reference in ["UPPER/image", "image:", "image:-bad", "owner//image", "image@sha256:abc", "bad image"] {
+            assert!(RegistryImage::parse(reference).is_err(), "accepted {reference}");
+        }
+    }
+
+    #[test]
+    fn clap_validates_storage_driver() {
+        let cli = Cli::try_parse_from(["carrier", "--storage-driver", "vfs", "list"]).unwrap();
+        assert!(matches!(cli.storage_driver, Some(StorageDriverChoice::Vfs)));
+        assert!(Cli::try_parse_from(["carrier", "--storage-driver", "typo", "list"]).is_err());
     }
 }

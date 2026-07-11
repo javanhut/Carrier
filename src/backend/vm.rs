@@ -27,9 +27,10 @@ use objc2::AllocAnyThread;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZFileHandleSerialPortAttachment,
-    VZLinuxBootLoader, VZSharedDirectory, VZSingleDirectoryShare,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSharedDirectory,
+    VZSingleDirectoryShare, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration,
 };
@@ -47,8 +48,7 @@ pub struct VmSpec<'a> {
 }
 
 fn file_url(p: &Path) -> Retained<NSURL> {
-    // SAFETY: fileURLWithPath: just wraps the path string; no preconditions.
-    unsafe { NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy())) }
+    NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()))
 }
 
 /// Build a `VZVirtualMachineConfiguration` for a Linux guest from `spec`.
@@ -312,6 +312,11 @@ fn boot_and_connect(port: u32, console: bool) -> Result<RawFd, String> {
             cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[
                 Retained::into_super(fsdev),
             ]));
+            // NAT networking so the guest (and the container, which shares its
+            // netns) can reach the internet (apt/curl/etc.).
+            let net = VZVirtioNetworkDeviceConfiguration::new();
+            net.setAttachment(Some(&*VZNATNetworkDeviceAttachment::new()));
+            cfg.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)]));
             cfg.validateWithError()
                 .map_err(|e| format!("invalid VM config: {e:?}"))?;
 
@@ -396,7 +401,7 @@ pub async fn run_in_vm(image: String, command: Vec<String>, interactive: bool, t
         eprintln!("carrier: VM not provisioned — run `carrier machine init` first");
         std::process::exit(1);
     }
-    if let Err(e) = prepare_bundle(&image, &command).await {
+    if let Err(e) = prepare_bundle(&image, &command, tty).await {
         eprintln!("carrier: {e}");
         std::process::exit(1);
     }
@@ -501,9 +506,9 @@ fn restore_raw_mode(orig: Option<libc::termios>) {
 /// Pull `image` (reusing carrier's cross-platform pull), merge its layers into a
 /// rootfs, and write an OCI config running `command` — all under vm_dir/bundle,
 /// which boot_and_connect shares into the guest via virtiofs.
-async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
+async fn prepare_bundle(image: &str, command: &[String], tty: bool) -> Result<(), String> {
     use crate::cli::RegistryImage;
-    use crate::storage::{extract_layer_rootless, StorageLayout};
+    use crate::storage::{apply_layer_rootless, atomic_write, StorageLayout};
 
     // 1. Pull into the shared blob cache (guest matches the host arch).
     crate::commands::pull_image(image.to_string(), Some(format!("linux/{}", guest_arch()))).await;
@@ -520,17 +525,21 @@ async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
         .as_array()
         .ok_or("manifest has no layers")?;
 
-    // 3. Merge layers (in order) into one rootfs. ponytail: sequential extract =
-    // VFS merge; no whiteout handling yet (fine for single-layer images).
+    // 3. Merge layers into a staging rootfs, applying OCI whiteouts. Publish the
+    // complete tree only after every layer succeeds.
     let rootfs = vm_dir().join("bundle/rootfs");
-    let _ = std::fs::remove_dir_all(&rootfs);
-    std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+    let staging = vm_dir().join(format!("bundle/.rootfs-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     for layer in layers {
-        let digest = layer["digest"].as_str().ok_or("layer missing digest")?;
-        extract_layer_rootless(&layout.blob_cache_path(digest), &rootfs)
-            .map_err(|e| format!("extract {digest}: {e}"))?;
+        let Some(digest) = layer["digest"].as_str() else {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err("layer missing digest".into());
+        };
+        if let Err(error) = apply_layer_rootless(&layout.blob_cache_path(digest), &staging) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("apply {digest}: {error}"));
+        }
     }
-
     // 4. Take the image's default entrypoint/cmd/env/cwd from its config blob, so
     // `carrier run <image>` (no command) runs the image as built. A user command
     // replaces Cmd (Docker semantics: Entrypoint is kept).
@@ -552,6 +561,7 @@ async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
         [entrypoint, command.to_vec()].concat()
     };
     if args.is_empty() {
+        let _ = std::fs::remove_dir_all(&staging);
         return Err("image has no default command — pass one: `carrier run <image> <cmd>`".into());
     }
     let mut env = strs(&icfg["Env"]);
@@ -562,25 +572,55 @@ async fn prepare_bundle(image: &str, command: &[String]) -> Result<(), String> {
         env.push("TERM=xterm".into()); // so clear/ncurses work under the PTY
     }
     let cwd = icfg["WorkingDir"].as_str().filter(|s| !s.is_empty()).unwrap_or("/");
-    std::fs::write(vm_dir().join("bundle/config.json"), bundle_config(&args, &env, cwd))
-        .map_err(|e| e.to_string())?;
+    let config = bundle_config(&args, &env, cwd, tty);
+
+    // Commit rootfs and config together with rollback to the previous rootfs if
+    // publishing either artifact fails.
+    let previous = vm_dir().join("bundle/.rootfs-previous");
+    let _ = std::fs::remove_dir_all(&previous);
+    if rootfs.exists() {
+        std::fs::rename(&rootfs, &previous).map_err(|e| e.to_string())?;
+    }
+    if let Err(error) = std::fs::rename(&staging, &rootfs) {
+        if previous.exists() {
+            let _ = std::fs::rename(&previous, &rootfs);
+        }
+        return Err(error.to_string());
+    }
+    if let Err(error) = atomic_write(&vm_dir().join("bundle/config.json"), config.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&rootfs);
+        if previous.exists() {
+            let _ = std::fs::rename(&previous, &rootfs);
+        }
+        return Err(error.to_string());
+    }
+    let _ = std::fs::remove_dir_all(previous);
     Ok(())
 }
 
-/// Minimal OCI runtime spec. rootfs is read-only (shared via virtiofs RO).
-fn bundle_config(args: &[String], env: &[String], cwd: &str) -> String {
+/// Docker's default container capabilities.
+const DEFAULT_CAPS: [&str; 14] = [
+    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD",
+    "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP",
+    "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE",
+];
+
+/// Minimal OCI runtime spec. `terminal` true makes runc allocate a PTY (for -it).
+fn bundle_config(args: &[String], env: &[String], cwd: &str, terminal: bool) -> String {
     serde_json::json!({
         "ociVersion": "1.0.2",
         "process": {
-            "terminal": false,
+            "terminal": terminal,
             "user": { "uid": 0, "gid": 0 },
             "args": args,
             "env": env,
             "cwd": cwd,
+            // Docker's default capability set — apt's http method drops to the
+            // _apt user, so it needs CAP_SETUID/SETGID etc.
             "capabilities": {
-                "bounding": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "effective": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"],
-                "permitted": ["CAP_AUDIT_WRITE", "CAP_KILL", "CAP_NET_BIND_SERVICE"]
+                "bounding": DEFAULT_CAPS,
+                "effective": DEFAULT_CAPS,
+                "permitted": DEFAULT_CAPS
             },
             "noNewPrivileges": true
         },
@@ -589,7 +629,11 @@ fn bundle_config(args: &[String], env: &[String], cwd: &str) -> String {
         "mounts": [
             { "destination": "/proc", "type": "proc", "source": "proc" },
             { "destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
-            { "destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid", "noexec", "nodev", "ro"] }
+            // devpts: required for terminal:true so runc can open /dev/pts/ptmx.
+            { "destination": "/dev/pts", "type": "devpts", "source": "devpts", "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
+            { "destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid", "noexec", "nodev", "ro"] },
+            // DNS: the container shares the guest netns; bind the guest's resolver.
+            { "destination": "/etc/resolv.conf", "type": "bind", "source": "/etc/resolv.conf", "options": ["bind", "ro"] }
         ],
         "linux": { "namespaces": [ {"type":"pid"}, {"type":"ipc"}, {"type":"uts"}, {"type":"mount"} ] }
     })
@@ -647,11 +691,6 @@ pub fn machine(action: crate::cli::MachineCmd) {
                 print!("{body}");
                 let _ = std::io::stdout().flush();
                 std::process::exit(code);
-                eprintln!("[carrier] Ctrl-C to stop.");
-                // Keep `ch` (and the VM, on its queue) alive by parking.
-                loop {
-                    std::thread::park();
-                }
             }
             Err(e) => {
                 eprintln!("carrier: {e}");

@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 
 pub struct StorageLayout {
@@ -84,7 +85,68 @@ impl StorageLayout {
         if let Some(parent) = blob_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&blob_path, data)?;
+        atomic_write(&blob_path, data)?;
         Ok(blob_path)
+    }
+}
+
+/// Write a file in the destination directory and publish it with an atomic
+/// rename. Readers therefore see either the old complete file or the new one,
+/// never a partially-written cache entry.
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path.parent().ok_or("destination has no parent directory")?;
+    fs::create_dir_all(parent)?;
+
+    let mut attempt = 0_u32;
+    let tmp_path = loop {
+        let candidate = parent.join(format!(
+            ".{}.tmp-{}-{}",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("carrier"),
+            std::process::id(),
+            attempt
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut file) => {
+                if let Err(error) = (|| -> std::io::Result<()> {
+                    file.write_all(data)?;
+                    file.sync_all()
+                })() {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error.into());
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.checked_add(1).ok_or("too many temporary files")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atomic_write;
+
+    #[test]
+    fn atomic_write_replaces_complete_file_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write(&path, b"new contents").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec!["blob"]);
     }
 }

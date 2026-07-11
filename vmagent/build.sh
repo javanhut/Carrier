@@ -28,6 +28,28 @@ rm -rf "build/$RUST_ARCH" && mkdir -p "build/$RUST_ARCH/root/bin" "$OUT"
 cp "target/$TARGET/release/vmagent" "build/$RUST_ARCH/root/init" && chmod +x "build/$RUST_ARCH/root/init"
 [ -f "build/runc.$OCI" ] || curl -fsSL -o "build/runc.$OCI" "$RUNC"
 cp "build/runc.$OCI" "build/$RUST_ARCH/root/bin/runc" && chmod +x "build/$RUST_ARCH/root/bin/runc"
+
+# Static busybox (from Alpine) for guest networking: udhcpc + ip/ifconfig/route.
+ALPINE="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$RUST_ARCH/alpine-minirootfs-3.24.1-$RUST_ARCH.tar.gz"
+[ -f "build/alpine-$RUST_ARCH.tar.gz" ] || curl -fsSL -o "build/alpine-$RUST_ARCH.tar.gz" "$ALPINE"
+# busybox + its musl interpreter (it's dynamically linked to /lib/ld-musl-*.so.1)
+tar xzf "build/alpine-$RUST_ARCH.tar.gz" -C "build/$RUST_ARCH/root" \
+    bin/busybox "lib/ld-musl-$RUST_ARCH.so.1" 2>/dev/null
+chmod +x "build/$RUST_ARCH/root/bin/busybox"
+# udhcpc lease-applier: sets the address/route/DNS busybox hands it.
+cat > "build/$RUST_ARCH/root/udhcpc.sh" <<'SH'
+#!/bin/busybox sh
+case "$1" in
+  bound|renew)
+    /bin/busybox ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}"
+    [ -n "$router" ] && /bin/busybox route add default gw "$router"
+    : > /etc/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+    ;;
+esac
+SH
+chmod +x "build/$RUST_ARCH/root/udhcpc.sh"
+
 ( cd "build/$RUST_ARCH/root" && find . | cpio -o -H newc 2>/dev/null ) | gzip > "$OUT/initramfs.cpio.gz"
 
 # Kata kernel for this arch: stream the ~600MB bundle, keep only the ~18MB kernel.

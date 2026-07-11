@@ -1,6 +1,6 @@
 use crate::cli::RegistryImage;
 use crate::storage::StorageLayout;
-use crate::storage::{ContainerStorage, extract_layer_rootless, generate_container_id};
+use crate::storage::{atomic_write, ContainerStorage, extract_layer_rootless, generate_container_id};
 use std::io::{self, Write};
 
 fn get_runc_root() -> String {
@@ -116,6 +116,30 @@ struct Platform {
     #[serde(rename = "os.features", default)]
     os_features: Option<Vec<String>>,
     variant: Option<String>,
+}
+
+fn validate_digest(digest: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .ok_or("Only sha256 image digests are supported")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Malformed sha256 image digest".into());
+    }
+    Ok(())
+}
+
+fn validate_manifest(manifest: ManifestV2) -> Result<ManifestV2, Box<dyn std::error::Error>> {
+    if manifest.schema_version != 2 {
+        return Err(format!("Unsupported manifest schema version {}", manifest.schema_version).into());
+    }
+    if manifest.config.size < 0 || manifest.layers.iter().any(|layer| layer.size < 0) {
+        return Err("Manifest contains a negative blob size".into());
+    }
+    validate_digest(&manifest.config.digest)?;
+    for layer in &manifest.layers {
+        validate_digest(&layer.digest)?;
+    }
+    Ok(manifest)
 }
 
 pub async fn run_image(
@@ -355,16 +379,12 @@ pub async fn run_image(
     };
 
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
-    // Add cached_size to manifest JSON for faster listing
+    // Prepare metadata, but do not publish it until all layers are complete.
     let mut manifest_json_obj = serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = manifest_json_obj {
         map.insert("cached_size".to_string(), serde_json::json!(cached_size));
     }
     let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
-    if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
-        eprintln!("Warning: Failed to save manifest metadata: {}", e);
-    }
-
     // Download layers with progress using storage
     let layer_paths =
         match download_layers_with_storage(&manifest, &parsed_image, &token, &storage, verbose).await {
@@ -374,6 +394,11 @@ pub async fn run_image(
                 return;
             }
         };
+
+    if let Err(e) = atomic_write(&metadata_path, manifest_to_save.as_bytes()) {
+        eprintln!("Failed to save image metadata: {}", e);
+        return;
+    }
 
     if verbose {
         println!("\nImage {} pulled successfully!", image_name);
@@ -614,10 +639,9 @@ pub async fn run_image_with_command(
             }
         };
 
-    // Save the actual manifest as metadata
+    // Prepare metadata, but publish it only after every layer is complete.
     let metadata_path = storage.image_metadata_path(&parsed_image.image, &parsed_image.tag);
     let manifest_to_save = serde_json::to_string(&manifest).unwrap_or(manifest_json.clone());
-    let _ = std::fs::write(&metadata_path, &manifest_to_save);
 
     // Download layers with progress using storage
     let layer_paths =
@@ -628,6 +652,11 @@ pub async fn run_image_with_command(
                 return;
             }
         };
+
+    if let Err(e) = atomic_write(&metadata_path, manifest_to_save.as_bytes()) {
+        eprintln!("Failed to save image metadata: {}", e);
+        return;
+    }
 
     if verbose {
         println!("\nImage {} pulled successfully!", image_name);
@@ -717,18 +746,24 @@ async fn exec_elevated_container(
             ];
             nsenter_args.extend(command.clone());
 
-            let exit_code = spawn_with_pty("nsenter", &nsenter_args).unwrap_or_else(|_| {
-                // Fallback to regular execution
-                let mut child = exec_cmd
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .expect("Failed to spawn nsenter");
-
-                let status = child.wait().expect("Failed to wait for child");
-                status.code().unwrap_or(1)
-            });
+            let exit_code = match spawn_with_pty("nsenter", &nsenter_args) {
+                Ok(code) => code,
+                Err(pty_error) => {
+                    // Fall back to regular stdio, preserving both failure
+                    // contexts if nsenter cannot be started or waited on.
+                    let mut child = exec_cmd
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .map_err(|error| {
+                            format!("PTY execution failed ({pty_error}); fallback spawn failed: {error}")
+                        })?;
+                    child.wait().map_err(|error| {
+                        format!("PTY execution failed ({pty_error}); fallback wait failed: {error}")
+                    })?.code().unwrap_or(1)
+                }
+            };
 
             if exit_code != 0 {
                 return Err(format!("Command exited with code {}", exit_code).into());
@@ -910,7 +945,7 @@ pub async fn exec_in_container(
         // Process doesn't exist - update the metadata to reflect this
         let mut metadata_mut = metadata.clone();
         metadata_mut["status"] = serde_json::json!("exited");
-        let _ = std::fs::write(&metadata_path, metadata_mut.to_string());
+        let _ = atomic_write(&metadata_path, metadata_mut.to_string().as_bytes());
         let _ = std::fs::remove_file(&pid_file);
 
         return Err(format!(
@@ -1627,13 +1662,14 @@ pub async fn pull_image(image_name: String, platform: Option<String>) {
         map.insert("cached_size".to_string(), serde_json::json!(cached_size));
     }
     let manifest_to_save = serde_json::to_string(&manifest_json_obj).unwrap_or(manifest_json.clone());
-    if let Err(e) = std::fs::write(&metadata_path, &manifest_to_save) {
-        eprintln!("Warning: Failed to save manifest metadata: {}", e);
-    }
-
     // Download layers with progress using storage - always verbose for explicit pull
     if let Err(e) = download_layers_with_storage(&manifest, &parsed_image, &token, &storage, true).await {
         eprintln!("Failed to download layers: {}", e);
+        return;
+    }
+
+    if let Err(e) = atomic_write(&metadata_path, manifest_to_save.as_bytes()) {
+        eprintln!("Failed to save image metadata: {}", e);
         return;
     }
 
@@ -1686,18 +1722,25 @@ async fn parse_and_get_manifest(
         }
 
         // Determine desired platform
+        let host_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            "x86" => "386",
+            "arm" => "arm",
+            other => other,
+        };
         let (want_os, want_arch) = platform
             .and_then(|p| p.split_once('/'))
             .map(|(os, arch)| (os.to_string(), arch.to_string()))
-            .unwrap_or_else(|| ("linux".to_string(), "amd64".to_string()));
+            .unwrap_or_else(|| ("linux".to_string(), host_arch.to_string()));
 
         // Find the desired platform (or first available)
         let selected_manifest = manifest_list
             .manifests
             .iter()
             .find(|m| m.platform.os == want_os && m.platform.architecture == want_arch)
-            .or_else(|| manifest_list.manifests.first())
-            .ok_or("No suitable manifest found in manifest list")?;
+            .ok_or_else(|| format!("Image does not provide requested platform {want_os}/{want_arch}"))?;
+        validate_digest(&selected_manifest.digest)?;
 
         if verbose {
             println!(
@@ -1724,14 +1767,14 @@ async fn parse_and_get_manifest(
 
             let specific_manifest_json = response.text().await?;
             let manifest: ManifestV2 = serde_json::from_str(&specific_manifest_json)?;
-            Ok(manifest)
+            validate_manifest(manifest)
         } else {
             Err(format!("Registry not found").into())
         }
     } else {
         // Try to parse as direct manifest
         let manifest: ManifestV2 = serde_json::from_str(manifest_json)?;
-        Ok(manifest)
+        validate_manifest(manifest)
     }
 }
 
@@ -1764,7 +1807,8 @@ async fn download_layers_with_storage(
             registry_url, image_path, manifest.config.digest
         );
 
-        let blob_data = download_blob_with_progress(
+        let config_path = storage.blob_cache_path(&manifest.config.digest);
+        download_blob_with_progress(
             &client,
             &config_url,
             token,
@@ -1773,10 +1817,9 @@ async fn download_layers_with_storage(
             &multi_progress,
             "config",
             verbose,
+            &config_path,
         )
         .await?;
-
-        storage.save_blob(&manifest.config.digest, &blob_data)?;
     } else {
         if verbose {
             println!("Config already cached: {}", &manifest.config.digest[..12]);
@@ -1851,7 +1894,9 @@ async fn download_layers_with_storage(
 
                 let blob_url = format!("{}{}/blobs/{}", registry_url, image_path, layer_digest);
 
-                let blob_data = match download_blob_with_progress(
+                let clean_digest = layer_digest.replace(":", "_");
+                let blob_cache = storage_base.join("cache/blobs").join(format!("{}.tar.gz", &clean_digest));
+                if let Err(e) = download_blob_with_progress(
                     &client,
                     &blob_url,
                     &token,
@@ -1860,23 +1905,11 @@ async fn download_layers_with_storage(
                     &mp,
                     &format!("layer {}/{}", index + 1, total_layers),
                     verbose_flag,
+                    &blob_cache,
                 )
                 .await
                 {
-                    Ok(data) => data,
-                    Err(e) => return Err(format!("Download failed: {}", e)),
-                };
-
-                // Save blob to cache - match StorageLayout::blob_cache_path format
-                let clean_digest = layer_digest.replace(":", "_");
-                let blob_cache = storage_base.join("cache/blobs").join(format!("{}.tar.gz", &clean_digest));
-                if let Some(parent) = blob_cache.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        return Err(format!("Failed to create blob dir: {}", e));
-                    }
-                }
-                if let Err(e) = std::fs::write(&blob_cache, &blob_data) {
-                    return Err(format!("Failed to write blob: {}", e));
+                    return Err(format!("Download failed: {}", e));
                 }
 
                 Ok::<(usize, String, PathBuf), String>((index, layer_digest, blob_cache))
@@ -1983,7 +2016,8 @@ async fn download_blob_with_progress(
     multi_progress: &MultiProgress,
     label: &str,
     verbose: bool,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut attempt = 0;
     let max_attempts = 3;
     loop {
@@ -2030,24 +2064,65 @@ async fn download_blob_with_progress(
             }
         }
 
-        // Download with progress
-        let mut downloaded = Vec::new();
+        let parent = destination.parent().ok_or("blob destination has no parent")?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temporary = parent.join(format!(
+            ".{}.download-{}-{}",
+            destination.file_name().and_then(|name| name.to_str()).unwrap_or("blob"),
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut file = tokio::fs::File::create(&temporary).await?;
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
+        let mut downloaded = 0_u64;
         let mut stream = response.bytes_stream();
 
         use futures_util::StreamExt;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            downloaded.extend_from_slice(&chunk);
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return Err(error.into());
+                }
+            };
+            downloaded = downloaded.checked_add(chunk.len() as u64).ok_or("blob size overflow")?;
+            if expected_size > 0 && downloaded > expected_size {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(format!("Blob exceeded declared size of {expected_size} bytes").into());
+            }
+            hasher.update(&chunk);
+            if let Err(error) = file.write_all(&chunk).await {
+                drop(file);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(error.into());
+            }
             if let Some(ref pb) = pb {
                 pb.inc(chunk.len() as u64);
             }
         }
 
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+        if let Err(error) = file.sync_all().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+        drop(file);
+
+        if expected_size > 0 && downloaded != expected_size {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(format!("Blob size mismatch: expected {expected_size}, received {downloaded}").into());
+        }
+
         // Verify digest if provided as sha256
         if let Some(hex_expected) = digest.strip_prefix("sha256:") {
-            let mut hasher = sha2::Sha256::new();
-            use sha2::Digest;
-            hasher.update(&downloaded);
             let actual = hasher.finalize();
             let actual_hex = hex::encode(actual);
             if actual_hex != hex_expected {
@@ -2056,17 +2131,21 @@ async fn download_blob_with_progress(
                 }
                 attempt += 1;
                 if attempt >= max_attempts {
+                    let _ = tokio::fs::remove_file(&temporary).await;
                     return Err("Downloaded blob digest verification failed".into());
                 }
+                let _ = tokio::fs::remove_file(&temporary).await;
                 tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
                 continue;
             }
         }
 
+        tokio::fs::rename(&temporary, destination).await?;
+
         if let Some(ref pb) = pb {
             pb.finish_with_message(format!("[OK] {} {}", label, &digest[..12]));
         }
-        return Ok(downloaded);
+        return Ok(());
     }
 }
 
@@ -2182,6 +2261,7 @@ async fn run_container_with_storage(
     storage_driver: Option<&str>,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_runtime_inputs(volumes, ports, extra_env)?;
     if verbose {
         println!(
             "\nStarting container from image {}...",
@@ -2193,10 +2273,16 @@ async fn run_container_with_storage(
     let _ = setup_carrier_cgroup_limits();
 
     // Generate container ID or use custom name
+    if let Some(custom_name) = name.as_deref() {
+        validate_container_name(custom_name)?;
+    }
     let container_id = match &name {
         Some(custom_name) => custom_name.clone(),
         None => generate_container_id(),
     };
+    if storage.container_path(&container_id).exists() {
+        return Err(format!("Container name or ID '{}' is already in use", container_id).into());
+    }
     if verbose {
         println!("Container ID: {}", container_id);
     }
@@ -2275,6 +2361,7 @@ async fn run_container_with_storage(
             }
         }
     }
+    validate_container_path(&working_dir, "Image working directory")?;
 
     // Apply command override if provided
     if let Some(override_cmd) = command_override.clone() {
@@ -2372,7 +2459,7 @@ async fn run_container_with_storage(
         if let Some(parent) = meta_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&meta_path, metadata_str).map_err(|e| e.to_string())?;
+        atomic_write(&meta_path, metadata_str.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     });
 
@@ -2683,7 +2770,7 @@ async fn run_container_with_storage(
 
     // Get exit code from exec
     let exit_code = match exec_result {
-        Ok(status) => status.code().unwrap_or(-1),
+        Ok(status) => process_exit_code(status),
         Err(e) => {
             let _ = Command::new("runc")
                 .arg("--root")
@@ -2734,7 +2821,7 @@ async fn run_container_with_storage(
         "storage_driver": storage_driver_str,
         "elevated": elevated
     });
-    std::fs::write(&container_meta_path, metadata.to_string())?;
+    atomic_write(&container_meta_path, metadata.to_string().as_bytes())?;
 
     if verbose {
         if exit_code == 0 {
@@ -2746,6 +2833,12 @@ async fn run_container_with_storage(
                 exit_code
             );
         }
+    }
+
+    // Match normal container-runtime CLI semantics so automation receives the
+    // command status from a foreground container.
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 
     Ok(())
@@ -2761,6 +2854,32 @@ fn normalize_image_path(image_name: &str) -> String {
 
 fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
+}
+
+fn process_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+fn validate_container_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("Container name must contain between 1 and 128 characters".into());
+    }
+    if !name.chars().enumerate().all(|(index, ch)| {
+        ch.is_ascii_alphanumeric() || (index > 0 && matches!(ch, '_' | '.' | '-'))
+    }) {
+        return Err("Container name must start with an alphanumeric character and contain only alphanumerics, '_', '.', or '-'".into());
+    }
+    Ok(())
 }
 
 /// Cache for subuid/subgid mappings to avoid repeated file I/O
@@ -2840,34 +2959,91 @@ fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_jso
 }
 
 /// Parse a volume specification string (host_path:container_path[:ro])
-fn parse_volume_spec(spec: &str) -> Option<(String, String, bool)> {
+fn validate_container_path(path: &str, field: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!("{field} must be an absolute container path without '..'").into());
+    }
+    Ok(())
+}
+
+fn parse_volume_spec(spec: &str) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() < 2 {
-        return None;
+    if !(2..=3).contains(&parts.len()) || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(format!("Invalid volume '{spec}'; expected HOST_PATH:CONTAINER_PATH[:ro|rw]").into());
     }
     let host_path = parts[0].to_string();
     let container_path = parts[1].to_string();
-    let readonly = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
-    Some((host_path, container_path, readonly))
+    validate_container_path(&container_path, "Volume destination")?;
+    let readonly = match parts.get(2).copied().unwrap_or("rw") {
+        "ro" => true,
+        "rw" => false,
+        mode => return Err(format!("Invalid volume mode '{mode}'; expected 'ro' or 'rw'").into()),
+    };
+    Ok((host_path, container_path, readonly))
 }
 
 /// Parse a port mapping specification (host_port:container_port or host_port:container_port/protocol)
-fn parse_port_spec(spec: &str) -> Option<(u16, u16, String)> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() != 2 {
-        return None;
+fn parse_port_spec(spec: &str) -> Result<(u16, u16, String), Box<dyn std::error::Error>> {
+    let (host, container) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("Invalid port mapping '{spec}'; expected HOST_PORT:CONTAINER_PORT[/tcp]"))?;
+    if container.contains(':') {
+        return Err(format!("Invalid port mapping '{spec}'; too many ':' separators").into());
     }
-    let host_port: u16 = parts[0].parse().ok()?;
+    let host_port: u16 = host.parse().map_err(|_| format!("Invalid host port in '{spec}'"))?;
 
     // Check for protocol specification (e.g., 80/tcp)
-    let (container_port, protocol) = if parts[1].contains('/') {
-        let port_proto: Vec<&str> = parts[1].split('/').collect();
-        (port_proto[0].parse().ok()?, port_proto.get(1).unwrap_or(&"tcp").to_string())
+    let (container_port, protocol) = if let Some((port, protocol)) = container.split_once('/') {
+        if protocol != "tcp" {
+            return Err(format!("Unsupported port protocol '{protocol}'; only tcp is supported").into());
+        }
+        (port.parse().map_err(|_| format!("Invalid container port in '{spec}'"))?, protocol.to_string())
     } else {
-        (parts[1].parse().ok()?, "tcp".to_string())
+        (container.parse().map_err(|_| format!("Invalid container port in '{spec}'"))?, "tcp".to_string())
     };
+    if host_port == 0 || container_port == 0 {
+        return Err("Port zero is not valid for an explicit mapping".into());
+    }
+    Ok((host_port, container_port, protocol))
+}
 
-    Some((host_port, container_port, protocol))
+fn validate_environment_spec(spec: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (key, _) = spec.split_once('=').ok_or_else(|| format!("Invalid environment value '{spec}'; expected KEY=VALUE"))?;
+    let mut chars = key.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!("Invalid environment variable name '{key}'").into());
+    }
+    Ok(())
+}
+
+fn validate_runtime_inputs(volumes: &[String], ports: &[String], env: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    for volume in volumes {
+        let (source, _, _) = parse_volume_spec(volume)?;
+        let source = if Path::new(&source).is_absolute() {
+            PathBuf::from(source)
+        } else {
+            std::env::current_dir()?.join(source)
+        };
+        if !source.exists() {
+            return Err(format!("Volume source does not exist: {}", source.display()).into());
+        }
+    }
+    let mut host_ports = std::collections::HashSet::new();
+    for port in ports {
+        let (host, _, _) = parse_port_spec(port)?;
+        if !host_ports.insert(host) {
+            return Err(format!("Host port {host} is mapped more than once").into());
+        }
+    }
+    for variable in env {
+        validate_environment_spec(variable)?;
+    }
+    Ok(())
 }
 
 fn generate_oci_config(
@@ -2939,7 +3115,7 @@ fn generate_oci_config(
 
     // Add user-specified volume mounts
     for vol_spec in volumes {
-        if let Some((host_path, container_path, readonly)) = parse_volume_spec(vol_spec) {
+        let (host_path, container_path, readonly) = parse_volume_spec(vol_spec)?;
             // Resolve to absolute path
             let abs_host_path = if host_path.starts_with('/') {
                 PathBuf::from(&host_path)
@@ -2947,10 +3123,7 @@ fn generate_oci_config(
                 std::env::current_dir()?.join(&host_path)
             };
 
-            // Ensure host path exists
-            if !abs_host_path.exists() {
-                std::fs::create_dir_all(&abs_host_path)?;
-            }
+            let abs_host_path = abs_host_path.canonicalize()?;
 
             let mut options = vec!["rbind".to_string()];
             if readonly {
@@ -2965,7 +3138,6 @@ fn generate_oci_config(
                 "source": abs_host_path.to_string_lossy(),
                 "options": options
             }));
-        }
     }
 
     let config = serde_json::json!({
@@ -3000,7 +3172,7 @@ fn generate_oci_config(
         }
     });
 
-    std::fs::write(config_path, serde_json::to_string_pretty(&config)?)?;
+    atomic_write(config_path, serde_json::to_string_pretty(&config)?.as_bytes())?;
     Ok(())
 }
 
@@ -3042,7 +3214,7 @@ fn setup_container_network_with_ports(
     let etc_dir = upper_dir.join("etc");
     std::fs::create_dir_all(&etc_dir)?;
     let resolv_conf = etc_dir.join("resolv.conf");
-    std::fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
+    atomic_write(&resolv_conf, b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
 
     // Start slirp4netns to provide userspace networking
     let network_pid_file = container_dir.join("network.pid");
@@ -3056,11 +3228,10 @@ fn setup_container_network_with_ports(
 
     // Add port forwards
     for port_spec in ports {
-        if let Some((host_port, container_port, _protocol)) = parse_port_spec(port_spec) {
+        let (host_port, container_port, _protocol) = parse_port_spec(port_spec)?;
             // slirp4netns uses format: host_port:guest_port
             slirp_cmd.arg("-p").arg(format!("{}:{}", host_port, container_port));
             println!("Port mapping: {} -> {}", host_port, container_port);
-        }
     }
 
     slirp_cmd
@@ -3074,10 +3245,10 @@ fn setup_container_network_with_ports(
         Ok(child) => {
             // Store the slirp4netns PID for cleanup
             let slirp_pid = child.id();
-            let _ = std::fs::write(&network_pid_file, slirp_pid.to_string());
+            let _ = atomic_write(&network_pid_file, slirp_pid.to_string().as_bytes());
         }
-        Err(_) => {
-            // Silent failure - slirp4netns not available, network will be limited but container can still run
+        Err(error) => {
+            eprintln!("Warning: failed to start slirp4netns: {error}; container networking is unavailable");
         }
     }
 
@@ -3489,6 +3660,79 @@ mod tests {
         assert_eq!(normalize_image_path("alpine"), "library/alpine");
         assert_eq!(normalize_image_path("library/nginx"), "library/nginx");
         assert_eq!(normalize_image_path("myorg/myimg"), "myorg/myimg");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_untrusted_descriptor_values() {
+        let descriptor = |digest: &str, size: i64| Descriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            size,
+            digest: digest.into(),
+        };
+        let valid_digest = format!("sha256:{}", "a".repeat(64));
+        let malformed = ManifestV2 {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            config: descriptor(&valid_digest, 1),
+            layers: vec![descriptor("sha256:short", 1)],
+        };
+        assert!(validate_manifest(malformed).is_err());
+
+        let negative = ManifestV2 {
+            schema_version: 2,
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            config: descriptor(&valid_digest, -1),
+            layers: vec![],
+        };
+        assert!(validate_manifest(negative).is_err());
+    }
+
+    #[test]
+    fn maps_child_exit_status_for_cli_propagation() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        assert_eq!(process_exit_code(status), 7);
+    }
+
+    #[test]
+    fn validates_container_names_before_filesystem_use() {
+        for valid in ["web", "web-1", "api.prod_2"] {
+            assert!(validate_container_name(valid).is_ok());
+        }
+        for invalid in ["", "../escape", ".hidden", "name/child", "has space"] {
+            assert!(validate_container_name(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn validates_volume_port_and_environment_specs() {
+        assert_eq!(
+            parse_volume_spec("./data:/srv/data:ro").unwrap(),
+            ("./data".into(), "/srv/data".into(), true)
+        );
+        assert!(parse_volume_spec("./data:relative").is_err());
+        assert!(parse_volume_spec("./data:/srv/../escape").is_err());
+        assert!(parse_volume_spec("./data:/srv:cached").is_err());
+
+        assert_eq!(parse_port_spec("8080:80/tcp").unwrap(), (8080, 80, "tcp".into()));
+        for invalid in ["80", "0:80", "8080:0", "8080:80/udp", "a:80", "80:81:82"] {
+            assert!(parse_port_spec(invalid).is_err(), "accepted {invalid}");
+        }
+
+        for valid in ["KEY=value", "_PRIVATE=", "A1=two=parts"] {
+            assert!(validate_environment_spec(valid).is_ok());
+        }
+        for invalid in ["KEY", "1KEY=value", "BAD-NAME=value", "=value"] {
+            assert!(validate_environment_spec(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_host_port_mappings() {
+        let ports = vec!["8080:80".to_string(), "8080:8080".to_string()];
+        assert!(validate_runtime_inputs(&[], &ports, &[]).is_err());
     }
 
     #[test]
@@ -4700,7 +4944,7 @@ pub async fn stop_container(
     metadata["stopped_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     metadata["exit_code"] = serde_json::json!(if force { 137 } else { 0 });
 
-    std::fs::write(&metadata_path, metadata.to_string())?;
+    atomic_write(&metadata_path, metadata.to_string().as_bytes())?;
 
     println!("Container {} stopped", short12(&full_container_id));
     Ok(())
@@ -5114,10 +5358,20 @@ impl AuthConfig {
         let auth_path = get_auth_config_path()?;
         if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            }
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(auth_path, content)?;
+        atomic_write(&auth_path, content.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -5221,24 +5475,17 @@ async fn test_registry_credentials(
     let is_success = status.is_success();
     let status_code = status.as_u16();
 
-    if is_success || status_code == 401 {
-        // 401 might mean the scope/repo doesn't exist but auth worked
-        // We'll accept both success and certain auth errors as "credentials work"
+    if is_success {
         let body: serde_json::Value = response.json().await.unwrap_or_default();
 
         // Check if we got a token (success) or an auth error with proper format
         if body.get("token").is_some() || body.get("access_token").is_some() {
             Ok(())
-        } else if status_code == 401 {
-            // For 401, check if it's a proper auth response format
-            if body.get("errors").is_some() {
-                Ok(()) // Proper registry response, credentials format is correct
-            } else {
-                Err("Invalid credentials".into())
-            }
         } else {
-            Err("Authentication test failed".into())
+            Err("Registry accepted the request but returned no access token".into())
         }
+    } else if status_code == 401 || status_code == 403 {
+        Err("Invalid registry credentials".into())
     } else {
         Err(format!("Authentication failed with status: {}", status).into())
     }
