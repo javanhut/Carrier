@@ -1,0 +1,80 @@
+# ImLazy configuration for Carrier
+
+[settings]
+default = "build"
+
+[variables]
+# Where `install` puts the binary. `$HOME/.local` needs no root; override per
+# run, e.g. `imlazy install prefix=/usr/local`.
+prefix = "$HOME/.local"
+
+[commands]
+
+# Everything that builds or runs Carrier depends on this first. It checks for
+# the tools Carrier calls (runc, fuse-overlayfs, slirp4netns, nsenter, ...),
+# a subordinate UID/GID range for this user and newuidmap/newgidmap being
+# allowed to use it, and fixes only what is missing -- with `rvn` on Raven or
+# the distribution's package manager elsewhere -- so a fresh machine needs
+# nothing done by hand. A no-op when all is there.
+[commands.system-deps]
+desc = "Install the system packages and ID mappings Carrier needs"
+alias = ["setup", "deps"]
+run = ["bash scripts/system-deps.sh"]
+
+[commands.build]
+desc = "Build carrier (debug)"
+dep = ["system-deps"]
+alias = ["b"]
+run = ["cargo build"]
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[commands.release]
+desc = "Build carrier with optimisations"
+dep = ["system-deps"]
+run = ["cargo build --release"]
+
+# carrier.sh builds and, on macOS, re-signs the binary the bundled VM needs.
+[commands.run]
+desc = "Run carrier (pass args after --, e.g. imlazy run -- run alpine)"
+dep = ["system-deps"]
+alias = ["r"]
+run = ["bash carrier.sh"]
+
+[commands.doctor]
+desc = "Check the container runtime, storage, networking and ID mappings"
+dep = ["build"]
+run = ["target/debug/carrier doctor"]
+
+[commands.check]
+desc = "Type-check everything, tests included"
+alias = ["c"]
+run = ["cargo check --all-targets"]
+
+[commands.clippy]
+desc = "Lint with clippy"
+alias = ["l", "lint"]
+run = ["cargo clippy --all-targets"]
+
+[commands.fmt]
+desc = "Format code"
+alias = ["f"]
+run = ["cargo fmt"]
+
+[commands.test]
+desc = "Run tests"
+dep = ["system-deps"]
+alias = ["t"]
+run = ["cargo test"]
+
+[commands.install]
+desc = "Build and install carrier into prefix/bin (default ~/.local/bin)"
+dep = ["release"]
+run = ["install -Dm755 target/release/carrier {{prefix}}/bin/carrier"]
+
+[commands.uninstall]
+desc = "Remove an installed carrier (images and containers are left alone)"
+run = ["rm -f {{prefix}}/bin/carrier"]
+
+[commands.clean]
+desc = "Remove build artefacts"
+run = ["cargo clean"]

@@ -15,6 +15,7 @@ pub enum Distro {
     CentOS,
     RHEL,
     Arch,
+    Raven,
     OpenSUSE,
     Alpine,
     Gentoo,
@@ -29,6 +30,7 @@ pub enum PackageManager {
     Dnf,
     Yum,
     Pacman,
+    Rvn,
     Zypper,
     Apk,
     Emerge,
@@ -47,6 +49,17 @@ pub struct Platform {
     pub kernel_version: Option<String>,
 }
 
+impl PackageManager {
+    /// The manager whose package names this one uses: rvn installs Arch
+    /// packages, so it shares pacman's names.
+    pub fn package_names(&self) -> &PackageManager {
+        match self {
+            PackageManager::Rvn => &PackageManager::Pacman,
+            other => other,
+        }
+    }
+}
+
 impl Platform {
     pub fn is_linux(&self) -> bool {
         matches!(self.os, Os::Linux)
@@ -62,6 +75,7 @@ impl Platform {
             PackageManager::Dnf => "dnf",
             PackageManager::Yum => "yum",
             PackageManager::Pacman => "pacman",
+            PackageManager::Rvn => "rvn",
             PackageManager::Zypper => "zypper",
             PackageManager::Apk => "apk",
             PackageManager::Emerge => "emerge",
@@ -163,6 +177,7 @@ fn parse_os_release(content: &str) -> (Distro, Option<String>) {
         Some("centos") => Distro::CentOS,
         Some("rhel") | Some("redhat") => Distro::RHEL,
         Some("arch") | Some("archlinux") => Distro::Arch,
+        Some("raven") => Distro::Raven,
         Some("opensuse") | Some("opensuse-leap") | Some("opensuse-tumbleweed") => Distro::OpenSUSE,
         Some("alpine") => Distro::Alpine,
         Some("gentoo") => Distro::Gentoo,
@@ -219,6 +234,7 @@ fn detect_package_manager(os: &Os, distro: &Distro) -> PackageManager {
                     }
                 }
                 Distro::Arch => PackageManager::Pacman,
+                Distro::Raven => PackageManager::Rvn,
                 Distro::OpenSUSE => PackageManager::Zypper,
                 Distro::Alpine => PackageManager::Apk,
                 Distro::Gentoo => PackageManager::Emerge,
@@ -239,6 +255,8 @@ fn detect_package_manager_by_binary() -> PackageManager {
         PackageManager::Dnf
     } else if command_exists("yum") {
         PackageManager::Yum
+    } else if command_exists("rvn") {
+        PackageManager::Rvn
     } else if command_exists("pacman") {
         PackageManager::Pacman
     } else if command_exists("zypper") {
@@ -339,5 +357,22 @@ ID=arch
 "#;
         let (distro, _version) = parse_os_release(content);
         assert_eq!(distro, Distro::Arch);
+    }
+
+    #[test]
+    fn test_parse_os_release_raven() {
+        let content = r#"
+NAME="Raven Linux"
+ID=raven
+ID_LIKE=arch
+"#;
+        let (distro, _version) = parse_os_release(content);
+        assert_eq!(distro, Distro::Raven);
+    }
+
+    #[test]
+    fn test_rvn_uses_pacman_package_names() {
+        assert_eq!(PackageManager::Rvn.package_names(), &PackageManager::Pacman);
+        assert_eq!(PackageManager::Apt.package_names(), &PackageManager::Apt);
     }
 }

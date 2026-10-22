@@ -53,13 +53,14 @@ pub struct DependencyCheck {
 
 impl DependencyCheck {
     pub fn get_install_command(&self, pm: &PackageManager) -> Option<String> {
-        self.install_packages.get(pm).map(|packages| {
+        self.install_packages.get(pm.package_names()).map(|packages| {
             let pkg_list = packages.join(" ");
             match pm {
                 PackageManager::Apt => format!("sudo apt-get install -y {}", pkg_list),
                 PackageManager::Dnf => format!("sudo dnf install -y {}", pkg_list),
                 PackageManager::Yum => format!("sudo yum install -y {}", pkg_list),
                 PackageManager::Pacman => format!("sudo pacman -S --noconfirm {}", pkg_list),
+                PackageManager::Rvn => format!("rvn install --repo-only --yes {}", pkg_list),
                 PackageManager::Zypper => format!("sudo zypper install -y {}", pkg_list),
                 PackageManager::Apk => format!("sudo apk add {}", pkg_list),
                 PackageManager::Emerge => format!("sudo emerge {}", pkg_list),
@@ -265,10 +266,9 @@ fn check_runc() -> CheckResult {
         let version = get_command_version("runc");
         CheckResult::Ok { version }
     } else if command_exists("crun") {
-        CheckResult::Unavailable {
-            reason: "runc not found".to_string(),
-            alternative: Some("crun is available and can be used instead".to_string()),
-        }
+        // Carrier runs crun when runc is missing, so this is a working setup.
+        let version = get_command_version("crun");
+        CheckResult::Ok { version }
     } else {
         CheckResult::Missing {
             suggestion: "Install runc package".to_string(),

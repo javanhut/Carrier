@@ -394,7 +394,7 @@ fn post_install_fixes(pm: &PackageManager) -> Result<(), String> {
 
 /// Get all packages needed for a full Carrier installation
 pub fn get_all_packages(pm: &PackageManager) -> Vec<&'static str> {
-    match pm {
+    match pm.package_names() {
         PackageManager::Apt => vec![
             "runc",
             "fuse-overlayfs",
@@ -461,6 +461,7 @@ pub fn get_full_install_command(pm: &PackageManager) -> Option<String> {
         PackageManager::Dnf => format!("sudo dnf install -y {}", pkg_list),
         PackageManager::Yum => format!("sudo yum install -y {}", pkg_list),
         PackageManager::Pacman => format!("sudo pacman -S --noconfirm {}", pkg_list),
+        PackageManager::Rvn => format!("rvn install --repo-only --yes {}", pkg_list),
         PackageManager::Zypper => format!("sudo zypper install -y {}", pkg_list),
         PackageManager::Apk => format!("sudo apk add {}", pkg_list),
         PackageManager::Brew => format!("brew install {}", pkg_list),

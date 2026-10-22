@@ -783,15 +783,16 @@ async fn exec_rootless_container(
         .to_string();
 
     println!(
-        "Executing in container {} using runc exec",
-        short12(&container_id)
+        "Executing in container {} using {} exec",
+        short12(&container_id),
+        oci_runtime()
     );
 
     // Determine runc root directory
     let runc_root_path = get_runc_root();
 
     // Build runc exec command
-    let mut exec_cmd = Command::new("runc");
+    let mut exec_cmd = Command::new(oci_runtime());
     exec_cmd.arg("--root").arg(&runc_root_path).arg("exec");
 
     // Add -t flag for terminal if interactive
@@ -2463,21 +2464,22 @@ async fn run_container_with_storage(
         }
 
         // Create the container
-        let create_status = Command::new("runc")
+        let create_status = Command::new(oci_runtime())
             .arg("--root")
             .arg(&runc_root_path)
             .arg("create")
             .arg("--bundle")
             .arg(&bundle_dir)
             .arg(&container_id)
-            .status()?;
+            .status()
+            .map_err(runtime_spawn_error)?;
 
         if !create_status.success() {
-            return Err(format!("Failed to create container with runc").into());
+            return Err(format!("Failed to create container with {}", oci_runtime()).into());
         }
 
         // Start the container
-        let start_status = Command::new("runc")
+        let start_status = Command::new(oci_runtime())
             .arg("--root")
             .arg(&runc_root_path)
             .arg("start")
@@ -2485,11 +2487,11 @@ async fn run_container_with_storage(
             .status()?;
 
         if !start_status.success() {
-            return Err(format!("Failed to start container with runc").into());
+            return Err(format!("Failed to start container with {}", oci_runtime()).into());
         }
 
         // Get container PID from runc state
-        let state_output = Command::new("runc")
+        let state_output = Command::new(oci_runtime())
             .arg("--root")
             .arg(&runc_root_path)
             .arg("state")
@@ -2552,7 +2554,7 @@ async fn run_container_with_storage(
     std::fs::write(&config_path, serde_json::to_string_pretty(&oci_spec)?)?;
 
     // Create the container with the pause process
-    let create_status = Command::new("runc")
+    let create_status = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("create")
@@ -2562,14 +2564,15 @@ async fn run_container_with_storage(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
-        .status()?;
+        .status()
+        .map_err(runtime_spawn_error)?;
 
     if !create_status.success() {
-        return Err(format!("Failed to create container with runc").into());
+        return Err(format!("Failed to create container with {}", oci_runtime()).into());
     }
 
     // Get container PID from runc state
-    let state_output = Command::new("runc")
+    let state_output = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("state")
@@ -2598,7 +2601,7 @@ async fn run_container_with_storage(
     }
 
     // Start the container (starts the pause process)
-    let start_status = Command::new("runc")
+    let start_status = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("start")
@@ -2606,7 +2609,7 @@ async fn run_container_with_storage(
         .status()?;
 
     if !start_status.success() {
-        return Err(format!("Failed to start container with runc").into());
+        return Err(format!("Failed to start container with {}", oci_runtime()).into());
     }
 
     // Now exec the actual command with inherited stdio
@@ -2615,7 +2618,7 @@ async fn run_container_with_storage(
 
     // Try with TTY first if interactive, fall back to non-TTY if it fails
     let exec_result = if use_tty {
-        let mut exec_cmd = Command::new("runc");
+        let mut exec_cmd = Command::new(oci_runtime());
         exec_cmd
             .arg("--root")
             .arg(&runc_root_path)
@@ -2637,7 +2640,7 @@ async fn run_container_with_storage(
         // If TTY allocation failed, retry without -t
         if result.as_ref().map(|s| s.code() == Some(255)).unwrap_or(false) {
             eprintln!("Note: TTY allocation failed, falling back to non-TTY mode");
-            let mut retry_cmd = Command::new("runc");
+            let mut retry_cmd = Command::new(oci_runtime());
             retry_cmd
                 .arg("--root")
                 .arg(&runc_root_path)
@@ -2658,7 +2661,7 @@ async fn run_container_with_storage(
             result
         }
     } else {
-        let mut exec_cmd = Command::new("runc");
+        let mut exec_cmd = Command::new(oci_runtime());
         exec_cmd
             .arg("--root")
             .arg(&runc_root_path)
@@ -2685,14 +2688,14 @@ async fn run_container_with_storage(
     let exit_code = match exec_result {
         Ok(status) => status.code().unwrap_or(-1),
         Err(e) => {
-            let _ = Command::new("runc")
+            let _ = Command::new(oci_runtime())
                 .arg("--root")
                 .arg(&runc_root_path)
                 .arg("kill")
                 .arg(&container_id)
                 .arg("SIGKILL")
                 .status();
-            let _ = Command::new("runc")
+            let _ = Command::new(oci_runtime())
                 .arg("--root")
                 .arg(&runc_root_path)
                 .arg("delete")
@@ -2703,7 +2706,7 @@ async fn run_container_with_storage(
     };
 
     // Kill and delete the container
-    let _ = Command::new("runc")
+    let _ = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("kill")
@@ -2714,7 +2717,7 @@ async fn run_container_with_storage(
     // Give it a moment to clean up
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    let _ = Command::new("runc")
+    let _ = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("delete")
@@ -2763,8 +2766,52 @@ fn short12(s: &str) -> String {
     s.chars().take(12).collect::<String>()
 }
 
-/// Cache for subuid/subgid mappings to avoid repeated file I/O
 use std::sync::OnceLock;
+
+/// OCI runtime binary: runc when it is installed, crun otherwise. crun takes
+/// the same command line, and it is the one podman brings in, so a machine
+/// that got its container tools that way often has no runc at all.
+fn oci_runtime() -> &'static str {
+    static RUNTIME: OnceLock<&'static str> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        ["runc", "crun"]
+            .into_iter()
+            .find(|cmd| crate::deps::platform::command_exists(cmd))
+            .unwrap_or("runc")
+    })
+}
+
+/// Name the problem when the runtime can't be started at all, instead of the
+/// bare "No such file or directory" that a failed spawn reports.
+fn runtime_spawn_error(e: std::io::Error) -> Box<dyn std::error::Error> {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        "no OCI runtime found: install runc or crun (`imlazy system-deps` installs it)".into()
+    } else {
+        format!("failed to run {}: {}", oci_runtime(), e).into()
+    }
+}
+
+/// First subordinate ID past every range in /etc/subuid and /etc/subgid, so a
+/// suggested range overlaps nothing already handed out (never below 100000).
+fn next_free_subid() -> u64 {
+    ["/etc/subuid", "/etc/subgid"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|content| {
+            content
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split(':').skip(1);
+                    let start: u64 = fields.next()?.trim().parse().ok()?;
+                    let count: u64 = fields.next()?.trim().parse().ok()?;
+                    Some(start + count)
+                })
+                .collect::<Vec<_>>()
+        })
+        .fold(100000, u64::max)
+}
+
+/// Cache for subuid/subgid mappings to avoid repeated file I/O
 static SUBID_CACHE: OnceLock<(Option<(u32, u32)>, Option<(u32, u32)>)> = OnceLock::new();
 
 /// Read subordinate UID/GID mappings from /etc/subuid or /etc/subgid (with caching)
@@ -2804,13 +2851,16 @@ fn get_id_mappings(uid: u32, gid: u32) -> (Vec<serde_json::Value>, Vec<serde_jso
         let subgid = read_subid_mappings("/etc/subgid", &username).ok();
 
         // Only print warnings once when cache is initialized
-        if subuid.is_none() {
-            eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
-            eprintln!("Consider adding an entry to /etc/subuid: {}:100000:65536", username);
-        }
-        if subgid.is_none() {
-            eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
-            eprintln!("Consider adding an entry to /etc/subgid: {}:100000:65536", username);
+        if subuid.is_none() || subgid.is_none() {
+            let start = next_free_subid();
+            if subuid.is_none() {
+                eprintln!("Warning: No subuid mapping found for user {}. Only container UID 0 will be mapped.", username);
+                eprintln!("Consider adding an entry to /etc/subuid: {}:{}:65536", username, start);
+            }
+            if subgid.is_none() {
+                eprintln!("Warning: No subgid mapping found for user {}. Only container GID 0 will be mapped.", username);
+                eprintln!("Consider adding an entry to /etc/subgid: {}:{}:65536", username, start);
+            }
         }
 
         (subuid, subgid)
@@ -3919,7 +3969,7 @@ pub async fn list_items(all: bool, images_only: bool, containers_only: bool) {
                                     // Query runc for actual state
                                     let runc_root_path = get_runc_root();
 
-                                    let state_result = std::process::Command::new("runc")
+                                    let state_result = std::process::Command::new(oci_runtime())
                                         .arg("--root")
                                         .arg(&runc_root_path)
                                         .arg("state")
@@ -4541,7 +4591,7 @@ pub async fn stop_container(
     let runc_root_path = get_runc_root();
 
     // Check if container exists in runc
-    let state_result = Command::new("runc")
+    let state_result = Command::new(oci_runtime())
         .arg("--root")
         .arg(&runc_root_path)
         .arg("state")
@@ -4556,7 +4606,7 @@ pub async fn stop_container(
         // Use runc to stop the container
         if !force {
             println!("Sending SIGTERM via runc...");
-            let kill_status = Command::new("runc")
+            let kill_status = Command::new(oci_runtime())
                 .arg("--root")
                 .arg(&runc_root_path)
                 .arg("kill")
@@ -4570,7 +4620,7 @@ pub async fn stop_container(
                 let timeout_duration = std::time::Duration::from_secs(timeout);
 
                 while start.elapsed() < timeout_duration {
-                    let state = Command::new("runc")
+                    let state = Command::new(oci_runtime())
                         .arg("--root")
                         .arg(&runc_root_path)
                         .arg("state")
@@ -4602,7 +4652,7 @@ pub async fn stop_container(
             println!("Sending SIGKILL via runc...");
         }
 
-        let _ = Command::new("runc")
+        let _ = Command::new(oci_runtime())
             .arg("--root")
             .arg(&runc_root_path)
             .arg("kill")
@@ -4612,7 +4662,7 @@ pub async fn stop_container(
 
         // Delete the container from runc
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let _ = Command::new("runc")
+        let _ = Command::new(oci_runtime())
             .arg("--root")
             .arg(&runc_root_path)
             .arg("delete")
